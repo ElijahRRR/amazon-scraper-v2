@@ -49,45 +49,57 @@ class AmazonSession:
         """
         初始化 session：
         1. 创建 curl_cffi 会话
-        2. 访问 Amazon 首页获取 cookies
+        2. 访问 Amazon 首页获取 cookies（带重试）
         3. POST 设置邮编
         """
-        try:
-            proxy = await self.proxy_manager.get_proxy()
-            
-            # 创建会话（impersonate Chrome 120）
-            self._session = AsyncSession(
-                impersonate=config.IMPERSONATE_BROWSER,
-                timeout=config.REQUEST_TIMEOUT,
-                proxy=proxy,
-            )
+        for init_attempt in range(3):
+            try:
+                proxy = await self.proxy_manager.get_proxy()
 
-            # 1. 访问首页获取初始 cookies
-            logger.info(f"🌐 访问 Amazon 首页获取 cookies...")
-            headers = self._build_headers()
-            resp = await self._session.get(
-                self.AMAZON_BASE,
-                headers=headers,
-            )
-            
-            if resp.status_code != 200:
-                logger.warning(f"⚠️ 首页返回 {resp.status_code}")
-                return False
+                # 创建会话（impersonate Chrome 120）
+                self._session = AsyncSession(
+                    impersonate=config.IMPERSONATE_BROWSER,
+                    timeout=config.REQUEST_TIMEOUT,
+                    proxy=proxy,
+                )
 
-            # 2. 设置邮编
-            success = await self._set_zip_code()
-            if success:
-                self._initialized = True
-                logger.info(f"✅ Session 初始化成功 (邮编: {self.zip_code})")
-            else:
-                # 邮编设置失败不算致命错误，继续使用
-                self._initialized = True
-                logger.warning(f"⚠️ 邮编设置失败，但 session 仍可使用")
+                # 1. 访问首页获取初始 cookies
+                headers = self._build_headers()
+                resp = await self._session.get(
+                    self.AMAZON_BASE,
+                    headers=headers,
+                )
 
-            return True
-        except Exception as e:
-            logger.error(f"❌ Session 初始化失败: {e}")
-            return False
+                # 接受所有 2xx 响应（200/202 等都有效）
+                if resp.status_code >= 300:
+                    logger.warning(f"首页返回 {resp.status_code}，重试 ({init_attempt+1}/3)")
+                    await self._session.close()
+                    self._session = None
+                    await asyncio.sleep(3)
+                    continue
+
+                # 2. 设置邮编
+                success = await self._set_zip_code()
+                if success:
+                    self._initialized = True
+                    logger.info(f"✅ Session 初始化成功 (邮编: {self.zip_code})")
+                else:
+                    self._initialized = True
+                    logger.warning(f"⚠️ 邮编设置失败，但 session 仍可使用")
+
+                return True
+
+            except Exception as e:
+                logger.error(f"❌ Session 初始化失败 (尝试 {init_attempt+1}/3): {e}")
+                if self._session:
+                    await self._session.close()
+                    self._session = None
+                if init_attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+
+        logger.error("❌ Session 初始化失败，已重试 3 次")
+        return False
 
     async def _set_zip_code(self) -> bool:
         """

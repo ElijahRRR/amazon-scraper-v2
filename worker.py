@@ -64,6 +64,11 @@ class Worker:
         # 运行控制
         self._running = False
 
+        # Session 轮换控制
+        self._success_since_rotate = 0
+        self._rotate_every = config.SESSION_ROTATE_EVERY
+        self._rotate_lock = asyncio.Lock()
+
     async def start(self):
         """启动 Worker"""
         logger.info(f"🚀 Worker [{self.worker_id}] 启动")
@@ -113,6 +118,23 @@ class Worker:
         success = await self._session.initialize()
         if not success:
             logger.warning("⚠️ Session 初始化失败，将在首次请求时重试")
+        self._success_since_rotate = 0
+
+    async def _rotate_session(self, reason: str = "主动轮换"):
+        """轮换 session：关闭旧的，刷新代理，创建新的"""
+        async with self._rotate_lock:
+            logger.info(f"🔄 Session {reason}...")
+            if self._session:
+                await self._session.close()
+            await self.proxy_manager.report_blocked()
+            await asyncio.sleep(1)
+            self._session = AmazonSession(self.proxy_manager, self.zip_code)
+            success = await self._session.initialize()
+            self._success_since_rotate = 0
+            if success:
+                logger.info("🔄 Session 轮换成功")
+            else:
+                logger.warning("⚠️ Session 轮换后初始化失败")
 
     async def _pull_tasks(self) -> List[Dict]:
         """从服务器拉取任务"""
@@ -169,9 +191,7 @@ class Worker:
                 if self._session.is_blocked(resp):
                     self._stats["blocked"] += 1
                     logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt+1}/{max_retries})")
-                    await self.proxy_manager.report_blocked()
-                    await self._session.close()
-                    await self._init_session()
+                    await self._rotate_session(reason="被封锁")
                     continue
 
                 # 404 处理
@@ -193,9 +213,7 @@ class Worker:
                 if result_data["title"] in ["[验证码拦截]", "[API封锁]"]:
                     self._stats["blocked"] += 1
                     logger.warning(f"ASIN {asin} {result_data['title']} (尝试 {attempt+1}/{max_retries})")
-                    await self.proxy_manager.report_blocked()
-                    await self._session.close()
-                    await self._init_session()
+                    await self._rotate_session(reason="页面拦截")
                     continue
 
                 # 标题为空视为软拦截
@@ -209,9 +227,15 @@ class Worker:
                 await self._submit_result(task_id, result_data, success=True)
                 self._stats["success"] += 1
                 self._stats["total"] += 1
+                self._success_since_rotate += 1
 
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
                 logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
+
+                # 主动轮换：每 N 次成功请求更换 session 防止被检测
+                if self._success_since_rotate >= self._rotate_every:
+                    await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
+
                 return
 
             except Exception as e:
