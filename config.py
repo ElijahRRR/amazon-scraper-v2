@@ -26,7 +26,7 @@ DEFAULT_ZIP_CODE = "10001"
 DEFAULT_CONCURRENCY = 5          # 每个 worker 并发数
 REQUEST_INTERVAL = 0.2           # 请求间隔（秒）
 REQUEST_JITTER = 0.05            # 间隔随机抖动范围（秒）
-REQUEST_TIMEOUT = 15             # 请求超时（秒）
+REQUEST_TIMEOUT = 30             # 请求超时（秒）
 MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
 

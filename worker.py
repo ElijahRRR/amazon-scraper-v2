@@ -141,7 +141,9 @@ class Worker:
     async def _process_task(self, task: Dict):
         """
         处理单个采集任务
-        包含重试逻辑：被封 → 换 IP + 换 session → 重试
+        区分超时和真正的封锁：
+        - 超时/网络错误 → 等待后直接重试（不换 IP）
+        - 验证码/403/503 → 换 IP + 换 session → 重试
         """
         asin = task["asin"]
         task_id = task["id"]
@@ -157,23 +159,24 @@ class Worker:
                 # 发起请求
                 resp = await self._session.fetch_product_page(asin)
 
-                # 被封检测
+                # 请求失败（超时/网络异常）→ 不换 IP，等待后重试
+                if resp is None:
+                    logger.warning(f"ASIN {asin} 请求超时 (尝试 {attempt+1}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
+
+                # 真正被封（403/503/验证码）→ 换 IP + 换 session
                 if self._session.is_blocked(resp):
                     self._stats["blocked"] += 1
-                    logger.warning(f"🚫 ASIN {asin} 被封 (尝试 {attempt+1}/{max_retries})")
-                    
-                    # 换 IP
+                    logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt+1}/{max_retries})")
                     await self.proxy_manager.report_blocked()
-                    
-                    # 换 session
                     await self._session.close()
                     await self._init_session()
-                    
                     continue
 
                 # 404 处理
                 if self._session.is_404(resp):
-                    logger.info(f"🔍 ASIN {asin} 商品不存在 (404)")
+                    logger.info(f"ASIN {asin} 商品不存在 (404)")
                     result_data = self.parser._default_result(asin, zip_code)
                     result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
@@ -189,7 +192,7 @@ class Worker:
                 # 检查是否是拦截页面
                 if result_data["title"] in ["[验证码拦截]", "[API封锁]"]:
                     self._stats["blocked"] += 1
-                    logger.warning(f"🚫 ASIN {asin} {result_data['title']} (尝试 {attempt+1}/{max_retries})")
+                    logger.warning(f"ASIN {asin} {result_data['title']} (尝试 {attempt+1}/{max_retries})")
                     await self.proxy_manager.report_blocked()
                     await self._session.close()
                     await self._init_session()
@@ -197,30 +200,28 @@ class Worker:
 
                 # 标题为空视为软拦截
                 if not result_data["title"] or result_data["title"] == "N/A":
-                    logger.warning(f"⚠️ ASIN {asin} 标题为空 (软拦截, 尝试 {attempt+1}/{max_retries})")
+                    logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt+1}/{max_retries})")
                     if attempt < max_retries - 1:
-                        await self.proxy_manager.report_blocked()
-                        await self._session.close()
-                        await self._init_session()
+                        await asyncio.sleep(2)
                         continue
 
                 # 成功
                 await self._submit_result(task_id, result_data, success=True)
                 self._stats["success"] += 1
                 self._stats["total"] += 1
-                
+
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
-                logger.info(f"✅ ASIN {asin} | {title_short}... | {result_data['current_price']}")
+                logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
                 return
 
             except Exception as e:
-                logger.error(f"❌ ASIN {asin} 处理异常 (尝试 {attempt+1}/{max_retries}): {e}")
+                logger.error(f"ASIN {asin} 异常 (尝试 {attempt+1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
                     continue
 
         # 所有重试用完，标记失败
-        logger.error(f"💀 ASIN {asin} 采集失败 (已重试 {max_retries} 次)")
+        logger.error(f"ASIN {asin} 采集失败 (已重试 {max_retries} 次)")
         await self._submit_result(task_id, None, success=False)
         self._stats["failed"] += 1
         self._stats["total"] += 1

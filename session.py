@@ -216,15 +216,15 @@ class AmazonSession:
     def is_blocked(self, response: Response) -> bool:
         """
         检测是否被 Amazon 封锁
-        返回 True 表示被封
+        注意：response 为 None（超时）时由调用方单独处理，这里只检查实际响应
         """
         if response is None:
-            return True
-        
+            return False
+
         # HTTP 状态码检测
         if response.status_code in (403, 503):
             return True
-        
+
         # 验证码检测
         text = response.text
         if "captcha" in response.url.lower():
@@ -233,7 +233,7 @@ class AmazonSession:
             return True
         if "api-services-support@amazon.com" in text:
             return True
-            
+
         return False
 
     def is_404(self, response: Response) -> bool:
