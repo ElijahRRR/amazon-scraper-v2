@@ -79,7 +79,7 @@
             <tbody>
                 {% for b in batches %}
                 <tr>
-                    <td><a href="/results?batch_name={{ b.batch_name }}" class="text-decoration-none" style="color:var(--accent-light)">{{ b.batch_name }}</a></td>
+                    <td><a href="/results?batch_name={{ b.batch_name }}" class="text-decoration-none" style="color:var(--accent)">{{ b.batch_name }}</a></td>
                     <td>{{ b.total }}</td>
                     <td><span class="text-success">{{ b.done }}</span></td>
                     <td><span class="text-danger">{{ b.failed }}</span></td>
