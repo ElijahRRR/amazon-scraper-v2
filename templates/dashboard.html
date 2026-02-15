@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% set active_page = "dashboard" %}
+{% block title %}仪表盘 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">仪表盘</h2>
+<p class="page-subtitle">实时采集概览</p>
+
+<!-- 统计卡片 -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3">
+        <div class="stat-card accent">
+            <div class="stat-label">总任务</div>
+            <div class="stat-number" id="stat-total">{{ progress.total }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card success">
+            <div class="stat-label">已完成</div>
+            <div class="stat-number" id="stat-done">{{ progress.done }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card warning">
+            <div class="stat-label">进行中</div>
+            <div class="stat-number" id="stat-processing">{{ progress.processing }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card danger">
+            <div class="stat-label">失败</div>
+            <div class="stat-number" id="stat-failed">{{ progress.failed }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- 整体进度条 -->
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="d-flex justify-content-between mb-2">
+            <span>整体进度</span>
+            <span id="progress-pct">{{ progress.success_rate }}%</span>
+        </div>
+        <div class="progress" style="height: 12px;">
+            <div class="progress-bar bg-success" id="progress-bar-done"
+                 style="width: {{ (progress.done / progress.total * 100) if progress.total > 0 else 0 }}%"></div>
+            <div class="progress-bar bg-danger" id="progress-bar-failed"
+                 style="width: {{ (progress.failed / progress.total * 100) if progress.total > 0 else 0 }}%"></div>
+        </div>
+        <div class="d-flex justify-content-between mt-2">
+            <small class="text-secondary">
+                <i class="bi bi-pc-display-horizontal"></i> 在线 Worker: <strong>{{ active_workers }}</strong>
+            </small>
+            <small class="text-secondary">
+                成功率: <strong>{{ progress.success_rate }}%</strong>
+            </small>
+        </div>
+    </div>
+</div>
+
+<!-- 最近批次 -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-clock-history"></i> 最近批次</span>
+        <a href="/tasks" class="btn btn-sm btn-outline-accent">查看全部</a>
+    </div>
+    <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>批次名称</th>
+                    <th>总数</th>
+                    <th>完成</th>
+                    <th>失败</th>
+                    <th>进度</th>
+                    <th>创建时间</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in batches %}
+                <tr>
+                    <td><a href="/results?batch_name={{ b.batch_name }}" class="text-decoration-none" style="color:var(--accent-light)">{{ b.batch_name }}</a></td>
+                    <td>{{ b.total }}</td>
+                    <td><span class="text-success">{{ b.done }}</span></td>
+                    <td><span class="text-danger">{{ b.failed }}</span></td>
+                    <td>
+                        <div class="progress" style="width:120px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                        </div>
+                        <small class="text-secondary">{{ b.progress }}%</small>
+                    </td>
+                    <td><small class="text-secondary">{{ b.created_at }}</small></td>
+                </tr>
+                {% endfor %}
+                {% if not batches %}
+                <tr><td colspan="6" class="text-center text-secondary py-4">暂无批次</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// 每 5 秒自动刷新进度
+setInterval(async () => {
+    try {
+        const resp = await fetch('/api/progress');
+        const data = await resp.json();
+        document.getElementById('stat-total').textContent = data.total;
+        document.getElementById('stat-done').textContent = data.done;
+        document.getElementById('stat-processing').textContent = data.processing;
+        document.getElementById('stat-failed').textContent = data.failed;
+        document.getElementById('progress-pct').textContent = data.success_rate + '%';
+        if (data.total > 0) {
+            document.getElementById('progress-bar-done').style.width = (data.done / data.total * 100) + '%';
+            document.getElementById('progress-bar-failed').style.width = (data.failed / data.total * 100) + '%';
+        }
+    } catch(e) {}
+}, 5000);
+</script>
+{% endblock %}

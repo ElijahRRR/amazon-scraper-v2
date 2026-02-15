@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% set active_page = "settings" %}
+{% block title %}系统设置 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">系统设置</h2>
+<p class="page-subtitle">配置采集参数</p>
+
+<div class="row">
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-gear"></i> 运行时配置</div>
+            <div class="card-body">
+                <form id="settingsForm">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label">配送邮编</label>
+                            <input type="text" class="form-control" name="zip_code" 
+                                   value="{{ settings.zip_code }}" placeholder="10001">
+                            <small class="text-secondary">Worker 将使用此邮编采集</small>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">每 Worker 并发数</label>
+                            <input type="number" class="form-control" name="concurrency" 
+                                   value="{{ settings.concurrency }}" min="1" max="20">
+                            <small class="text-secondary">建议不超过 5（匹配代理限制）</small>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">请求间隔（秒）</label>
+                            <input type="number" class="form-control" name="request_interval" 
+                                   value="{{ settings.request_interval }}" step="0.01" min="0.1">
+                            <small class="text-secondary">每次请求之间的间隔</small>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">最大重试次数</label>
+                            <input type="number" class="form-control" name="max_retries" 
+                                   value="{{ settings.max_retries }}" min="1" max="10">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">代理 API 地址</label>
+                            <input type="text" class="form-control" name="proxy_api_url" 
+                                   value="{{ settings.proxy_api_url }}">
+                            <small class="text-secondary">快代理 TPS API 地址</small>
+                        </div>
+                    </div>
+                    <div class="mt-4">
+                        <button type="submit" class="btn btn-accent">
+                            <i class="bi bi-check-lg"></i> 保存设置
+                        </button>
+                    </div>
+                </form>
+                <div id="saveResult" class="mt-3" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-info-circle"></i> 系统信息</div>
+            <div class="card-body">
+                <ul class="list-unstyled mb-0">
+                    <li class="mb-2">
+                        <small class="text-secondary">服务端口</small><br>
+                        <strong>{{ settings.get('port', 8899) if settings.get else 8899 }}</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">数据库路径</small><br>
+                        <strong style="word-break:break-all;">scraper.db</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">TLS 指纹</small><br>
+                        <strong>chrome120</strong>
+                    </li>
+                    <li>
+                        <small class="text-secondary">版本</small><br>
+                        <strong>v2.0.0</strong>
+                    </li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <div class="card-header"><i class="bi bi-terminal"></i> Worker 启动命令</div>
+            <div class="card-body">
+                <code style="color:var(--accent-light); word-break:break-all;">
+                    python worker.py --server http://&lt;服务器IP&gt;:8899
+                </code>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const data = Object.fromEntries(formData);
+    // 数值类型转换
+    data.concurrency = parseInt(data.concurrency);
+    data.request_interval = parseFloat(data.request_interval);
+    data.max_retries = parseInt(data.max_retries);
+
+    const resultDiv = document.getElementById('saveResult');
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-success">✅ 设置已保存</div>';
+        } else {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-danger">❌ 保存失败</div>';
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = `<div class="alert alert-danger">❌ 网络错误: ${err.message}</div>`;
+    }
+    setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
+});
+</script>
+{% endblock %}

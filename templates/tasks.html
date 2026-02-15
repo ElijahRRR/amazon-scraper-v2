@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% set active_page = "tasks" %}
+{% block title %}任务管理 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">任务管理</h2>
+<p class="page-subtitle">上传 ASIN 列表，管理采集批次</p>
+
+<!-- 上传区域 -->
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-cloud-upload"></i> 上传 ASIN 文件</div>
+    <div class="card-body">
+        <form id="uploadForm" enctype="multipart/form-data">
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">批次名称（可选）</label>
+                    <input type="text" class="form-control" name="batch_name" placeholder="自动生成">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">配送邮编</label>
+                    <input type="text" class="form-control" name="zip_code" value="10001" placeholder="10001">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">ASIN 文件</label>
+                    <input type="file" class="form-control" name="file" accept=".xlsx,.xls,.csv,.txt" required>
+                </div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+                <small class="text-secondary">支持 Excel (.xlsx)、CSV (.csv)、纯文本 (.txt) 格式</small>
+                <button type="submit" class="btn btn-accent" id="uploadBtn">
+                    <i class="bi bi-upload"></i> 上传
+                </button>
+            </div>
+        </form>
+        <div id="uploadResult" class="mt-3" style="display:none;"></div>
+    </div>
+</div>
+
+<!-- 批次列表 -->
+<div class="card">
+    <div class="card-header"><i class="bi bi-collection"></i> 历史批次</div>
+    <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>批次名称</th>
+                    <th>总数</th>
+                    <th>待处理</th>
+                    <th>处理中</th>
+                    <th>完成</th>
+                    <th>失败</th>
+                    <th>进度</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in batches %}
+                <tr>
+                    <td>{{ b.batch_name }}</td>
+                    <td>{{ b.total }}</td>
+                    <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
+                    <td><span class="badge-status badge-processing">{{ b.processing }}</span></td>
+                    <td><span class="badge-status badge-done">{{ b.done }}</span></td>
+                    <td><span class="badge-status badge-failed">{{ b.failed }}</span></td>
+                    <td>
+                        <div class="progress" style="width:100px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                        </div>
+                        <small>{{ b.progress }}%</small>
+                    </td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <a href="/results?batch_name={{ b.batch_name }}" class="btn btn-outline-accent" title="查看结果">
+                                <i class="bi bi-eye"></i>
+                            </a>
+                            <a href="/api/export/{{ b.batch_name }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
+                                <i class="bi bi-download"></i>
+                            </a>
+                            <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.batch_name }}')" title="重试失败">
+                                <i class="bi bi-arrow-clockwise"></i>
+                            </button>
+                            <button class="btn btn-outline-danger" onclick="deleteBatch('{{ b.batch_name }}')" title="删除">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not batches %}
+                <tr><td colspan="8" class="text-center text-secondary py-4">暂无批次，请上传 ASIN 文件</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('uploadBtn');
+    const resultDiv = document.getElementById('uploadResult');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 上传中...';
+
+    const formData = new FormData(e.target);
+    try {
+        const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `<div class="alert alert-success">
+                ✅ 上传成功！批次: <strong>${data.batch_name}</strong>，
+                共 ${data.total_asins} 个 ASIN，插入 ${data.inserted} 个任务
+            </div>`;
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `<div class="alert alert-danger">❌ ${data.detail || '上传失败'}</div>`;
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = `<div class="alert alert-danger">❌ 网络错误: ${err.message}</div>`;
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-upload"></i> 上传';
+});
+
+async function retryBatch(name) {
+    if (!confirm(`确定重试批次 "${name}" 中所有失败的任务？`)) return;
+    await fetch(`/api/batches/${name}/retry`, { method: 'POST' });
+    location.reload();
+}
+
+async function deleteBatch(name) {
+    if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
+    await fetch(`/api/batches/${name}`, { method: 'DELETE' });
+    location.reload();
+}
+</script>
+{% endblock %}

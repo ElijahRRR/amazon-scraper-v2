@@ -1,0 +1,298 @@
+:root {
+    --bg-primary: #0f1117;
+    --bg-secondary: #1a1d29;
+    --bg-card: #222639;
+    --bg-hover: #2a2f45;
+    --text-primary: #e4e6f0;
+    --text-secondary: #8b8fa8;
+    --accent: #6c5ce7;
+    --accent-light: #a29bfe;
+    --success: #00b894;
+    --warning: #fdcb6e;
+    --danger: #e17055;
+    --info: #74b9ff;
+    --border: #2d3250;
+}
+
+body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+}
+
+/* 侧边栏 */
+.sidebar {
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    min-height: 100vh;
+    width: 240px;
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 1000;
+    padding-top: 20px;
+}
+
+.sidebar .brand {
+    padding: 0 20px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 10px;
+}
+
+.sidebar .brand h5 {
+    color: var(--accent-light);
+    font-weight: 700;
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.sidebar .brand small {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.sidebar .nav-link {
+    color: var(--text-secondary);
+    padding: 10px 20px;
+    border-radius: 0;
+    transition: all 0.2s;
+    font-size: 0.9rem;
+}
+
+.sidebar .nav-link:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+.sidebar .nav-link.active {
+    background: var(--accent);
+    color: white;
+}
+
+.sidebar .nav-link i {
+    width: 24px;
+    text-align: center;
+    margin-right: 8px;
+}
+
+/* 主内容区 */
+.main-content {
+    margin-left: 240px;
+    padding: 30px;
+}
+
+/* 卡片 */
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 20px;
+}
+
+.card-header {
+    background: transparent;
+    border-bottom: 1px solid var(--border);
+    padding: 15px 20px;
+    font-weight: 600;
+}
+
+.card-body {
+    padding: 20px;
+}
+
+/* 统计卡片 */
+.stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    transition: transform 0.2s;
+}
+
+.stat-card:hover {
+    transform: translateY(-2px);
+}
+
+.stat-card .stat-number {
+    font-size: 2rem;
+    font-weight: 700;
+    margin: 5px 0;
+}
+
+.stat-card .stat-label {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.stat-card.accent .stat-number { color: var(--accent-light); }
+.stat-card.success .stat-number { color: var(--success); }
+.stat-card.warning .stat-number { color: var(--warning); }
+.stat-card.danger .stat-number { color: var(--danger); }
+.stat-card.info .stat-number { color: var(--info); }
+
+/* 进度条 */
+.progress {
+    background: var(--bg-primary);
+    border-radius: 10px;
+    height: 10px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    background: linear-gradient(90deg, var(--accent), var(--accent-light));
+    border-radius: 10px;
+    transition: width 0.5s ease;
+}
+
+.progress-bar.bg-success {
+    background: linear-gradient(90deg, #00b894, #55efc4);
+}
+
+.progress-bar.bg-danger {
+    background: linear-gradient(90deg, #e17055, #fab1a0);
+}
+
+/* 表格 */
+.table {
+    color: var(--text-primary);
+}
+
+.table thead th {
+    background: var(--bg-primary);
+    border-bottom: 2px solid var(--border);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+.table td {
+    border-color: var(--border);
+    vertical-align: middle;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+}
+
+.table tbody tr:hover {
+    background: var(--bg-hover);
+}
+
+/* 按钮 */
+.btn-accent {
+    background: var(--accent);
+    color: white;
+    border: none;
+}
+
+.btn-accent:hover {
+    background: var(--accent-light);
+    color: white;
+}
+
+.btn-outline-accent {
+    border: 1px solid var(--accent);
+    color: var(--accent-light);
+}
+
+.btn-outline-accent:hover {
+    background: var(--accent);
+    color: white;
+}
+
+/* 表单控件 */
+.form-control, .form-select {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+}
+
+.form-control:focus, .form-select:focus {
+    background: var(--bg-primary);
+    border-color: var(--accent);
+    color: var(--text-primary);
+    box-shadow: 0 0 0 0.2rem rgba(108, 92, 231, 0.25);
+}
+
+/* 徽章 */
+.badge-status {
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.badge-online { background: rgba(0, 184, 148, 0.2); color: var(--success); }
+.badge-offline { background: rgba(225, 112, 85, 0.2); color: var(--danger); }
+.badge-pending { background: rgba(253, 203, 110, 0.2); color: var(--warning); }
+.badge-done { background: rgba(0, 184, 148, 0.2); color: var(--success); }
+.badge-failed { background: rgba(225, 112, 85, 0.2); color: var(--danger); }
+.badge-processing { background: rgba(116, 185, 255, 0.2); color: var(--info); }
+
+/* 分页 */
+.page-link {
+    background: var(--bg-card);
+    border-color: var(--border);
+    color: var(--text-secondary);
+}
+
+.page-link:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border-color: var(--accent);
+}
+
+.page-item.active .page-link {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+/* 文件上传区域 */
+.upload-zone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 40px;
+    text-align: center;
+    transition: all 0.3s;
+    cursor: pointer;
+}
+
+.upload-zone:hover, .upload-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(108, 92, 231, 0.05);
+}
+
+.upload-zone i {
+    font-size: 3rem;
+    color: var(--accent);
+    margin-bottom: 15px;
+}
+
+/* 页面标题 */
+.page-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 5px;
+}
+
+.page-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-bottom: 25px;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+    .sidebar {
+        width: 100%;
+        position: relative;
+        min-height: auto;
+    }
+    .main-content {
+        margin-left: 0;
+    }
+}

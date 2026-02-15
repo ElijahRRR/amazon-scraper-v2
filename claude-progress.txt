@@ -1,0 +1,84 @@
+# Amazon Scraper v2 - 开发进度记录
+
+## 当前状态
+- **总功能: 18/18 已完成 (100%)**
+- **所有模块已实现并通过测试**
+
+## 模块完成情况
+
+### ✅ 基础设施 (3/3)
+1. `config.py` - 配置管理（代理密钥、邮编、并发数、UA列表、请求头等）
+2. `models.py` - 数据模型（Task + Result dataclass，38个采集字段）
+3. `requirements.txt` - 依赖管理
+
+### ✅ 数据库 (1/1)
+4. `database.py` - 异步 SQLite 操作（aiosqlite + WAL 模式）
+   - tasks 表 + results 表
+   - 完整 CRUD：create_tasks, pull_tasks, save_result, get_results
+   - 断点续传：reset_timeout_tasks（processing 超过 5 分钟自动回退）
+   - 批次管理：get_batch_list, delete_batch, retry_all_failed
+
+### ✅ 核心模块 (4/4)
+5. `proxy.py` - 快代理 TPS 集成
+   - ProxyManager: 代理池管理、定期刷新、被封换 IP
+   - 支持带认证格式 (ip:port:user:pwd)
+6. `session.py` - Amazon session 管理
+   - curl_cffi (impersonate="chrome120") TLS 指纹
+   - POST 邮编设置 (address-change.html)
+   - 完整反指纹请求头 (sec-ch-ua 等)
+   - SessionPool 轮换
+7. `parser.py` - Amazon 页面解析器
+   - 参考原版 amazon_dist.py 逻辑
+   - 38 个字段全覆盖
+   - 反爬检测、不可售检测、定制产品检测
+   - 健壮错误处理（字段缺失不崩溃）
+8. `worker.py` - 异步采集引擎
+   - 连接服务器 API 拉取/推送
+   - 200ms ± 50ms 随机抖动限速
+   - 被封检测 → 换 IP + 换 session，最多重试 3 次
+   - CLI: python worker.py --server http://x.x.x.x:8899
+
+### ✅ 服务器 (2/2)
+9. `server.py` - FastAPI 中央服务器 (端口 8899)
+   - POST /api/upload — 上传 ASIN 文件
+   - GET /api/tasks/pull — Worker 拉取任务
+   - POST /api/tasks/result — Worker 提交结果
+   - GET /api/progress/{batch} — 进度查询
+   - GET /api/export/{batch} — 数据导出 (Excel/CSV)
+   - GET /api/workers — Worker 在线列表
+   - GET/PUT /api/settings — 设置管理
+   - POST /api/batches/{name}/retry — 重试失败任务
+   - DELETE /api/batches/{name} — 删除批次
+
+### ✅ Web UI (4/4)
+10. `templates/base.html` — 深色主题基础模板 + 侧边栏导航
+11. `templates/dashboard.html` — 仪表盘（进度条、统计卡片、5秒自动刷新）
+12. `templates/tasks.html` — 任务管理（拖拽上传、批次列表、操作按钮）
+13. `templates/results.html` — 结果浏览（分页、搜索、筛选、导出）
+14. `templates/settings.html` — 设置页面
+15. `templates/workers.html` — Worker 监控
+16. `static/css/style.css` — 自定义深色主题 CSS
+
+### ✅ 功能 (3/3)
+17. 数据导出 — Excel (中文表头) + CSV
+18. 断点续传 — 超时回退 + 失败重试
+19. Worker 监控 — 在线/离线状态、心跳追踪
+
+## 启动方式
+```bash
+# 安装依赖
+cd /Users/nextderboy/Projects/amazon-scraper-v2
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 启动服务器
+python server.py
+# 访问 http://localhost:8899
+
+# 启动 Worker（另一个终端或另一台机器）
+python worker.py --server http://<服务器IP>:8899
+```
+
+## 开发时间线
+- Session 1 (2026-02-15): 完成全部 18 个功能模块
