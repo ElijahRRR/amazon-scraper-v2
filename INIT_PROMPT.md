@@ -48,11 +48,17 @@
 - 被 Amazon 封锁（403/503/captcha）时立即换 IP
 
 ### 反爬策略
-1. **随机 User-Agent** — 维护 20+ 个现代浏览器 UA
-2. **请求间隔** — 每个 worker 控制 200ms 间隔（5次/s）
-3. **重试机制** — 被封锁时换 IP 重试，最多 3 次
-4. **Session 管理** — 每个 worker 维护独立的 cookie session
-5. **TLS 指纹** — 使用 curl_cffi 模拟真实浏览器 TLS 指纹
+1. **TLS/JA3 指纹** — 使用 curl_cffi（impersonate="chrome120"）模拟真实浏览器 TLS 握手指纹，这是最关键的反封措施
+2. **随机 User-Agent** — 维护 20+ 个现代浏览器 UA，且 UA 必须与 impersonate 的浏览器版本匹配
+3. **HTTP/2 指纹** — curl_cffi 自动处理 HTTP/2 SETTINGS、WINDOW_UPDATE、PRIORITY 等帧指纹
+4. **请求头顺序** — 模拟真实浏览器的请求头顺序（Host, Connection, Accept, UA 等），不能随意排列
+5. **sec-ch-ua 头** — 必须与 UA 版本一致，包含 sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, sec-fetch-dest, sec-fetch-mode, sec-fetch-site
+6. **Cookie 管理** — 每个 session 维护完整的 cookie jar，模拟真实浏览器的 cookie 行为
+7. **Accept-Language / Accept-Encoding** — 使用真实浏览器的值，不要用 Python 默认的
+8. **请求间隔** — 每个 worker 控制 200ms 间隔（5次/s），加入 ±50ms 随机抖动
+9. **重试机制** — 被封锁时换 IP + 换 session 重试，最多 3 次
+10. **Referer 链** — 第一次请求带 `https://www.amazon.com/` 作为 referer，后续带上一个请求的 URL
+11. **Canvas/WebGL 指纹** — 不适用（非浏览器环境），但 TLS 指纹是核心
 
 ### 数据库表设计
 
