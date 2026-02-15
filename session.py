@@ -56,11 +56,13 @@ class AmazonSession:
             try:
                 proxy = await self.proxy_manager.get_proxy()
 
-                # 创建会话（impersonate Chrome 120）
+                # 创建会话（impersonate Chrome, HTTP/2 多路复用）
                 self._session = AsyncSession(
                     impersonate=config.IMPERSONATE_BROWSER,
                     timeout=config.REQUEST_TIMEOUT,
                     proxy=proxy,
+                    max_clients=config.DEFAULT_CONCURRENCY,
+                    http_version=2,
                 )
 
                 # 1. 访问首页获取初始 cookies
@@ -176,7 +178,7 @@ class AmazonSession:
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": self._user_agent,
             "Upgrade-Insecure-Requests": "1",
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self._platform,
             "Sec-Fetch-Dest": "document",
@@ -208,13 +210,9 @@ class AmazonSession:
         headers = self._build_headers(referer=referer)
 
         try:
-            # 获取当前代理
-            proxy = await self.proxy_manager.get_proxy()
-            
             resp = await self._session.get(
                 url,
                 headers=headers,
-                proxy=proxy,
             )
             
             self._last_url = url
