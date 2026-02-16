@@ -23,11 +23,11 @@ SERVER_PORT = 8899
 # 采集配置
 # ============================================================
 DEFAULT_ZIP_CODE = "10001"
-DEFAULT_CONCURRENCY = 10         # 每个 worker 并发数
-MAX_CLIENTS = 20                 # HTTP/2 连接池 max_clients（多路复用）
-REQUEST_INTERVAL = 0.03          # 请求间隔（秒）— 代理延迟200-500ms已是天然限速
+DEFAULT_CONCURRENCY = 14         # 每个 worker 并发数
+MAX_CLIENTS = 28                 # HTTP/2 连接池 max_clients（多路复用）
+REQUEST_INTERVAL = 0.05          # 请求间隔（秒）— 微间隔让代理更从容
 REQUEST_JITTER = 0.02            # 间隔随机抖动范围（秒）
-REQUEST_TIMEOUT = 30             # 请求超时（秒）
+REQUEST_TIMEOUT = 15             # 请求超时（秒）— 短超时更快释放并发槽位
 MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
 SESSION_ROTATE_EVERY = 100       # 每 N 次成功请求主动轮换 session
