@@ -61,7 +61,7 @@ class AmazonSession:
                     impersonate=config.IMPERSONATE_BROWSER,
                     timeout=config.REQUEST_TIMEOUT,
                     proxy=proxy,
-                    max_clients=config.DEFAULT_CONCURRENCY,
+                    max_clients=config.MAX_CLIENTS,
                     http_version=2,
                 )
 
@@ -196,6 +196,40 @@ class AmazonSession:
             headers["Sec-Fetch-Site"] = "same-origin"
 
         return headers
+
+    async def fetch_aod_page(self, asin: str) -> Optional[Response]:
+        """
+        采集 AOD (All Offers Display) AJAX 页面
+        响应体比产品页小 5-10 倍，包含卖家价格、运费、FBA状态
+        返回: Response 对象 或 None
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        url = f"{self.AMAZON_BASE}/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=true"
+        referer = f"{self.AMAZON_BASE}/dp/{asin}"
+        headers = self._build_headers(referer=referer)
+        # AOD 是 AJAX 请求，需要额外的头
+        headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Accept": "text/html,*/*",
+        })
+
+        try:
+            resp = await self._session.get(
+                url,
+                headers=headers,
+            )
+
+            self._last_url = referer  # referer 保持为产品页
+            self._request_count += 1
+
+            return resp
+        except Exception as e:
+            logger.error(f"AOD 请求失败 ASIN={asin}: {e}")
+            return None
 
     async def fetch_product_page(self, asin: str) -> Optional[Response]:
         """

@@ -24,6 +24,7 @@ SERVER_PORT = 8899
 # ============================================================
 DEFAULT_ZIP_CODE = "10001"
 DEFAULT_CONCURRENCY = 10         # 每个 worker 并发数
+MAX_CLIENTS = 20                 # HTTP/2 连接池 max_clients（多路复用）
 REQUEST_INTERVAL = 0.03          # 请求间隔（秒）— 代理延迟200-500ms已是天然限速
 REQUEST_JITTER = 0.02            # 间隔随机抖动范围（秒）
 REQUEST_TIMEOUT = 30             # 请求超时（秒）
