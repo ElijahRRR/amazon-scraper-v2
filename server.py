@@ -217,6 +217,33 @@ async def submit_result(request: Request):
     return {"status": "ok"}
 
 
+# --- Worker 批量提交结果 ---
+@app.post("/api/tasks/result/batch")
+async def submit_result_batch(request: Request):
+    """Worker 批量提交采集结果"""
+    db = await get_db()
+    data = await request.json()
+    results_list = data.get("results", [])
+
+    for item in results_list:
+        task_id = item.get("task_id")
+        worker_id = item.get("worker_id", "unknown")
+        success = item.get("success", False)
+        result_data = item.get("result")
+
+        _register_worker(worker_id)
+        if worker_id in _worker_registry:
+            _worker_registry[worker_id]["results_submitted"] += 1
+
+        if success and result_data:
+            await db.save_result(result_data)
+            await db.mark_task_done(task_id, worker_id)
+        else:
+            await db.mark_task_failed(task_id, worker_id)
+
+    return {"status": "ok", "count": len(results_list)}
+
+
 # --- 进度查询 ---
 @app.get("/api/progress/{batch_name}")
 async def get_progress(batch_name: str):
