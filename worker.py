@@ -36,11 +36,12 @@ class Worker:
     """异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
-                 zip_code: str = None):
+                 zip_code: str = None, fast_mode: bool = False):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.concurrency = concurrency or config.DEFAULT_CONCURRENCY
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
+        self.fast_mode = fast_mode  # 快速模式: AOD 优先获取价格
 
         # 组件
         self.proxy_manager = get_proxy_manager()
@@ -64,6 +65,12 @@ class Worker:
         # 运行控制
         self._running = False
 
+        # 批量提交队列
+        self._result_queue: asyncio.Queue = None  # 在 start() 中初始化
+        self._batch_submitter_task: Optional[asyncio.Task] = None
+        self._batch_size = 10
+        self._batch_interval = 2.0  # 秒
+
         # Session 轮换控制
         self._success_since_rotate = 0
         self._rotate_every = config.SESSION_ROTATE_EVERY
@@ -75,9 +82,14 @@ class Worker:
         logger.info(f"   服务器: {self.server_url}")
         logger.info(f"   并发数: {self.concurrency}")
         logger.info(f"   邮编: {self.zip_code}")
+        logger.info(f"   快速模式: {'开启 (AOD优先)' if self.fast_mode else '关闭'}")
 
         self._running = True
         self._stats["start_time"] = time.time()
+
+        # 初始化批量提交队列和后台任务
+        self._result_queue = asyncio.Queue()
+        self._batch_submitter_task = asyncio.create_task(self._batch_submitter())
 
         # 初始化 session
         await self._init_session()
@@ -178,6 +190,20 @@ class Worker:
                 delay = self._interval + random.uniform(-self._jitter, self._jitter)
                 await asyncio.sleep(delay)
 
+                # 快速模式: 先用 AOD 获取价格数据
+                if self.fast_mode and attempt == 0:
+                    aod_result = await self._try_aod_fast(asin, zip_code, task)
+                    if aod_result is not None:
+                        await self._submit_result(task_id, aod_result, success=True)
+                        self._stats["success"] += 1
+                        self._stats["total"] += 1
+                        self._success_since_rotate += 1
+                        title_short = aod_result["title"][:40] if aod_result.get("title") else "AOD"
+                        logger.info(f"AOD {asin} | {title_short}... | {aod_result['buybox_price']}")
+                        if self._success_since_rotate >= self._rotate_every:
+                            await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
+                        return
+
                 # 发起请求
                 resp = await self._session.fetch_product_page(asin)
 
@@ -250,28 +276,131 @@ class Worker:
         self._stats["failed"] += 1
         self._stats["total"] += 1
 
-    async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool):
-        """提交采集结果到服务器"""
+    async def _try_aod_fast(self, asin: str, zip_code: str, task: Dict) -> Optional[Dict]:
+        """
+        AOD 快速路径: 用 AOD AJAX 端点获取价格数据
+        成功返回 result_data，失败返回 None（会 fallback 到产品页）
+        """
         try:
-            url = f"{self.server_url}/api/tasks/result"
-            payload = {
-                "task_id": task_id,
-                "worker_id": self.worker_id,
-                "success": success,
-                "result": result_data,
-            }
+            resp = await self._session.fetch_aod_page(asin)
+            if resp is None:
+                return None
+            if self._session.is_blocked(resp):
+                return None
+            if resp.status_code != 200:
+                return None
+
+            aod_data = self.parser.parse_aod_response(resp.text, asin)
+
+            # AOD 必须至少有价格才算成功
+            if not aod_data.get("offers") or aod_data["buybox_price"] == "N/A":
+                return None
+
+            # 构建完整结果（AOD 只有价格数据，其他字段留默认）
+            result_data = self.parser._default_result(asin, zip_code)
+            result_data["title"] = f"[AOD] {asin}"  # AOD 不包含标题
+            result_data["buybox_price"] = aod_data["buybox_price"]
+            result_data["current_price"] = aod_data["buybox_price"]
+            result_data["buybox_shipping"] = aod_data["buybox_shipping"]
+            result_data["is_fba"] = aod_data["is_fba"]
+            result_data["batch_name"] = task.get("batch_name", "")
+            return result_data
+
+        except Exception as e:
+            logger.debug(f"AOD 快速路径失败 {asin}: {e}")
+            return None
+
+    async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool):
+        """将结果放入批量提交队列"""
+        payload = {
+            "task_id": task_id,
+            "worker_id": self.worker_id,
+            "success": success,
+            "result": result_data,
+        }
+        await self._result_queue.put(payload)
+
+    async def _batch_submitter(self):
+        """后台协程：每攒够 batch_size 个或每 batch_interval 秒批量提交"""
+        batch: List[Dict] = []
+        while self._running or not self._result_queue.empty():
+            try:
+                # 等待队列中的数据，最多等 batch_interval 秒
+                try:
+                    item = await asyncio.wait_for(
+                        self._result_queue.get(), timeout=self._batch_interval
+                    )
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    pass
+
+                # 快速排空队列中已有的数据
+                while not self._result_queue.empty() and len(batch) < self._batch_size:
+                    batch.append(self._result_queue.get_nowait())
+
+                # 达到批量大小或超时且有数据 → 提交
+                if batch:
+                    await self._submit_batch(batch)
+                    batch = []
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"批量提交协程异常: {e}")
+                await asyncio.sleep(1)
+
+        # 退出前刷新剩余
+        if batch:
+            await self._submit_batch(batch)
+
+    async def _flush_results(self):
+        """刷新队列中所有剩余结果"""
+        batch: List[Dict] = []
+        while not self._result_queue.empty():
+            batch.append(self._result_queue.get_nowait())
+        if batch:
+            await self._submit_batch(batch)
+
+    async def _submit_batch(self, batch: List[Dict]):
+        """批量 POST 提交结果到服务器"""
+        try:
+            url = f"{self.server_url}/api/tasks/result/batch"
             resp = curl_requests.post(
                 url,
-                json=payload,
-                timeout=10,
+                json={"results": batch},
+                timeout=15,
             )
-            if resp.status_code != 200:
-                logger.warning(f"提交结果失败: HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                logger.debug(f"批量提交 {len(batch)} 条结果成功")
+            else:
+                logger.warning(f"批量提交失败 HTTP {resp.status_code}，回退逐条提交")
+                await self._submit_batch_fallback(batch)
         except Exception as e:
-            logger.error(f"提交结果异常: {e}")
+            logger.error(f"批量提交异常: {e}，回退逐条提交")
+            await self._submit_batch_fallback(batch)
+
+    async def _submit_batch_fallback(self, batch: List[Dict]):
+        """逐条提交 fallback（批量接口不可用时）"""
+        url = f"{self.server_url}/api/tasks/result"
+        for payload in batch:
+            try:
+                resp = curl_requests.post(url, json=payload, timeout=10)
+                if resp.status_code != 200:
+                    logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
+            except Exception as e:
+                logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
 
     async def _cleanup(self):
         """清理资源"""
+        # 刷新批量提交队列中的剩余结果
+        if self._result_queue:
+            await self._flush_results()
+        if self._batch_submitter_task:
+            self._batch_submitter_task.cancel()
+            try:
+                await self._batch_submitter_task
+            except asyncio.CancelledError:
+                pass
         if self._session:
             await self._session.close()
 
@@ -301,7 +430,8 @@ def main():
     arg_parser.add_argument("--worker-id", default=None, help="Worker ID（默认自动生成）")
     arg_parser.add_argument("--concurrency", type=int, default=None, help=f"并发数（默认 {config.DEFAULT_CONCURRENCY}）")
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
-    
+    arg_parser.add_argument("--fast", action="store_true", help="快速模式: AOD 优先获取价格数据")
+
     args = arg_parser.parse_args()
 
     worker = Worker(
@@ -309,6 +439,7 @@ def main():
         worker_id=args.worker_id,
         concurrency=args.concurrency,
         zip_code=args.zip_code,
+        fast_mode=args.fast,
     )
 
     # 优雅退出
