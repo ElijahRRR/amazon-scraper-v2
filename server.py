@@ -483,6 +483,12 @@ async def settings_page(request: Request):
     return templates.TemplateResponse("settings.html", {
         "request": request,
         "settings": _runtime_settings,
+        "config": {
+            "port": config.SERVER_PORT,
+            "impersonate": config.IMPERSONATE_BROWSER,
+            "timeout": config.REQUEST_TIMEOUT,
+            "rotate_every": config.SESSION_ROTATE_EVERY,
+        },
     })
 
 

@@ -75,6 +75,7 @@ class Worker:
         self._success_since_rotate = 0
         self._rotate_every = config.SESSION_ROTATE_EVERY
         self._rotate_lock = asyncio.Lock()
+        self._last_rotate_time = 0.0  # 轮换防抖
 
     async def start(self):
         """启动 Worker"""
@@ -133,8 +134,13 @@ class Worker:
         self._success_since_rotate = 0
 
     async def _rotate_session(self, reason: str = "主动轮换"):
-        """轮换 session：关闭旧的，刷新代理，创建新的"""
+        """轮换 session：关闭旧的，刷新代理，创建新的（带防抖）"""
         async with self._rotate_lock:
+            # 防抖：5秒内不重复轮换
+            now = time.time()
+            if now - self._last_rotate_time < 5:
+                logger.debug(f"🔄 跳过轮换（距上次不足5秒）")
+                return
             logger.info(f"🔄 Session {reason}...")
             if self._session:
                 await self._session.close()
@@ -143,6 +149,7 @@ class Worker:
             self._session = AmazonSession(self.proxy_manager, self.zip_code)
             success = await self._session.initialize()
             self._success_since_rotate = 0
+            self._last_rotate_time = time.time()
             if success:
                 logger.info("🔄 Session 轮换成功")
             else:
@@ -184,11 +191,18 @@ class Worker:
         zip_code = task.get("zip_code", self.zip_code)
         max_retries = config.MAX_RETRIES
 
-        for attempt in range(max_retries):
+        attempt = 0
+        while attempt < max_retries:
             try:
-                # 速率控制：200ms ± 50ms 随机抖动
+                # 速率控制
                 delay = self._interval + random.uniform(-self._jitter, self._jitter)
                 await asyncio.sleep(delay)
+
+                # 等待 session 就绪（轮换期间可能暂时不可用）
+                if self._session is None or self._session._session is None:
+                    logger.debug(f"ASIN {asin} 等待 session 就绪...")
+                    await asyncio.sleep(3)
+                    continue  # 不增加 attempt
 
                 # 快速模式: 先用 AOD 获取价格数据
                 if self.fast_mode and attempt == 0:
@@ -209,14 +223,16 @@ class Worker:
 
                 # 请求失败（超时/网络异常）→ 不换 IP，等待后重试
                 if resp is None:
-                    logger.warning(f"ASIN {asin} 请求超时 (尝试 {attempt+1}/{max_retries})")
+                    attempt += 1
+                    logger.warning(f"ASIN {asin} 请求超时 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
 
                 # 真正被封（403/503/验证码）→ 换 IP + 换 session
                 if self._session.is_blocked(resp):
+                    attempt += 1
                     self._stats["blocked"] += 1
-                    logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt+1}/{max_retries})")
+                    logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
                     await self._rotate_session(reason="被封锁")
                     continue
 
@@ -235,19 +251,27 @@ class Worker:
                 result_data = self.parser.parse_product(resp.text, asin, zip_code)
                 result_data["batch_name"] = task.get("batch_name", "")
 
-                # 检查是否是拦截页面
-                if result_data["title"] in ["[验证码拦截]", "[API封锁]"]:
+                # 检查是否是拦截或空页面
+                title = result_data.get("title", "")
+                if title in ["[验证码拦截]", "[API封锁]"]:
+                    attempt += 1
                     self._stats["blocked"] += 1
-                    logger.warning(f"ASIN {asin} {result_data['title']} (尝试 {attempt+1}/{max_retries})")
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await self._rotate_session(reason="页面拦截")
                     continue
 
-                # 标题为空视为软拦截
-                if not result_data["title"] or result_data["title"] == "N/A":
-                    logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt+1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2)
-                        continue
+                if title in ["[页面为空]", "[HTML解析失败]"]:
+                    attempt += 1
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
+
+                # 标题为空视为软拦截，重试
+                if not title or title == "N/A":
+                    attempt += 1
+                    logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
 
                 # 成功
                 await self._submit_result(task_id, result_data, success=True)
@@ -265,10 +289,9 @@ class Worker:
                 return
 
             except Exception as e:
-                logger.error(f"ASIN {asin} 异常 (尝试 {attempt+1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
+                attempt += 1
+                logger.error(f"ASIN {asin} 异常 (尝试 {attempt}/{max_retries}): {e}")
+                await asyncio.sleep(2)
 
         # 所有重试用完，标记失败
         logger.error(f"ASIN {asin} 采集失败 (已重试 {max_retries} 次)")

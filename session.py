@@ -109,6 +109,8 @@ class AmazonSession:
         这是正确的邮编设置方式（而非伪造 cookie）
         """
         try:
+            if self._session is None:
+                return False
             # 从首页 cookie 中提取 csrf token
             cookies = self._session.cookies
             session_id = None
@@ -178,7 +180,7 @@ class AmazonSession:
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": self._user_agent,
             "Upgrade-Insecure-Requests": "1",
-            "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua": '"Chromium";v="133", "Google Chrome";v="133", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self._platform,
             "Sec-Fetch-Dest": "document",
@@ -205,6 +207,10 @@ class AmazonSession:
         """
         if not self._initialized:
             await self.initialize()
+
+        if self._session is None:
+            logger.warning(f"⚠️ Session 未就绪，跳过 AOD ASIN={asin}")
+            return None
 
         url = f"{self.AMAZON_BASE}/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=true"
         referer = f"{self.AMAZON_BASE}/dp/{asin}"
@@ -239,6 +245,10 @@ class AmazonSession:
         if not self._initialized:
             await self.initialize()
 
+        if self._session is None:
+            logger.warning(f"⚠️ Session 未就绪，跳过 ASIN={asin}")
+            return None
+
         url = f"{self.AMAZON_BASE}/dp/{asin}"
         referer = self._last_url or f"{self.AMAZON_BASE}/"
         headers = self._build_headers(referer=referer)
@@ -248,10 +258,15 @@ class AmazonSession:
                 url,
                 headers=headers,
             )
-            
+
             self._last_url = url
             self._request_count += 1
-            
+
+            # 检测空响应或过短响应（正常产品页至少 50KB）
+            if resp.status_code == 200 and len(resp.content) < 1000:
+                logger.warning(f"⚠️ ASIN={asin} 响应体过短 ({len(resp.content)} bytes)，视为空页面")
+                return None
+
             return resp
         except Exception as e:
             logger.error(f"❌ 请求失败 ASIN={asin}: {e}")
@@ -261,8 +276,13 @@ class AmazonSession:
         """
         检测是否被 Amazon 封锁
         注意：response 为 None（超时）时由调用方单独处理，这里只检查实际响应
+        注意：404 不算封锁（Amazon 标准 404 页面包含 api-services-support 注释）
         """
         if response is None:
+            return False
+
+        # 404 是正常的商品不存在，不是封锁
+        if response.status_code == 404:
             return False
 
         # HTTP 状态码检测

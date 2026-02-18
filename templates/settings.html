@@ -23,12 +23,12 @@
                             <label class="form-label">每 Worker 并发数</label>
                             <input type="number" class="form-control" name="concurrency" 
                                    value="{{ settings.concurrency }}" min="1" max="20">
-                            <small class="text-secondary">建议不超过 5（匹配代理限制）</small>
+                            <small class="text-secondary">建议不超过 14（匹配代理限制）</small>
                         </div>
                         <div class="col-md-6">
                             <label class="form-label">请求间隔（秒）</label>
                             <input type="number" class="form-control" name="request_interval" 
-                                   value="{{ settings.request_interval }}" step="0.01" min="0.1">
+                                   value="{{ settings.request_interval }}" step="0.01" min="0">
                             <small class="text-secondary">每次请求之间的间隔</small>
                         </div>
                         <div class="col-md-6">
@@ -61,7 +61,7 @@
                 <ul class="list-unstyled mb-0">
                     <li class="mb-2">
                         <small class="text-secondary">服务端口</small><br>
-                        <strong>{{ settings.get('port', 8899) if settings.get else 8899 }}</strong>
+                        <strong>{{ config.port }}</strong>
                     </li>
                     <li class="mb-2">
                         <small class="text-secondary">数据库路径</small><br>
@@ -69,7 +69,15 @@
                     </li>
                     <li class="mb-2">
                         <small class="text-secondary">TLS 指纹</small><br>
-                        <strong>chrome120</strong>
+                        <strong>{{ config.impersonate }}</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">请求超时</small><br>
+                        <strong>{{ config.timeout }}s</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">Session 轮换</small><br>
+                        <strong>每 {{ config.rotate_every }} 次</strong>
                     </li>
                     <li>
                         <small class="text-secondary">版本</small><br>

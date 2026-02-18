@@ -34,6 +34,21 @@
     </div>
 </div>
 
+<!-- 采集速度 -->
+<div class="card mb-4">
+    <div class="card-body d-flex align-items-center justify-content-between">
+        <div>
+            <span class="text-secondary" style="font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px;">
+                <i class="bi bi-lightning-charge"></i> 采集速度
+            </span>
+        </div>
+        <div class="d-flex align-items-baseline gap-2">
+            <span id="stat-speed" style="font-size:2rem;font-weight:700;color:var(--accent);">--</span>
+            <span class="text-secondary" style="font-size:0.9rem;">条/分钟</span>
+        </div>
+    </div>
+</div>
+
 <!-- 整体进度条 -->
 <div class="card mb-4">
     <div class="card-body">
@@ -103,21 +118,49 @@
 
 {% block extra_js %}
 <script>
-// 每 5 秒自动刷新进度
+// 速度计算：追踪 done 变化量
+let prevDone = {{ progress.done }};
+let prevTime = Date.now();
+
+// 每 10 秒刷新进度和计算速度
 setInterval(async () => {
     try {
         const resp = await fetch('/api/progress');
         const data = await resp.json();
+
         document.getElementById('stat-total').textContent = data.total;
         document.getElementById('stat-done').textContent = data.done;
         document.getElementById('stat-processing').textContent = data.processing;
         document.getElementById('stat-failed').textContent = data.failed;
         document.getElementById('progress-pct').textContent = data.success_rate + '%';
+
         if (data.total > 0) {
             document.getElementById('progress-bar-done').style.width = (data.done / data.total * 100) + '%';
             document.getElementById('progress-bar-failed').style.width = (data.failed / data.total * 100) + '%';
         }
+
+        // 计算速度
+        const now = Date.now();
+        const deltaDone = data.done - prevDone;
+        const deltaSec = (now - prevTime) / 1000;
+
+        if (deltaSec > 0 && deltaDone >= 0) {
+            const speed = deltaDone / deltaSec * 60;
+            const el = document.getElementById('stat-speed');
+            if (deltaDone === 0 && data.processing === 0) {
+                el.textContent = '0';
+                el.style.color = 'var(--text-secondary)';
+            } else if (deltaDone === 0) {
+                // 有任务在处理但还没出结果，保持上次的值不变
+            } else {
+                el.textContent = speed.toFixed(1);
+                el.style.color = 'var(--accent)';
+            }
+        }
+
+        prevDone = data.done;
+        prevTime = now;
     } catch(e) {}
-}, 5000);
+}, 10000);
 </script>
 {% endblock %}
