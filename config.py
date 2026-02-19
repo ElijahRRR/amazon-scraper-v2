@@ -23,7 +23,7 @@ SERVER_PORT = 8899
 # 采集配置
 # ============================================================
 DEFAULT_ZIP_CODE = "10001"
-DEFAULT_CONCURRENCY = 14         # 每个 worker 并发数
+DEFAULT_CONCURRENCY = 14         # 固定并发数（仅作为 fallback / --concurrency 覆盖）
 MAX_CLIENTS = 28                 # HTTP/2 连接池 max_clients（多路复用）
 REQUEST_INTERVAL = 0.05          # 请求间隔（秒）— 微间隔让代理更从容
 REQUEST_JITTER = 0.02            # 间隔随机抖动范围（秒）
@@ -31,6 +31,30 @@ REQUEST_TIMEOUT = 15             # 请求超时（秒）— 短超时更快释�
 MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
 SESSION_ROTATE_EVERY = 100       # 每 N 次成功请求主动轮换 session
+
+# ============================================================
+# 自适应并发控制（流水线模式）
+# ============================================================
+INITIAL_CONCURRENCY = 5          # 冷启动并发数（保守开始，自动攀升）
+MIN_CONCURRENCY = 2              # 并发下限（再差也保持 2 个在飞）
+MAX_CONCURRENCY = 50             # 并发上限（受代理套餐约束）
+
+# 代理硬约束
+PROXY_BANDWIDTH_MBPS = 24        # 总带宽上限 (如 8通道×3Mbps=24)
+
+# 自适应调节参数
+ADJUST_INTERVAL_S = 10           # 评估间隔（秒）
+TARGET_LATENCY_S = 2.0           # 目标 p50 延迟（低于此才加速）
+MAX_LATENCY_S = 4.0              # 延迟上限（超过则减速）
+TARGET_SUCCESS_RATE = 0.95       # 成功率目标（高于此才加速）
+MIN_SUCCESS_RATE = 0.85          # 成功率下限（低于此则减速）
+BLOCK_RATE_THRESHOLD = 0.05      # 封锁率阈值（超 5% 紧急减速）
+BANDWIDTH_SOFT_CAP = 0.80        # 带宽软上限（超 80% 停止加速）
+COOLDOWN_AFTER_BLOCK_S = 30      # 被封后冷却时间（秒）
+
+# 任务预取
+TASK_QUEUE_SIZE = 100            # 任务缓冲队列大小
+TASK_PREFETCH_THRESHOLD = 0.5    # 队列低于 50% 时触发预取
 
 # ============================================================
 # 代理配置（快代理 TPS）

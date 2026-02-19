@@ -1,9 +1,12 @@
 """
-Amazon 产品采集系统 v2 - Worker 采集引擎
+Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发）
+
+架构：
+  task_feeder  → [task_queue] → worker_pool (N个独立协程) → [result_queue] → batch_submitter
+  
+  adaptive_controller 实时调整 N 的大小
+
 连接中央服务器 API 拉取任务、推送结果
-每个 worker 维护独立 session
-严格 5次/s 限速（200ms ± 50ms 随机抖动）
-被封检测 → 换 IP + 换 session 重试，最多 3 次
 启动方式：python worker.py --server http://x.x.x.x:8899
 """
 import asyncio
@@ -22,6 +25,8 @@ import config
 from proxy import ProxyManager, get_proxy_manager
 from session import AmazonSession
 from parser import AmazonParser
+from metrics import MetricsCollector
+from adaptive import AdaptiveController
 
 # 日志配置
 logging.basicConfig(
@@ -33,13 +38,12 @@ logger = logging.getLogger(__name__)
 
 
 class Worker:
-    """异步采集 Worker"""
+    """流水线异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
                  zip_code: str = None, fast_mode: bool = False):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
-        self.concurrency = concurrency or config.DEFAULT_CONCURRENCY
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self.fast_mode = fast_mode  # 快速模式: AOD 优先获取价格
 
@@ -51,7 +55,21 @@ class Worker:
         # 速率控制
         self._interval = config.REQUEST_INTERVAL
         self._jitter = config.REQUEST_JITTER
-        self._semaphore = asyncio.Semaphore(self.concurrency)
+
+        # 自适应并发控制
+        self._metrics = MetricsCollector()
+        max_c = concurrency or config.MAX_CONCURRENCY
+        self._controller = AdaptiveController(
+            initial=config.INITIAL_CONCURRENCY,
+            min_c=config.MIN_CONCURRENCY,
+            max_c=max_c,
+            metrics=self._metrics,
+        )
+
+        # 任务队列（流水线核心）
+        self._task_queue: asyncio.Queue = None
+        self._queue_size = getattr(config, "TASK_QUEUE_SIZE", 100)
+        self._prefetch_threshold = getattr(config, "TASK_PREFETCH_THRESHOLD", 0.5)
 
         # 统计
         self._stats = {
@@ -66,7 +84,7 @@ class Worker:
         self._running = False
 
         # 批量提交队列
-        self._result_queue: asyncio.Queue = None  # 在 start() 中初始化
+        self._result_queue: asyncio.Queue = None
         self._batch_submitter_task: Optional[asyncio.Task] = None
         self._batch_size = 10
         self._batch_interval = 2.0  # 秒
@@ -77,44 +95,40 @@ class Worker:
         self._rotate_lock = asyncio.Lock()
         self._last_rotate_time = 0.0  # 轮换防抖
 
+        # Worker 协程管理
+        self._worker_tasks: List[asyncio.Task] = []
+
     async def start(self):
-        """启动 Worker"""
-        logger.info(f"🚀 Worker [{self.worker_id}] 启动")
+        """启动 Worker（流水线架构）"""
+        logger.info(f"🚀 Worker [{self.worker_id}] 启动（流水线模式）")
         logger.info(f"   服务器: {self.server_url}")
-        logger.info(f"   并发数: {self.concurrency}")
+        logger.info(f"   初始并发: {self._controller.current_concurrency}")
+        logger.info(f"   并发范围: [{config.MIN_CONCURRENCY}, {self._controller._max}]")
         logger.info(f"   邮编: {self.zip_code}")
         logger.info(f"   快速模式: {'开启 (AOD优先)' if self.fast_mode else '关闭'}")
 
         self._running = True
         self._stats["start_time"] = time.time()
 
-        # 初始化批量提交队列和后台任务
+        # 初始化队列
+        self._task_queue = asyncio.Queue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
-        self._batch_submitter_task = asyncio.create_task(self._batch_submitter())
 
         # 初始化 session
         await self._init_session()
 
-        # 主循环：持续拉取和处理任务
-        while self._running:
-            try:
-                tasks = await self._pull_tasks()
-                if not tasks:
-                    logger.info("📭 暂无任务，等待 5 秒...")
-                    await asyncio.sleep(5)
-                    continue
+        # 启动自适应控制器
+        await self._controller.start()
 
-                logger.info(f"📋 拉取到 {len(tasks)} 个任务")
-
-                # 并发处理任务
-                sem_tasks = [self._process_with_semaphore(task) for task in tasks]
-                await asyncio.gather(*sem_tasks, return_exceptions=True)
-
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                logger.error(f"❌ 主循环异常: {e}")
-                await asyncio.sleep(3)
+        # 启动三大协程
+        try:
+            await asyncio.gather(
+                self._task_feeder(),         # 1. 持续从 Server 拉任务
+                self._worker_pool(),         # 2. 工人池：自适应并发
+                self._batch_submitter(),     # 3. 批量回传结果
+            )
+        except asyncio.CancelledError:
+            pass
 
         await self._cleanup()
         logger.info(f"🛑 Worker [{self.worker_id}] 已停止")
@@ -123,6 +137,164 @@ class Worker:
     async def stop(self):
         """停止 Worker"""
         self._running = False
+        # 向任务队列放入 None 哨兵，唤醒所有等待的 worker
+        for _ in range(self._controller._max):
+            try:
+                self._task_queue.put_nowait(None)
+            except (asyncio.QueueFull, AttributeError):
+                break
+
+    # ═══════════════════════════════════════════════
+    # 流水线三大组件
+    # ═══════════════════════════════════════════════
+
+    async def _task_feeder(self):
+        """
+        任务补给协程：持续从 Server 拉任务，保持队列不空
+        
+        当队列低于阈值时，主动拉取新任务填充
+        """
+        logger.info("📡 任务补给协程启动")
+        empty_streak = 0  # 连续空响应计数
+
+        while self._running:
+            try:
+                queue_size = self._task_queue.qsize()
+                threshold = int(self._queue_size * self._prefetch_threshold)
+
+                if queue_size < threshold:
+                    # 拉取量 = 当前并发数的 2 倍（预取），但不超过队列剩余空间
+                    fetch_count = min(
+                        self._controller.current_concurrency * 2,
+                        self._queue_size - queue_size,
+                    )
+                    fetch_count = max(fetch_count, 5)  # 至少拉 5 个
+
+                    tasks = await self._pull_tasks(count=fetch_count)
+                    
+                    if tasks:
+                        empty_streak = 0
+                        for task in tasks:
+                            await self._task_queue.put(task)
+                        logger.debug(f"📡 补给 {len(tasks)} 个任务 (队列: {self._task_queue.qsize()})")
+                    else:
+                        empty_streak += 1
+                        # 指数退避：连续空响应时逐渐增加等待
+                        wait = min(5 * (2 ** min(empty_streak - 1, 3)), 30)
+                        logger.info(f"📭 暂无任务，等待 {wait} 秒... (队列剩余: {queue_size})")
+                        await asyncio.sleep(wait)
+                else:
+                    # 队列充足，短暂休息
+                    await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ 任务补给异常: {e}")
+                await asyncio.sleep(3)
+
+        logger.info("📡 任务补给协程退出")
+
+    async def _worker_pool(self):
+        """
+        工人池协程：管理动态数量的 worker 协程
+        
+        每个 worker 独立循环：acquire → 取任务 → 处理 → release → 循环
+        """
+        logger.info("⚙️ 工人池启动")
+        
+        # 启动初始 worker 协程，错开启动时间
+        initial = self._controller.current_concurrency
+        for i in range(initial):
+            task = asyncio.create_task(self._worker_loop(i))
+            self._worker_tasks.append(task)
+
+        # 监控循环：根据并发变化动态增减 worker
+        last_target = initial
+        while self._running:
+            await asyncio.sleep(2)  # 每 2 秒检查一次
+            
+            target = self._controller.current_concurrency
+            current = len([t for t in self._worker_tasks if not t.done()])
+            
+            if target > current:
+                # 需要更多 worker
+                for i in range(target - current):
+                    idx = len(self._worker_tasks)
+                    task = asyncio.create_task(self._worker_loop(idx))
+                    self._worker_tasks.append(task)
+                if target != last_target:
+                    logger.info(f"⚙️ Worker 扩容: {current} → {target}")
+            
+            last_target = target
+            
+            # 清理已完成的 task 引用
+            self._worker_tasks = [t for t in self._worker_tasks if not t.done()]
+
+        # 等待所有 worker 完成
+        if self._worker_tasks:
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        
+        logger.info("⚙️ 工人池退出")
+
+    async def _worker_loop(self, worker_idx: int):
+        """
+        单个 worker 协程：持续取任务处理
+        
+        错开启动 → acquire 并发槽 → 取任务 → 处理 → release → 循环
+        """
+        # 错开启动，分散请求
+        initial_c = self._controller.current_concurrency
+        if initial_c > 0:
+            stagger = worker_idx * (1.0 / initial_c)
+            stagger = min(stagger, 2.0)  # 最多错开 2 秒
+            if stagger > 0:
+                await asyncio.sleep(stagger)
+
+        while self._running:
+            try:
+                # 1. 获取并发槽位（自适应控制器管控）
+                await self._controller.acquire()
+                
+                try:
+                    # 2. 从队列取任务（最多等 5 秒）
+                    try:
+                        task = await asyncio.wait_for(
+                            self._task_queue.get(), timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        # 队列暂时为空，释放槽位后继续等
+                        continue
+                    
+                    # 3. 哨兵值 → 退出
+                    if task is None:
+                        break
+                    
+                    # 4. 处理任务（带计时）
+                    start_time = time.time()
+                    success, blocked, resp_bytes = await self._process_task(task)
+                    elapsed = time.time() - start_time
+                    
+                    # 5. 记录指标
+                    self._controller.record_result(
+                        latency_s=elapsed,
+                        success=success,
+                        blocked=blocked,
+                        resp_bytes=resp_bytes,
+                    )
+                finally:
+                    # 6. 释放并发槽位（保证 release）
+                    self._controller.release()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker-{worker_idx} 异常: {e}")
+                await asyncio.sleep(1)
+
+    # ═══════════════════════════════════════════════
+    # 核心处理逻辑（保持不变）
+    # ═══════════════════════════════════════════════
 
     async def _init_session(self):
         """初始化 Amazon session"""
@@ -155,13 +327,13 @@ class Worker:
             else:
                 logger.warning("⚠️ Session 轮换后初始化失败")
 
-    async def _pull_tasks(self) -> List[Dict]:
+    async def _pull_tasks(self, count: int = None) -> List[Dict]:
         """从服务器拉取任务"""
         try:
             url = f"{self.server_url}/api/tasks/pull"
             params = {
                 "worker_id": self.worker_id,
-                "count": self.concurrency,
+                "count": count or self._controller.current_concurrency,
             }
             resp = curl_requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
@@ -174,22 +346,17 @@ class Worker:
             logger.error(f"拉取任务异常: {e}")
             return []
 
-    async def _process_with_semaphore(self, task: Dict):
-        """带信号量的任务处理（控制并发）"""
-        async with self._semaphore:
-            await self._process_task(task)
-
-    async def _process_task(self, task: Dict):
+    async def _process_task(self, task: Dict) -> tuple:
         """
         处理单个采集任务
-        区分超时和真正的封锁：
-        - 超时/网络错误 → 等待后直接重试（不换 IP）
-        - 验证码/403/503 → 换 IP + 换 session → 重试
+        
+        返回: (success: bool, blocked: bool, resp_bytes: int)
         """
         asin = task["asin"]
         task_id = task["id"]
         zip_code = task.get("zip_code", self.zip_code)
         max_retries = config.MAX_RETRIES
+        resp_bytes = 0
 
         attempt = 0
         while attempt < max_retries:
@@ -216,7 +383,7 @@ class Worker:
                         logger.info(f"AOD {asin} | {title_short}... | {aod_result['buybox_price']}")
                         if self._success_since_rotate >= self._rotate_every:
                             await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
-                        return
+                        return (True, False, resp_bytes)
 
                 # 发起请求
                 resp = await self._session.fetch_product_page(asin)
@@ -228,13 +395,16 @@ class Worker:
                     await asyncio.sleep(2)
                     continue
 
+                # 记录响应大小
+                resp_bytes = len(resp.content) if hasattr(resp, 'content') else 0
+
                 # 真正被封（403/503/验证码）→ 换 IP + 换 session
                 if self._session.is_blocked(resp):
                     attempt += 1
                     self._stats["blocked"] += 1
                     logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
                     await self._rotate_session(reason="被封锁")
-                    continue
+                    return (False, True, resp_bytes)  # 标记被封，让控制器知道
 
                 # 404 处理
                 if self._session.is_404(resp):
@@ -245,7 +415,7 @@ class Worker:
                     await self._submit_result(task_id, result_data, success=True)
                     self._stats["success"] += 1
                     self._stats["total"] += 1
-                    return
+                    return (True, False, resp_bytes)
 
                 # 解析页面
                 result_data = self.parser.parse_product(resp.text, asin, zip_code)
@@ -286,7 +456,7 @@ class Worker:
                 if self._success_since_rotate >= self._rotate_every:
                     await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
 
-                return
+                return (True, False, resp_bytes)
 
             except Exception as e:
                 attempt += 1
@@ -298,6 +468,7 @@ class Worker:
         await self._submit_result(task_id, None, success=False)
         self._stats["failed"] += 1
         self._stats["total"] += 1
+        return (False, False, resp_bytes)
 
     async def _try_aod_fast(self, asin: str, zip_code: str, task: Dict) -> Optional[Dict]:
         """
@@ -332,6 +503,10 @@ class Worker:
         except Exception as e:
             logger.debug(f"AOD 快速路径失败 {asin}: {e}")
             return None
+
+    # ═══════════════════════════════════════════════
+    # 结果提交（保持不变）
+    # ═══════════════════════════════════════════════
 
     async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool):
         """将结果放入批量提交队列"""
@@ -413,8 +588,14 @@ class Worker:
             except Exception as e:
                 logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
 
+    # ═══════════════════════════════════════════════
+    # 生命周期
+    # ═══════════════════════════════════════════════
+
     async def _cleanup(self):
         """清理资源"""
+        # 停止自适应控制器
+        await self._controller.stop()
         # 刷新批量提交队列中的剩余结果
         if self._result_queue:
             await self._flush_results()
@@ -434,8 +615,8 @@ class Worker:
         success = self._stats["success"]
         rate = success / total * 100 if total > 0 else 0
         speed = total / elapsed * 60 if elapsed > 0 else 0
-        
-        logger.info("=" * 50)
+
+        logger.info("=" * 60)
         logger.info(f"📊 Worker [{self.worker_id}] 统计")
         logger.info(f"   总采集: {total}")
         logger.info(f"   成功: {success} ({rate:.1f}%)")
@@ -443,15 +624,19 @@ class Worker:
         logger.info(f"   被封: {self._stats['blocked']}")
         logger.info(f"   速度: {speed:.1f} 条/分钟")
         logger.info(f"   耗时: {elapsed:.0f} 秒")
-        logger.info("=" * 50)
+        logger.info(f"   最终并发: {self._controller.current_concurrency}")
+        # 最终指标快照
+        logger.info(self._metrics.format_summary())
+        logger.info("=" * 60)
 
 
 def main():
     """Worker 入口"""
-    arg_parser = argparse.ArgumentParser(description="Amazon Scraper Worker")
+    arg_parser = argparse.ArgumentParser(description="Amazon Scraper Worker (Pipeline + Adaptive)")
     arg_parser.add_argument("--server", required=True, help="中央服务器地址 (如 http://192.168.1.100:8899)")
     arg_parser.add_argument("--worker-id", default=None, help="Worker ID（默认自动生成）")
-    arg_parser.add_argument("--concurrency", type=int, default=None, help=f"并发数（默认 {config.DEFAULT_CONCURRENCY}）")
+    arg_parser.add_argument("--concurrency", type=int, default=None,
+                            help=f"最大并发数上限（默认 {config.MAX_CONCURRENCY}，自适应控制器自动探索最优值）")
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
     arg_parser.add_argument("--fast", action="store_true", help="快速模式: AOD 优先获取价格数据")
 
@@ -467,11 +652,11 @@ def main():
 
     # 优雅退出
     loop = asyncio.new_event_loop()
-    
+
     def signal_handler(sig, frame):
         logger.info("⏹️ 收到停止信号，正在退出...")
         loop.create_task(worker.stop())
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
