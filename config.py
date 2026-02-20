@@ -44,8 +44,8 @@ PROXY_BANDWIDTH_MBPS = 0          # 0=不限带宽（禁用带宽感知）
 
 # 自适应调节参数
 ADJUST_INTERVAL_S = 10           # 评估间隔（秒）
-TARGET_LATENCY_S = 2.0           # 目标 p50 延迟（低于此才加速）
-MAX_LATENCY_S = 4.0              # 延迟上限（超过则减速）
+TARGET_LATENCY_S = 5.0           # 目标 p50 延迟（低于此才加速）— 代理往返基线约4s
+MAX_LATENCY_S = 8.0              # 延迟上限（超过则减速）— 真正过载时才触发
 TARGET_SUCCESS_RATE = 0.95       # 成功率目标（高于此才加速）
 MIN_SUCCESS_RATE = 0.85          # 成功率下限（低于此则减速）
 BLOCK_RATE_THRESHOLD = 0.05      # 封锁率阈值（超 5% 紧急减速）
