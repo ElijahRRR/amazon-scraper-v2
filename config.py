@@ -40,7 +40,7 @@ MIN_CONCURRENCY = 2              # 并发下限（再差也保持 2 个在飞）
 MAX_CONCURRENCY = 50             # 并发上限（受代理套餐约束）
 
 # 代理硬约束
-PROXY_BANDWIDTH_MBPS = 24        # 总带宽上限 (如 8通道×3Mbps=24)
+PROXY_BANDWIDTH_MBPS = 0          # 0=不限带宽（禁用带宽感知）
 
 # 自适应调节参数
 ADJUST_INTERVAL_S = 10           # 评估间隔（秒）
