@@ -111,6 +111,19 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_results_asin ON results(asin);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_results_batch_asin ON results(batch_name, asin);
         """)
+
+        # 迁移：为已存在的表添加新列（CREATE TABLE IF NOT EXISTS 不会修改已有表）
+        migrations = [
+            ("tasks", "priority", "INTEGER DEFAULT 0"),
+            ("tasks", "needs_screenshot", "BOOLEAN DEFAULT 0"),
+            ("results", "screenshot_path", "TEXT"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            except Exception:
+                pass  # 列已存在，忽略
+
         await self._db.commit()
 
     # ==================== 任务操作 ====================
