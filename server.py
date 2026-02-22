@@ -591,8 +591,11 @@ source .venv/bin/activate
 
 # 安装依赖（首次运行或依赖更新）
 if [ ! -f ".deps_installed" ] || [ "requirements-worker.txt" -nt ".deps_installed" ]; then
-    echo "安装依赖..."
+    echo "安装核心依赖..."
     pip install -q -r requirements-worker.txt
+    echo "安装截图组件 (playwright)..."
+    pip install -q -r requirements-screenshot.txt
+    playwright install chromium
     touch .deps_installed
 fi
 
@@ -629,8 +632,11 @@ if not exist ".venv" (
 call .venv\\Scripts\\activate.bat
 
 if not exist ".deps_installed" (
-    echo 安装依赖...
+    echo 安装核心依赖...
     pip install -q -r requirements-worker.txt
+    echo 安装截图组件 (playwright^)...
+    pip install -q -r requirements-screenshot.txt
+    playwright install chromium
     echo. > .deps_installed
 )
 
