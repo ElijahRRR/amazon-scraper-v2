@@ -688,20 +688,34 @@ class Worker:
         batch: List[Dict] = []
         while self._running or not self._result_queue.empty():
             try:
-                # 等待队列中的数据，最多等 batch_interval 秒
+                # 等待第一条数据到来（最多等 batch_interval 秒）
                 try:
                     item = await asyncio.wait_for(
                         self._result_queue.get(), timeout=self._batch_interval
                     )
                     batch.append(item)
                 except asyncio.TimeoutError:
-                    pass
+                    # 超时且无数据 → 继续等
+                    if batch:
+                        await self._submit_batch(batch)
+                        batch = []
+                    continue
 
-                # 快速排空队列中已有的数据
-                while not self._result_queue.empty() and len(batch) < self._batch_size:
-                    batch.append(self._result_queue.get_nowait())
+                # 拿到第一条后，在剩余窗口内继续攒数据
+                deadline = asyncio.get_event_loop().time() + self._batch_interval
+                while len(batch) < self._batch_size:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(
+                            self._result_queue.get(), timeout=remaining
+                        )
+                        batch.append(item)
+                    except asyncio.TimeoutError:
+                        break  # 窗口到期
 
-                # 达到批量大小或超时且有数据 → 提交
+                # 提交攒到的批次
                 if batch:
                     await self._submit_batch(batch)
                     batch = []

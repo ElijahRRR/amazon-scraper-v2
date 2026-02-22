@@ -117,7 +117,7 @@
                         <td><small class="text-secondary">{{ r.crawl_time or '' }}</small></td>
                         <td>
                             {% if r.screenshot_path %}
-                            <button class="btn btn-sm btn-outline-accent" onclick="showScreenshot('{{ r.screenshot_path }}', '{{ r.asin }}')" title="查看截图">
+                            <button class="btn btn-sm btn-outline-accent" onclick="showScreenshot(this)" data-path="{{ r.screenshot_path }}" data-asin="{{ r.asin }}" title="查看截图">
                                 <i class="bi bi-camera"></i>
                             </button>
                             {% endif %}
@@ -161,6 +161,12 @@
 
 {% block extra_js %}
 <script>
+// HTML 转义 — 防止 DOM XSS
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 // 状态管理
 let state = {
     batch: '{{ current_batch or "" }}',
@@ -234,27 +240,27 @@ function renderResults(results) {
             ? '<span class="badge-status badge-done">FBA</span>'
             : r.is_fba === 'FBM'
                 ? '<span class="badge-status badge-pending">FBM</span>'
-                : (r.is_fba || 'N/A');
+                : esc(r.is_fba || 'N/A');
 
-        const title = r.title || '';
-        const titleEscaped = title.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        const titleEscaped = esc(r.title || '');
+        const asinEscaped = esc(r.asin || '');
 
         const screenshotCell = r.screenshot_path
-            ? `<button class="btn btn-sm btn-outline-accent" onclick="showScreenshot('${r.screenshot_path}', '${r.asin}')" title="查看截图"><i class="bi bi-camera"></i></button>`
+            ? `<button class="btn btn-sm btn-outline-accent" onclick="showScreenshot(this)" data-path="${esc(r.screenshot_path)}" data-asin="${asinEscaped}" title="查看截图"><i class="bi bi-camera"></i></button>`
             : '';
 
         return `<tr>
-            <td><a href="https://www.amazon.com/dp/${r.asin}" target="_blank"
-                   class="text-decoration-none" style="color:var(--info)">${r.asin}</a></td>
+            <td><a href="https://www.amazon.com/dp/${encodeURIComponent(r.asin)}" target="_blank"
+                   class="text-decoration-none" style="color:var(--info)">${asinEscaped}</a></td>
             <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
                 title="${titleEscaped}">${titleEscaped}</td>
-            <td>${r.current_price || 'N/A'}</td>
-            <td>${r.buybox_price || 'N/A'}</td>
-            <td>${r.brand || 'N/A'}</td>
-            <td>${r.stock_status || 'N/A'}</td>
+            <td>${esc(r.current_price || 'N/A')}</td>
+            <td>${esc(r.buybox_price || 'N/A')}</td>
+            <td>${esc(r.brand || 'N/A')}</td>
+            <td>${esc(r.stock_status || 'N/A')}</td>
             <td>${fbaCell}</td>
-            <td>${r.delivery_date || 'N/A'}</td>
-            <td><small class="text-secondary">${r.crawl_time || ''}</small></td>
+            <td>${esc(r.delivery_date || 'N/A')}</td>
+            <td><small class="text-secondary">${esc(r.crawl_time || '')}</small></td>
             <td>${screenshotCell}</td>
         </tr>`;
     }).join('');
@@ -337,7 +343,9 @@ function renderPagination() {
 }
 
 // 截图预览
-function showScreenshot(path, asin) {
+function showScreenshot(btn) {
+    const path = btn.dataset.path;
+    const asin = btn.dataset.asin;
     document.getElementById('screenshotModalTitle').textContent = `截图预览 - ${asin}`;
     document.getElementById('screenshotImg').src = path;
     document.getElementById('screenshotDownload').href = path;

@@ -461,14 +461,69 @@ async def get_settings():
 
 @app.put("/api/settings")
 async def update_settings(request: Request):
-    """更新运行时设置"""
+    """更新运行时设置（含类型与范围校验）"""
     global _settings_version
     data = await request.json()
+
+    # 类型与范围校验规则：(type, min, max)
+    _validators = {
+        "zip_code":             (str,   None, None),
+        "max_retries":          (int,   1,    10),
+        "proxy_api_url":        (str,   None, None),
+        "token_bucket_rate":    (float, 0.5,  50),
+        "initial_concurrency":  (int,   1,    50),
+        "min_concurrency":      (int,   1,    20),
+        "max_concurrency":      (int,   2,    100),
+        "session_rotate_every": (int,   50,   10000),
+        "adjust_interval":      (int,   3,    60),
+        "target_latency":       (float, 1,    30),
+        "max_latency":          (float, 2,    60),
+        "target_success_rate":  (float, 0.5,  1),
+        "min_success_rate":     (float, 0.3,  1),
+        "block_rate_threshold": (float, 0.01, 0.5),
+        "cooldown_after_block": (int,   5,    120),
+    }
+
     changed = False
+    errors = []
     for key in _runtime_settings:
-        if key in data and data[key] != _runtime_settings[key]:
-            _runtime_settings[key] = data[key]
-            changed = True
+        if key not in data or data[key] == _runtime_settings[key]:
+            continue
+        val = data[key]
+        validator = _validators.get(key)
+        if not validator:
+            continue
+
+        expected_type, lo, hi = validator
+        # 类型转换与校验
+        try:
+            if expected_type is int:
+                val = int(val)
+            elif expected_type is float:
+                val = float(val)
+            elif expected_type is str:
+                val = str(val)
+        except (ValueError, TypeError):
+            errors.append(f"{key}: 期望 {expected_type.__name__}，收到 {type(val).__name__}")
+            continue
+
+        # 范围校验
+        if lo is not None and val < lo:
+            errors.append(f"{key}: 不能小于 {lo}")
+            continue
+        if hi is not None and val > hi:
+            errors.append(f"{key}: 不能大于 {hi}")
+            continue
+
+        _runtime_settings[key] = val
+        changed = True
+
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "errors": errors,
+                     "settings": _runtime_settings, "_version": _settings_version}
+        )
     if changed:
         _settings_version += 1
         logger.info(f"⚙️ 设置已更新 (version={_settings_version})")

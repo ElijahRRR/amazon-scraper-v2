@@ -124,18 +124,30 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
         const data = await resp.json();
         if (resp.ok) {
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = `<div class="alert alert-success">
-                ✅ 上传成功！批次: <strong>${data.batch_name}</strong>，
-                共 ${data.total_asins} 个 ASIN，插入 ${data.inserted} 个任务
-            </div>`;
+            const batchSpan = document.createElement('strong');
+            batchSpan.textContent = data.batch_name;
+            resultDiv.innerHTML = '';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-success';
+            alertDiv.append('✅ 上传成功！批次: ', batchSpan,
+                `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
+            resultDiv.appendChild(alertDiv);
             setTimeout(() => location.reload(), 1500);
         } else {
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = `<div class="alert alert-danger">❌ ${data.detail || '上传失败'}</div>`;
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-danger';
+            alertDiv.textContent = '❌ ' + (data.detail || '上传失败');
+            resultDiv.innerHTML = '';
+            resultDiv.appendChild(alertDiv);
         }
     } catch(err) {
         resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<div class="alert alert-danger">❌ 网络错误: ${err.message}</div>`;
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = '❌ 网络错误: ' + err.message;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
     }
     btn.disabled = false;
     btn.innerHTML = '<i class="bi bi-upload"></i> 上传';
