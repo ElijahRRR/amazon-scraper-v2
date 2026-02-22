@@ -1,0 +1,156 @@
+[
+  {
+    "id": 1,
+    "category": "phase3-frontend",
+    "description": "Results 页面 AJAX 动态筛选：切换批次时无需整页刷新，用 fetch 动态加载数据",
+    "steps": [
+      "打开 results 页面",
+      "切换批次下拉菜单",
+      "确认页面不刷新，表格数据动态更新",
+      "确认分页也是 AJAX 无刷新"
+    ],
+    "passes": false
+  },
+  {
+    "id": 2,
+    "category": "phase3-frontend",
+    "description": "Results 页面顶部增加 4 个统计卡片（总任务/成功/失败/进度），随批次切换动态更新",
+    "steps": [
+      "打开 results 页面",
+      "确认顶部有 4 个统计卡片",
+      "切换批次后确认卡片数据更新为对应批次的统计"
+    ],
+    "passes": false
+  },
+  {
+    "id": 3,
+    "category": "phase3-frontend",
+    "description": "Results 页面导出按钮始终可见，根据当前选中批次动态更新导出链接",
+    "steps": [
+      "打开 results 页面",
+      "确认导出按钮始终可见",
+      "选择某个批次后确认导出链接指向该批次"
+    ],
+    "passes": false
+  },
+  {
+    "id": 4,
+    "category": "phase2-database",
+    "description": "tasks 表新增 priority 列，pull_tasks 按 priority DESC, id ASC 排序",
+    "steps": [
+      "检查 database.py init_tables 包含 priority 列",
+      "检查 pull_tasks SQL 使用 ORDER BY priority DESC, id ASC"
+    ],
+    "passes": false
+  },
+  {
+    "id": 5,
+    "category": "phase2-server",
+    "description": "新增 POST /api/batches/{batch_name}/prioritize 接口，将批次 pending 任务 priority 设为 10",
+    "steps": [
+      "检查 server.py 包含 prioritize 路由",
+      "确认只更新 status=pending 的任务",
+      "确认 priority 设为 10"
+    ],
+    "passes": false
+  },
+  {
+    "id": 6,
+    "category": "phase2-worker",
+    "description": "Worker _task_feeder 拉到高优先级任务时清空当前 task_queue",
+    "steps": [
+      "检查 _task_feeder 检测 priority > 0",
+      "确认检测到高优先级时清空 _task_queue",
+      "确认旧任务被丢弃（依靠超时回收）"
+    ],
+    "passes": false
+  },
+  {
+    "id": 7,
+    "category": "phase2-frontend",
+    "description": "tasks.html 批次操作区新增'优先采集'按钮，调用 prioritize API",
+    "steps": [
+      "打开 tasks 页面",
+      "确认每个批次行有'优先采集'按钮",
+      "点击按钮后确认调用 /api/batches/{name}/prioritize"
+    ],
+    "passes": false
+  },
+  {
+    "id": 8,
+    "category": "phase1-database",
+    "description": "tasks 表新增 needs_screenshot 列，results 表新增 screenshot_path 列",
+    "steps": [
+      "检查 database.py init_tables 包含 needs_screenshot 和 screenshot_path",
+      "检查 pull_tasks 返回数据包含 needs_screenshot"
+    ],
+    "passes": false
+  },
+  {
+    "id": 9,
+    "category": "phase1-server",
+    "description": "upload 接口支持 needs_screenshot 参数，create_tasks 写入该字段",
+    "steps": [
+      "检查 server.py upload_asin_file 接收 needs_screenshot",
+      "检查 database.py create_tasks 写入 needs_screenshot"
+    ],
+    "passes": false
+  },
+  {
+    "id": 10,
+    "category": "phase1-server",
+    "description": "新增 POST /api/tasks/screenshot 接口，接收 PNG 截图并保存，更新 results 表",
+    "steps": [
+      "检查 server.py 包含 screenshot 上传路由",
+      "确认保存到 static/screenshots/{batch_name}/",
+      "确认更新 results 表 screenshot_path"
+    ],
+    "passes": false
+  },
+  {
+    "id": 11,
+    "category": "phase1-worker",
+    "description": "Worker 新增 _screenshot_queue 和 _screenshot_worker 协程，用 Playwright 渲染截图",
+    "steps": [
+      "检查 worker.py 包含 _screenshot_queue",
+      "检查 _screenshot_worker 协程使用 Playwright 渲染",
+      "确认渲染使用 page.route 拦截注入 HTML",
+      "确认截图 POST 给 Server"
+    ],
+    "passes": false
+  },
+  {
+    "id": 12,
+    "category": "phase1-worker",
+    "description": "_process_task 在 needs_screenshot 时将 HTML 非阻塞放入截图队列",
+    "steps": [
+      "检查 _process_task 检测 needs_screenshot",
+      "确认使用 put_nowait 非阻塞放入队列",
+      "确认不等待渲染完成"
+    ],
+    "passes": false
+  },
+  {
+    "id": 13,
+    "category": "phase1-frontend",
+    "description": "tasks.html 上传表单新增'开启网页截图取证'开关",
+    "steps": [
+      "打开 tasks 页面",
+      "确认上传表单有截图开关",
+      "确认提交时 needs_screenshot 参数传给后端"
+    ],
+    "passes": false
+  },
+  {
+    "id": 14,
+    "category": "phase1-frontend",
+    "description": "results.html 结果表格新增截图列，有截图时显示查看按钮（Modal 预览 + 下载）",
+    "steps": [
+      "打开 results 页面",
+      "确认表格有截图列",
+      "有截图的行显示查看按钮",
+      "点击弹出 Modal 可预览和下载"
+    ],
+    "passes": false
+  }
+]
