@@ -210,7 +210,64 @@ class AdaptiveController:
             # 注意：这是非阻塞的尝试，如果 acquire 不到说明都在飞，
             # 等它们落地时自然就少了
             for _ in range(-diff):
-                # 非阻塞 acquire：如果拿到了 permit，就不还了（相当于减少总量）
-                # 拿不到说明都在用，等自然减少
+                # 缩容：减少信号量的可用 permit 数
+                # 注意：asyncio.Semaphore 没有公开的 try_acquire 或查询可用数的 API
+                # 直接操作 _value 是 CPython 中缩容信号量的标准做法
+                # （_value 自 Python 3.4 起稳定存在）
                 if self._semaphore._value > 0:
                     self._semaphore._value -= 1
+
+
+class TokenBucket:
+    """
+    全局令牌桶限流器
+
+    控制系统级请求发起速率（QPS），与 Semaphore（并发连接数）互补：
+    - Semaphore 控制同时在飞的请求数（池子多大）
+    - TokenBucket 控制新请求的产生速率（水龙头多快）
+
+    实现：经典令牌桶算法，令牌按固定速率补充，每次请求消耗一个令牌。
+    令牌不足时 await 直到有令牌可用。
+    """
+
+    def __init__(self, rate: float = None, burst: int = None):
+        """
+        Args:
+            rate: 每秒产生的令牌数（即目标 QPS）
+            burst: 桶容量（允许的最大突发数），默认等于 rate
+        """
+        self._rate = rate or getattr(config, "TOKEN_BUCKET_RATE", 4.5)
+        self._burst = burst or max(1, int(self._rate))
+        self._tokens = float(self._burst)  # 初始满桶
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """获取一个令牌，不够时等待"""
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # 计算等待时间：需要 1 个令牌，当前有 self._tokens 个
+                wait = (1.0 - self._tokens) / self._rate
+
+            await asyncio.sleep(wait)
+
+    def _refill(self):
+        """补充令牌"""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._last_refill = now
+        self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    @rate.setter
+    def rate(self, value: float):
+        """动态调整速率"""
+        self._rate = max(0.1, value)
+        self._burst = max(1, int(self._rate))

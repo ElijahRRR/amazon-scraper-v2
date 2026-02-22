@@ -1,0 +1,22 @@
+# ============================================================
+# Amazon Scraper v2 - Worker Dockerfile（精简版）
+# 只包含采集引擎，不含 Web UI / 数据库
+# ============================================================
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 系统依赖（curl_cffi 需要）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python 依赖（精简，不含 fastapi/uvicorn/aiosqlite 等）
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
+
+# 只复制 Worker 需要的文件
+COPY config.py models.py proxy.py session.py parser.py worker.py metrics.py adaptive.py ./
+
+ENTRYPOINT ["python", "worker.py"]
+CMD ["--server", "http://host.docker.internal:8899"]

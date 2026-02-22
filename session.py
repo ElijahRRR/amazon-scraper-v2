@@ -33,6 +33,7 @@ class AmazonSession:
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self._session: Optional[AsyncSession] = None
         self._initialized = False
+        self._init_lock = asyncio.Lock()
         self._request_count = 0
         self._last_url: Optional[str] = None
         # 随机选择 User-Agent
@@ -51,57 +52,86 @@ class AmazonSession:
         1. 创建 curl_cffi 会话
         2. 访问 Amazon 首页获取 cookies（带重试）
         3. POST 设置邮编
+
+        带锁保护：多个协程同时调用时，只有第一个执行初始化，其余等待并复用结果
         """
-        for init_attempt in range(3):
-            try:
-                proxy = await self.proxy_manager.get_proxy()
-
-                # 创建会话（impersonate Chrome, HTTP/2 多路复用）
-                self._session = AsyncSession(
-                    impersonate=config.IMPERSONATE_BROWSER,
-                    timeout=config.REQUEST_TIMEOUT,
-                    proxy=proxy,
-                    max_clients=config.MAX_CLIENTS,
-                    http_version=2,
-                )
-
-                # 1. 访问首页获取初始 cookies
-                headers = self._build_headers()
-                resp = await self._session.get(
-                    self.AMAZON_BASE,
-                    headers=headers,
-                )
-
-                # 接受所有 2xx 响应（200/202 等都有效）
-                if resp.status_code >= 300:
-                    logger.warning(f"首页返回 {resp.status_code}，重试 ({init_attempt+1}/3)")
-                    await self._session.close()
-                    self._session = None
-                    await asyncio.sleep(3)
-                    continue
-
-                # 2. 设置邮编
-                success = await self._set_zip_code()
-                if success:
-                    self._initialized = True
-                    logger.info(f"✅ Session 初始化成功 (邮编: {self.zip_code})")
-                else:
-                    self._initialized = True
-                    logger.warning(f"⚠️ 邮编设置失败，但 session 仍可使用")
-
+        async with self._init_lock:
+            # 已初始化 → 直接返回（被其他协程抢先完成了）
+            if self._initialized:
                 return True
 
-            except Exception as e:
-                logger.error(f"❌ Session 初始化失败 (尝试 {init_attempt+1}/3): {e}")
-                if self._session:
-                    await self._session.close()
-                    self._session = None
-                if init_attempt < 2:
-                    await asyncio.sleep(3)
-                    continue
+            for init_attempt in range(3):
+                try:
+                    proxy = await self.proxy_manager.get_proxy()
 
-        logger.error("❌ Session 初始化失败，已重试 3 次")
-        return False
+                    # 创建会话（impersonate Chrome, HTTP/2 多路复用）
+                    self._session = AsyncSession(
+                        impersonate=config.IMPERSONATE_BROWSER,
+                        timeout=config.REQUEST_TIMEOUT,
+                        proxy=proxy,
+                        max_clients=config.MAX_CLIENTS,
+                        http_version=2,
+                    )
+
+                    # 1. 访问首页获取初始 cookies
+                    headers = self._build_headers()
+                    resp = await self._session.get(
+                        self.AMAZON_BASE,
+                        headers=headers,
+                    )
+
+                    # 接受所有 2xx 响应（200/202 等都有效）
+                    if resp.status_code >= 300:
+                        logger.warning(f"首页返回 {resp.status_code}，重试 ({init_attempt+1}/3)")
+                        await self._session.close()
+                        self._session = None
+                        await asyncio.sleep(3)
+                        continue
+
+                    # 2. 设置邮编（带重试）
+                    zip_ok = False
+                    for zip_attempt in range(3):
+                        if await self._set_zip_code():
+                            zip_ok = True
+                            break
+                        logger.warning(f"📍 邮编设置失败 (尝试 {zip_attempt+1}/3)")
+                        await asyncio.sleep(1)
+
+                    if not zip_ok:
+                        # 邮编设置 3 次全失败 → 放弃该 session，换代理重试
+                        logger.warning(f"⚠️ 邮编设置 3 次全失败，放弃当前代理 (初始化 {init_attempt+1}/3)")
+                        await self._session.close()
+                        self._session = None
+                        # 强制刷新代理（换一个出口 IP）
+                        await self.proxy_manager.report_blocked()
+                        await asyncio.sleep(2)
+                        continue
+
+                    # 3. 验证邮编是否生效（重新访问首页检查 location widget）
+                    verified = await self._verify_zip_code()
+                    if not verified:
+                        logger.warning(f"⚠️ 邮编验证失败（页面未反映 {self.zip_code}），放弃当前代理 (初始化 {init_attempt+1}/3)")
+                        await self._session.close()
+                        self._session = None
+                        await self.proxy_manager.report_blocked()
+                        await asyncio.sleep(2)
+                        continue
+
+                    self._initialized = True
+                    logger.info(f"✅ Session 初始化成功 (邮编: {self.zip_code})")
+                    return True
+
+                except Exception as e:
+                    logger.error(f"❌ Session 初始化失败 (尝试 {init_attempt+1}/3): {e}")
+                    if self._session:
+                        await self._session.close()
+                        self._session = None
+                    if init_attempt < 2:
+                        await asyncio.sleep(3)
+                        continue
+
+            logger.error("❌ Session 初始化失败，已重试 3 次")
+            return False
 
     async def _set_zip_code(self) -> bool:
         """
@@ -167,6 +197,50 @@ class AmazonSession:
 
         except Exception as e:
             logger.error(f"📍 邮编设置异常: {e}")
+            return False
+
+    async def _verify_zip_code(self) -> bool:
+        """
+        验证邮编是否实际生效
+        重新访问首页，检查 location widget 是否显示了正确的邮编
+        防止代理 IP 导致 Amazon 忽略邮编设置
+        """
+        try:
+            headers = self._build_headers(referer="https://www.amazon.com/")
+            resp = await self._session.get(
+                self.AMAZON_BASE,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                return False
+
+            text = resp.text
+            # 检查 location widget 中的邮编（glow-ingress-line2 显示当前配送地址）
+            import re
+            zip_match = re.search(r'id="glow-ingress-line2"[^>]*>\s*([^<]+)', text)
+            if zip_match:
+                location_text = zip_match.group(1).strip()
+                if self.zip_code in location_text:
+                    logger.info(f"📍 邮编验证通过: {location_text}")
+                    return True
+                else:
+                    logger.warning(f"📍 邮编验证不匹配: 期望 {self.zip_code}, 页面显示 '{location_text}'")
+                    return False
+
+            # 备选：检查是否有非美国货币标识（CNY/¥/€/£）
+            # 如果出现这些标识说明 session 没被定位到美国
+            non_us_indicators = ['CNY', '¥', '€', '£', 'JP¥']
+            for indicator in non_us_indicators:
+                if indicator in text[:50000]:  # 只检查前半部分避免误匹配
+                    logger.warning(f"📍 邮编验证失败: 页面包含非美国货币标识 '{indicator}'")
+                    return False
+
+            # 如果 widget 不存在但也没有非美国标识，放行
+            logger.info(f"📍 邮编验证: 未找到 location widget，但无异常货币标识")
+            return True
+
+        except Exception as e:
+            logger.error(f"📍 邮编验证异常: {e}")
             return False
 
     def _build_headers(self, referer: str = None) -> Dict[str, str]:
@@ -295,7 +369,10 @@ class AmazonSession:
             return True
         if "validateCaptcha" in text or "Robot Check" in text:
             return True
-        if "api-services-support@amazon.com" in text:
+
+        # api-services-support 检测：只在短页面（非正常产品页）中检查
+        # 正常产品页 > 50KB，被封的错误页面通常 < 10KB
+        if "api-services-support@amazon.com" in text and len(text) < 20000:
             return True
 
         return False
@@ -322,73 +399,3 @@ class AmazonSession:
         }
 
 
-class SessionPool:
-    """
-    Session 池
-    管理多个 AmazonSession 实例，支持轮换
-    """
-
-    def __init__(self, proxy_manager: ProxyManager, pool_size: int = 3, zip_code: str = None):
-        self.proxy_manager = proxy_manager
-        self.pool_size = pool_size
-        self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
-        self._sessions: list = []
-        self._index = 0
-
-    async def initialize(self):
-        """初始化所有 session"""
-        for i in range(self.pool_size):
-            session = AmazonSession(self.proxy_manager, self.zip_code)
-            success = await session.initialize()
-            if success:
-                self._sessions.append(session)
-                logger.info(f"✅ Session {i+1}/{self.pool_size} 初始化成功")
-            else:
-                logger.warning(f"⚠️ Session {i+1}/{self.pool_size} 初始化失败")
-            
-            # 各 session 初始化之间加入延迟
-            if i < self.pool_size - 1:
-                await asyncio.sleep(1.0)
-
-    def get_session(self) -> Optional[AmazonSession]:
-        """获取下一个 session（轮换）"""
-        if not self._sessions:
-            return None
-        session = self._sessions[self._index % len(self._sessions)]
-        self._index += 1
-        return session
-
-    async def replace_session(self, old_session: AmazonSession) -> Optional[AmazonSession]:
-        """
-        替换被封锁的 session
-        关闭旧的，创建新的
-        """
-        try:
-            idx = self._sessions.index(old_session)
-        except ValueError:
-            idx = -1
-
-        await old_session.close()
-
-        # 创建新 session
-        new_session = AmazonSession(self.proxy_manager, self.zip_code)
-        success = await new_session.initialize()
-        
-        if success:
-            if idx >= 0:
-                self._sessions[idx] = new_session
-            else:
-                self._sessions.append(new_session)
-            logger.info("🔄 Session 替换成功")
-            return new_session
-        else:
-            if idx >= 0:
-                self._sessions.pop(idx)
-            logger.error("❌ Session 替换失败")
-            return None
-
-    async def close_all(self):
-        """关闭所有 session"""
-        for session in self._sessions:
-            await session.close()
-        self._sessions.clear()

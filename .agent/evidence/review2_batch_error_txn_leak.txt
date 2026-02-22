@@ -1,0 +1,2 @@
+simulated insert error: IntegrityError NOT NULL constraint failed: results.batch_name
+pull after error failed: OperationalError cannot start a transaction within a transaction

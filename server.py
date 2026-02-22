@@ -6,9 +6,11 @@ Amazon 产品采集系统 v2 - 中央服务器（FastAPI）
 import os
 import io
 import csv
+import re
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -31,8 +33,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== 生命周期 ====================
+
+@asynccontextmanager
+async def lifespan(app):
+    """应用生命周期管理"""
+    # startup
+    db = await get_db()
+    logger.info("✅ 数据库初始化完成")
+    asyncio.create_task(_timeout_task_loop())
+    yield
+    # shutdown
+    await close_db()
+    logger.info("🛑 服务器关闭")
+
+
 # FastAPI 应用
-app = FastAPI(title="Amazon Scraper v2", version="2.0.0")
+app = FastAPI(title="Amazon Scraper v2", version="2.0.0", lifespan=lifespan)
 
 # 静态文件和模板
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
@@ -65,24 +82,6 @@ _runtime_settings = {
     "request_interval": config.REQUEST_INTERVAL,
     "max_retries": config.MAX_RETRIES,
 }
-
-
-# ==================== 生命周期 ====================
-
-@app.on_event("startup")
-async def startup():
-    """应用启动时初始化数据库"""
-    db = await get_db()
-    logger.info("✅ 数据库初始化完成")
-    # 启动超时任务回退协程
-    asyncio.create_task(_timeout_task_loop())
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """应用关闭时清理资源"""
-    await close_db()
-    logger.info("🛑 服务器关闭")
 
 
 async def _timeout_task_loop():
@@ -132,8 +131,8 @@ async def upload_asin_file(
                 for cell in row:
                     if cell:
                         val = str(cell).strip().upper()
-                        # ASIN 格式：10位字母数字，以 B0 开头
-                        if len(val) == 10 and val[0] == 'B':
+                        # ASIN 格式：10位字母数字，以 B 开头
+                        if re.match(r'^B[0-9A-Z]{9}$', val):
                             asins.append(val)
             wb.close()
         elif filename.endswith('.csv'):
@@ -143,14 +142,14 @@ async def upload_asin_file(
             for row in reader:
                 for cell in row:
                     val = cell.strip().upper()
-                    if len(val) == 10 and val[0] == 'B':
+                    if re.match(r'^B[0-9A-Z]{9}$', val):
                         asins.append(val)
         else:
             # 纯文本（每行一个 ASIN）
             text = content.decode('utf-8-sig')
             for line in text.splitlines():
                 val = line.strip().upper()
-                if len(val) == 10 and val[0] == 'B':
+                if re.match(r'^B[0-9A-Z]{9}$', val):
                     asins.append(val)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"文件解析失败: {str(e)}")
@@ -220,26 +219,52 @@ async def submit_result(request: Request):
 # --- Worker 批量提交结果 ---
 @app.post("/api/tasks/result/batch")
 async def submit_result_batch(request: Request):
-    """Worker 批量提交采集结果"""
+    """Worker 批量提交采集结果（统一提交，减少磁盘 IO）"""
     db = await get_db()
     data = await request.json()
     results_list = data.get("results", [])
 
-    for item in results_list:
-        task_id = item.get("task_id")
-        worker_id = item.get("worker_id", "unknown")
-        success = item.get("success", False)
-        result_data = item.get("result")
+    try:
+        for item in results_list:
+            task_id = item.get("task_id")
+            worker_id = item.get("worker_id", "unknown")
+            success = item.get("success", False)
+            result_data = item.get("result")
 
-        _register_worker(worker_id)
-        if worker_id in _worker_registry:
-            _worker_registry[worker_id]["results_submitted"] += 1
+            _register_worker(worker_id)
+            if worker_id in _worker_registry:
+                _worker_registry[worker_id]["results_submitted"] += 1
 
-        if success and result_data:
-            await db.save_result(result_data)
-            await db.mark_task_done(task_id, worker_id)
-        else:
-            await db.mark_task_failed(task_id, worker_id)
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            if success and result_data:
+                # 保存结果（不单独 commit）
+                fields = ["batch_name", "asin"] + [f for f in RESULT_FIELDS if f != "asin"]
+                values = [result_data.get(f, "") for f in fields]
+                placeholders = ",".join(["?"] * len(fields))
+                field_names = ",".join(fields)
+                await db._db.execute(
+                    f"INSERT OR REPLACE INTO results ({field_names}) VALUES ({placeholders})",
+                    values
+                )
+                # 标记任务完成
+                await db._db.execute(
+                    "UPDATE tasks SET status = 'done', worker_id = ?, updated_at = ? WHERE id = ?",
+                    (worker_id, now, task_id)
+                )
+            else:
+                # 标记任务失败
+                await db._db.execute(
+                    """UPDATE tasks
+                       SET status = 'failed', worker_id = ?, retry_count = retry_count + 1, updated_at = ?
+                       WHERE id = ?""",
+                    (worker_id, now, task_id)
+                )
+
+        # 整批统一 commit
+        await db._db.commit()
+    except Exception:
+        await db._db.rollback()
+        raise
 
     return {"status": "ok", "count": len(results_list)}
 

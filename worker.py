@@ -26,7 +26,7 @@ from proxy import ProxyManager, get_proxy_manager
 from session import AmazonSession
 from parser import AmazonParser
 from metrics import MetricsCollector
-from adaptive import AdaptiveController
+from adaptive import AdaptiveController, TokenBucket
 
 # 日志配置
 logging.basicConfig(
@@ -55,6 +55,7 @@ class Worker:
         # 速率控制
         self._interval = config.REQUEST_INTERVAL
         self._jitter = config.REQUEST_JITTER
+        self._rate_limiter = TokenBucket()
 
         # 自适应并发控制
         self._metrics = MetricsCollector()
@@ -94,6 +95,7 @@ class Worker:
         self._rotate_every = config.SESSION_ROTATE_EVERY
         self._rotate_lock = asyncio.Lock()
         self._last_rotate_time = 0.0  # 轮换防抖
+        self._session_ready = asyncio.Event()  # Session 就绪信号
 
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
@@ -297,16 +299,29 @@ class Worker:
     # ═══════════════════════════════════════════════
 
     async def _init_session(self):
-        """初始化 Amazon session"""
+        """初始化 Amazon session（失败时重试，确保 _session_ready 最终被 set）"""
         logger.info("🔧 初始化 Amazon session...")
-        self._session = AmazonSession(self.proxy_manager, self.zip_code)
-        success = await self._session.initialize()
-        if not success:
-            logger.warning("⚠️ Session 初始化失败，将在首次请求时重试")
-        self._success_since_rotate = 0
+        self._session_ready.clear()
+        for attempt in range(3):
+            self._session = AmazonSession(self.proxy_manager, self.zip_code)
+            success = await self._session.initialize()
+            self._success_since_rotate = 0
+            if success:
+                self._session_ready.set()
+                return
+            # 初始化失败，等待后重试
+            logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/3)")
+            if self._session:
+                await self._session.close()
+            self._session = None
+            if attempt < 2:
+                await asyncio.sleep(5)
+        # 3 次全部失败，仍然 set event 让 worker 走正常的重试/失败流程
+        logger.error("❌ Session 初始化 3 次全部失败，Worker 将在处理任务时继续重试")
+        self._session_ready.set()
 
     async def _rotate_session(self, reason: str = "主动轮换"):
-        """轮换 session：关闭旧的，刷新代理，创建新的（带防抖）"""
+        """轮换 session：关闭旧的，刷新代理，创建新的（带防抖 + 就绪信号 + 失败重试）"""
         async with self._rotate_lock:
             # 防抖：5秒内不重复轮换
             now = time.time()
@@ -314,18 +329,35 @@ class Worker:
                 logger.debug(f"🔄 跳过轮换（距上次不足5秒）")
                 return
             logger.info(f"🔄 Session {reason}...")
+            # 通知所有 worker：session 不可用，请等待
+            self._session_ready.clear()
             if self._session:
                 await self._session.close()
+                self._session = None
             await self.proxy_manager.report_blocked()
             await asyncio.sleep(1)
-            self._session = AmazonSession(self.proxy_manager, self.zip_code)
-            success = await self._session.initialize()
-            self._success_since_rotate = 0
-            self._last_rotate_time = time.time()
-            if success:
-                logger.info("🔄 Session 轮换成功")
-            else:
-                logger.warning("⚠️ Session 轮换后初始化失败")
+
+            # 轮换重试（最多 3 次）
+            for attempt in range(3):
+                self._session = AmazonSession(self.proxy_manager, self.zip_code)
+                success = await self._session.initialize()
+                self._success_since_rotate = 0
+                self._last_rotate_time = time.time()
+                if success:
+                    self._session_ready.set()
+                    logger.info("🔄 Session 轮换成功")
+                    return
+                # 失败，清理后重试
+                logger.warning(f"⚠️ Session 轮换初始化失败 (尝试 {attempt+1}/3)")
+                if self._session:
+                    await self._session.close()
+                self._session = None
+                if attempt < 2:
+                    await asyncio.sleep(3)
+
+            # 全部失败，set event 让 worker 走正常失败流程
+            logger.error("❌ Session 轮换 3 次全部失败")
+            self._session_ready.set()
 
     async def _pull_tasks(self, count: int = None) -> List[Dict]:
         """从服务器拉取任务"""
@@ -361,15 +393,24 @@ class Worker:
         attempt = 0
         while attempt < max_retries:
             try:
-                # 速率控制
-                delay = self._interval + random.uniform(-self._jitter, self._jitter)
-                await asyncio.sleep(delay)
+                # 全局令牌桶限流（替代 per-worker sleep，确保系统级 QPS 不超标）
+                await self._rate_limiter.acquire()
 
-                # 等待 session 就绪（轮换期间可能暂时不可用）
-                if self._session is None or self._session._session is None:
+                # 等待 session 就绪（轮换期间统一等待信号，不各自初始化）
+                if not self._session_ready.is_set():
                     logger.debug(f"ASIN {asin} 等待 session 就绪...")
-                    await asyncio.sleep(3)
-                    continue  # 不增加 attempt
+                    try:
+                        await asyncio.wait_for(self._session_ready.wait(), timeout=30)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"ASIN {asin} 等待 session 超时 30s")
+                        attempt += 1
+                        continue
+
+                if self._session is None or self._session._session is None:
+                    attempt += 1
+                    logger.warning(f"ASIN {asin} session 仍未就绪 (尝试 {attempt}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
 
                 # 快速模式: 先用 AOD 获取价格数据
                 if self.fast_mode and attempt == 0:
@@ -442,6 +483,16 @@ class Worker:
                     logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
+
+                # 邮编/货币校验：检测是否采集到了非美国地区的数据
+                price = result_data.get("current_price", "")
+                if price and price not in ["N/A", "不可售", "See price in cart"]:
+                    # 价格应包含 $ 符号；出现 CNY/¥/€/£ 说明邮编没生效
+                    if any(c in price for c in ["¥", "€", "£", "CNY"]) or "$" not in price:
+                        attempt += 1
+                        logger.warning(f"ASIN {asin} 检测到非美国价格 '{price}'，邮编可能未生效 (尝试 {attempt}/{max_retries})")
+                        await self._rotate_session(reason="非美国区域数据")
+                        continue
 
                 # 成功
                 await self._submit_result(task_id, result_data, success=True)

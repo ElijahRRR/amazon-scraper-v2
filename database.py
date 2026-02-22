@@ -106,6 +106,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_batch_asin ON tasks(batch_name, asin);
             CREATE INDEX IF NOT EXISTS idx_results_batch ON results(batch_name);
             CREATE INDEX IF NOT EXISTS idx_results_asin ON results(asin);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_results_batch_asin ON results(batch_name, asin);
         """)
         await self._db.commit()
 
@@ -113,29 +114,34 @@ class Database:
 
     async def create_tasks(self, batch_name: str, asins: List[str], zip_code: str = "10001") -> int:
         """
-        批量创建采集任务
+        批量创建采集任务（使用 executemany 高效插入）
         返回: 实际插入的任务数（跳过已存在的）
         """
-        inserted = 0
+        # 预处理：去空、去重
+        clean_asins = []
+        seen = set()
         for asin in asins:
             asin = asin.strip()
-            if not asin:
-                continue
-            try:
-                await self._db.execute(
-                    "INSERT OR IGNORE INTO tasks (batch_name, asin, zip_code) VALUES (?, ?, ?)",
-                    (batch_name, asin, zip_code)
-                )
-                inserted += 1
-            except Exception:
-                pass
+            if asin and asin not in seen:
+                clean_asins.append((batch_name, asin, zip_code))
+                seen.add(asin)
+
+        if not clean_asins:
+            return 0
+
+        before = self._db.total_changes
+        await self._db.executemany(
+            "INSERT OR IGNORE INTO tasks (batch_name, asin, zip_code) VALUES (?, ?, ?)",
+            clean_asins
+        )
         await self._db.commit()
+        inserted = self._db.total_changes - before
         return inserted
 
     async def pull_tasks(self, worker_id: str, count: int = 10) -> List[Dict]:
         """
         Worker 拉取待处理任务
-        原子操作：SELECT + UPDATE 在同一事务中
+        原子操作：在 BEGIN IMMEDIATE 事务中完成 SELECT + UPDATE，防止并发重复分发
         """
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         tasks = []
@@ -143,33 +149,36 @@ class Database:
         # 先回退超时任务
         await self.reset_timeout_tasks()
 
-        async with self._db.execute(
-            """SELECT id, batch_name, asin, zip_code, retry_count
-               FROM tasks
-               WHERE status = 'pending'
-               ORDER BY id ASC
-               LIMIT ?""",
-            (count,)
-        ) as cursor:
-            rows = await cursor.fetchall()
+        # BEGIN IMMEDIATE 保证写锁，防止两个 Worker 同时拉到相同任务
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            async with self._db.execute(
+                """SELECT id, batch_name, asin, zip_code, retry_count
+                   FROM tasks
+                   WHERE status = 'pending'
+                   ORDER BY id ASC
+                   LIMIT ?""",
+                (count,)
+            ) as cursor:
+                rows = await cursor.fetchall()
 
-        if not rows:
-            return tasks
+            if not rows:
+                await self._db.execute("COMMIT")
+                return tasks
 
-        ids = []
-        for row in rows:
-            task = {
-                "id": row["id"],
-                "batch_name": row["batch_name"],
-                "asin": row["asin"],
-                "zip_code": row["zip_code"],
-                "retry_count": row["retry_count"],
-            }
-            tasks.append(task)
-            ids.append(row["id"])
+            ids = []
+            for row in rows:
+                task = {
+                    "id": row["id"],
+                    "batch_name": row["batch_name"],
+                    "asin": row["asin"],
+                    "zip_code": row["zip_code"],
+                    "retry_count": row["retry_count"],
+                }
+                tasks.append(task)
+                ids.append(row["id"])
 
-        # 批量更新状态为 processing
-        if ids:
+            # 批量更新状态为 processing
             placeholders = ",".join(["?"] * len(ids))
             await self._db.execute(
                 f"""UPDATE tasks
@@ -177,7 +186,10 @@ class Database:
                     WHERE id IN ({placeholders})""",
                 [worker_id, now] + ids
             )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            raise
 
         return tasks
 
@@ -227,8 +239,9 @@ class Database:
                WHERE status = 'processing' AND updated_at < ?""",
             (cutoff,)
         )
-        if result.rowcount > 0:
-            await self._db.commit()
+        # 始终 commit，即使 rowcount == 0
+        # DML 语句会隐式开启事务，不 commit 会导致后续 BEGIN IMMEDIATE 失败
+        await self._db.commit()
         return result.rowcount
 
     async def retry_all_failed(self, batch_name: str = None):
@@ -253,7 +266,7 @@ class Database:
     async def save_result(self, result_data: Dict[str, Any]) -> int:
         """
         保存采集结果
-        使用 INSERT OR REPLACE 避免重复
+        使用 INSERT OR REPLACE 避免重复（基于 batch_name + asin 唯一索引）
         """
         # 构建字段列表
         fields = ["batch_name", "asin"] + [f for f in RESULT_FIELDS if f != "asin"]
@@ -262,7 +275,7 @@ class Database:
         field_names = ",".join(fields)
 
         await self._db.execute(
-            f"INSERT INTO results ({field_names}) VALUES ({placeholders})",
+            f"INSERT OR REPLACE INTO results ({field_names}) VALUES ({placeholders})",
             values
         )
         await self._db.commit()

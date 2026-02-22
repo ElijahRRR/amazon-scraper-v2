@@ -1,0 +1,53 @@
+[
+  {
+    "id": "R-001",
+    "priority": "P0",
+    "dimension": "correctness",
+    "check": "检查 Python 关键路径改动是否引入逻辑错误、状态机回退或异常吞噬",
+    "status": "pass",
+    "evidence": [
+      ".agent/evidence/review3_pull_tasks_txn_check.txt",
+      ".agent/evidence/review3_batch_rollback_check.txt",
+      "database.py:150",
+      "database.py:153",
+      "database.py:236",
+      "database.py:244",
+      "server.py:227",
+      "server.py:265"
+    ],
+    "finding": "",
+    "last_checked_at": "2026-02-21T16:16:10Z"
+  },
+  {
+    "id": "R-002",
+    "priority": "P1",
+    "dimension": "operability",
+    "check": "检查新增 Docker/compose/requirements 与现有运行方式是否一致且可执行",
+    "status": "pass",
+    "evidence": [
+      ".agent/evidence/review3_py_compile.txt",
+      ".agent/evidence/review3_unittest_output.txt",
+      "tests/test_worker_session_ready_regression.py:11",
+      "tests/test_worker_session_ready_regression.py:50",
+      "tests/test_worker_session_ready_regression.py:59",
+      "worker.py:318"
+    ],
+    "finding": "",
+    "last_checked_at": "2026-02-21T16:16:10Z"
+  },
+  {
+    "id": "R-003",
+    "priority": "P1",
+    "dimension": "documentation",
+    "check": "检查 README 与代码/配置行为是否一致，避免误导性操作说明",
+    "status": "pass",
+    "evidence": [
+      ".agent/evidence/readme_concurrency_refs.txt",
+      ".agent/evidence/r003_readme_fix_check.txt",
+      "README.md:276",
+      "README.md:345"
+    ],
+    "finding": "",
+    "last_checked_at": "2026-02-21T16:16:10Z"
+  }
+]

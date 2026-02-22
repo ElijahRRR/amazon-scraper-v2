@@ -133,15 +133,6 @@ class ProxyManager:
             "total_blocked": self._total_blocked,
         }
 
-    async def start_auto_refresh(self):
-        """启动自动刷新协程（后台运行）"""
-        while True:
-            try:
-                await self.get_proxy()
-            except Exception as e:
-                logger.error(f"代理自动刷新异常: {e}")
-            await asyncio.sleep(self._refresh_interval)
-
 
 # 全局代理管理器实例
 _proxy_manager: Optional[ProxyManager] = None

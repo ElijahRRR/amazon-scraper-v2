@@ -1,0 +1,25 @@
+# ============================================================
+# Amazon Scraper v2 - Docker Compose
+# 一键启动 Server + Worker
+# ============================================================
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./data:/app/data    # 数据库和导出文件持久化
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: ["--server", "http://server:8899"]
+    depends_on:
+      - server
+    restart: unless-stopped
+    # 需要更多 Worker 时：docker compose up --scale worker=3

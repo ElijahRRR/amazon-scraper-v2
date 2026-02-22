@@ -1,0 +1,8 @@
+.venv
+.git
+__pycache__
+*.pyc
+data/
+.claude/
+*.md
+tuning_test.py

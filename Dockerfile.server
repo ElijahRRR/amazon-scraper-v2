@@ -1,0 +1,28 @@
+# ============================================================
+# Amazon Scraper v2 - Server Dockerfile
+# 包含 Web UI + API + 数据库
+# ============================================================
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 系统依赖（curl_cffi 需要）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 项目文件
+COPY config.py models.py database.py server.py parser.py proxy.py session.py worker.py metrics.py adaptive.py ./
+COPY templates/ templates/
+COPY static/ static/
+
+# 数据目录
+RUN mkdir -p data data/exports
+
+EXPOSE 8899
+
+CMD ["python", "server.py"]

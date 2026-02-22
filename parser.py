@@ -234,20 +234,34 @@ class AmazonParser:
 
     def _slx_parse_current_price(self, tree) -> str:
         try:
-            # 方法1: a-offscreen
-            node = tree.css_first('span.a-offscreen')
-            if node:
-                p = node.text(strip=True)
-                if p and "$" in p:
-                    return p
-            # 方法2: 拆分整数+小数
-            whole_node = tree.css_first('span.a-price-whole')
-            frac_node = tree.css_first('span.a-price-fraction')
-            if whole_node and frac_node:
-                whole = whole_node.text(strip=True)
-                frac = frac_node.text(strip=True)
-                if whole and frac:
-                    return f"${whole.replace('.', '')}.{frac}"
+            # 方法1: 价格容器内的 a-offscreen（限定到价格区域，避免全页匹配）
+            price_selectors = [
+                '#corePrice_feature_div span.a-offscreen',
+                '#corePriceDisplay_desktop_feature_div span.a-offscreen',
+                '#price span.a-offscreen',
+                '#priceblock_ourprice',
+                '#priceblock_dealprice',
+                '#priceToPay span.a-offscreen',
+                '#apex_offerDisplay_desktop span.a-offscreen',
+                'div.a-section span.a-price span.a-offscreen',
+            ]
+            for sel in price_selectors:
+                node = tree.css_first(sel)
+                if node:
+                    p = node.text(strip=True)
+                    if p and "$" in p:
+                        return p
+            # 方法2: 拆分整数+小数（限定到价格容器）
+            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
+                              '#price', '#apex_offerDisplay_desktop', '']:
+                prefix = f'{container} ' if container else ''
+                whole_node = tree.css_first(f'{prefix}span.a-price-whole')
+                frac_node = tree.css_first(f'{prefix}span.a-price-fraction')
+                if whole_node and frac_node:
+                    whole = whole_node.text(strip=True)
+                    frac = frac_node.text(strip=True)
+                    if whole and frac:
+                        return f"${whole.replace('.', '')}.{frac}"
         except Exception:
             pass
         return "N/A"
@@ -259,6 +273,9 @@ class AmazonParser:
             '#newBuyBoxPrice',
             '#priceToPay span.a-offscreen',
             '#price_inside_buybox',
+            '#corePrice_feature_div span.a-offscreen',
+            '#corePriceDisplay_desktop_feature_div span.a-offscreen',
+            '#apex_offerDisplay_desktop span.a-offscreen',
         ]
         for sel in selectors:
             try:
@@ -779,7 +796,8 @@ class AmazonParser:
         """检测反爬拦截，返回拦截类型或 None"""
         if "validateCaptcha" in html_text or "Robot Check" in html_text:
             return "[验证码拦截]"
-        if "api-services-support@amazon.com" in html_text:
+        # 仅短页面（< 20KB）中出现才算封锁；正常商品页（50KB+）可能包含此邮箱
+        if "api-services-support@amazon.com" in html_text and len(html_text) < 20000:
             return "[API封锁]"
         return None
 
@@ -901,9 +919,32 @@ class AmazonParser:
 
     def _parse_current_price(self, tree) -> str:
         try:
-            p = self._get_text(tree, ['//span[@class="a-offscreen"]/text()'])
-            if p and "$" in p:
-                return p.strip()
+            # 限定到价格容器内（避免全页匹配 a-offscreen）
+            price_xpaths = [
+                '//*[@id="corePrice_feature_div"]//span[@class="a-offscreen"]/text()',
+                '//*[@id="corePriceDisplay_desktop_feature_div"]//span[@class="a-offscreen"]/text()',
+                '//*[@id="price"]//span[@class="a-offscreen"]/text()',
+                '//*[@id="priceblock_ourprice"]/text()',
+                '//*[@id="priceblock_dealprice"]/text()',
+                '//*[@id="priceToPay"]//span[@class="a-offscreen"]/text()',
+                '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
+            ]
+            for xp in price_xpaths:
+                vals = tree.xpath(xp)
+                for v in vals:
+                    if isinstance(v, str) and "$" in v:
+                        return v.strip()
+            # fallback: 拆分整数+小数（限定到价格容器）
+            for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div',
+                                 'price', 'apex_offerDisplay_desktop']:
+                whole = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-whole"]/text()')
+                frac = tree.xpath(f'//*[@id="{container_id}"]//span[@class="a-price-fraction"]/text()')
+                if whole and frac:
+                    w = whole[0].strip().replace('.', '')
+                    f = frac[0].strip()
+                    if w and f:
+                        return f"${w}.{f}"
+            # 最终 fallback: 全页匹配（兼容旧版页面）
             whole = self._get_text(tree, ['//span[@class="a-price-whole"]/text()'])
             frac = self._get_text(tree, ['//span[@class="a-price-fraction"]/text()'])
             if whole and frac:
@@ -919,6 +960,9 @@ class AmazonParser:
             '//*[@id="newBuyBoxPrice"]//text()',
             '//*[@id="priceToPay"]//span[@class="a-offscreen"]/text()',
             '//*[@id="price_inside_buybox"]/text()',
+            '//*[@id="corePrice_feature_div"]//span[@class="a-offscreen"]/text()',
+            '//*[@id="corePriceDisplay_desktop_feature_div"]//span[@class="a-offscreen"]/text()',
+            '//*[@id="apex_offerDisplay_desktop"]//span[@class="a-offscreen"]/text()',
         ]
         for xp in xpaths:
             try:
