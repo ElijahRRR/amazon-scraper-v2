@@ -76,6 +76,9 @@
                             <a href="/api/export/{{ b.batch_name }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
                                 <i class="bi bi-download"></i>
                             </a>
+                            <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.batch_name }}')" title="优先采集">
+                                <i class="bi bi-lightning-charge"></i>
+                            </button>
                             <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.batch_name }}')" title="重试失败">
                                 <i class="bi bi-arrow-clockwise"></i>
                             </button>
@@ -131,6 +134,17 @@ async function retryBatch(name) {
     if (!confirm(`确定重试批次 "${name}" 中所有失败的任务？`)) return;
     await fetch(`/api/batches/${name}/retry`, { method: 'POST' });
     location.reload();
+}
+
+async function prioritizeBatch(name) {
+    if (!confirm(`确定将批次 "${name}" 设为优先采集？Worker 将立即切换到该批次。`)) return;
+    const resp = await fetch(`/api/batches/${name}/prioritize`, { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok) {
+        alert(`已将 ${data.updated} 个待处理任务设为优先采集`);
+    } else {
+        alert('操作失败');
+    }
 }
 
 async function deleteBatch(name) {

@@ -153,8 +153,10 @@ class Worker:
     async def _task_feeder(self):
         """
         任务补给协程：持续从 Server 拉任务，保持队列不空
-        
-        当队列低于阈值时，主动拉取新任务填充
+
+        当队列低于阈值时，主动拉取新任务填充。
+        如果拉到高优先级任务（priority > 0），立即清空当前队列，
+        让 Worker 秒级切换到新批次（旧任务靠超时回收）。
         """
         logger.info("📡 任务补给协程启动")
         empty_streak = 0  # 连续空响应计数
@@ -173,9 +175,23 @@ class Worker:
                     fetch_count = max(fetch_count, 5)  # 至少拉 5 个
 
                     tasks = await self._pull_tasks(count=fetch_count)
-                    
+
                     if tasks:
                         empty_streak = 0
+
+                        # 检测是否有高优先级任务（优先采集）
+                        has_priority = any(t.get("priority", 0) > 0 for t in tasks)
+                        if has_priority and not self._task_queue.empty():
+                            # 清空当前队列中的旧任务（靠 5 分钟超时机制自动回收为 pending）
+                            dropped = 0
+                            while not self._task_queue.empty():
+                                try:
+                                    self._task_queue.get_nowait()
+                                    dropped += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            logger.info(f"🚀 检测到优先采集任务，已清空队列中 {dropped} 个旧任务")
+
                         for task in tasks:
                             await self._task_queue.put(task)
                         logger.debug(f"📡 补给 {len(tasks)} 个任务 (队列: {self._task_queue.qsize()})")
