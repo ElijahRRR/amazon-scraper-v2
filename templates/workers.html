@@ -30,7 +30,12 @@
 
 <!-- Worker 列表 -->
 <div class="card">
-    <div class="card-header"><i class="bi bi-pc-display-horizontal"></i> Worker 列表</div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-pc-display-horizontal"></i> Worker 列表</span>
+        <button class="btn btn-sm btn-outline-danger" onclick="clearOffline()" title="清理所有离线 Worker">
+            <i class="bi bi-trash"></i> 清理离线
+        </button>
+    </div>
     <div class="card-body p-0">
         <table class="table table-hover mb-0">
             <thead>
@@ -41,6 +46,7 @@
                     <th>已提交结果</th>
                     <th>运行时长</th>
                     <th>最后活跃</th>
+                    <th>操作</th>
                 </tr>
             </thead>
             <tbody>
@@ -61,10 +67,17 @@
                     <td>{{ w.results_submitted }}</td>
                     <td>{{ w.uptime_min }} 分钟</td>
                     <td><small class="text-secondary">{{ w.last_seen }}</small></td>
+                    <td>
+                        {% if w.status == 'offline' %}
+                        <button class="btn btn-sm btn-outline-danger" onclick="removeWorker('{{ w.worker_id }}')" title="移除">
+                            <i class="bi bi-x-lg"></i>
+                        </button>
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
                 {% if not workers %}
-                <tr><td colspan="6" class="text-center text-secondary py-4">
+                <tr><td colspan="7" class="text-center text-secondary py-4">
                     暂无 Worker 连接<br>
                     <small>运行 <code>python worker.py --server http://&lt;IP&gt;:8899</code> 启动</small>
                 </td></tr>
@@ -79,5 +92,18 @@
 <script>
 // 每 10 秒自动刷新
 setInterval(() => { location.reload(); }, 10000);
+
+async function removeWorker(workerId) {
+    await fetch(`/api/workers/${encodeURIComponent(workerId)}`, { method: 'DELETE' });
+    location.reload();
+}
+
+async function clearOffline() {
+    const resp = await fetch('/api/workers', { method: 'DELETE' });
+    const data = await resp.json();
+    if (data.removed > 0) {
+        location.reload();
+    }
+}
 </script>
 {% endblock %}

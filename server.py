@@ -401,15 +401,37 @@ async def get_workers():
     workers = []
     for wid, info in _worker_registry.items():
         elapsed = now - info["last_seen"]
+        is_online = elapsed < 60
+        # 在线：now - first_seen；离线：last_seen - first_seen（冻结时长）
+        uptime = (now if is_online else info["last_seen"]) - info["first_seen"]
         workers.append({
             "worker_id": wid,
-            "status": "online" if elapsed < 60 else "offline",
+            "status": "online" if is_online else "offline",
             "last_seen": datetime.fromtimestamp(info["last_seen"]).strftime("%H:%M:%S"),
             "tasks_pulled": info["tasks_pulled"],
             "results_submitted": info["results_submitted"],
-            "uptime": int(now - info["first_seen"]),
+            "uptime": int(uptime),
         })
     return {"workers": workers}
+
+
+@app.delete("/api/workers/{worker_id}")
+async def remove_worker(worker_id: str):
+    """移除单个离线 worker"""
+    if worker_id in _worker_registry:
+        del _worker_registry[worker_id]
+        return {"status": "ok", "removed": worker_id}
+    return {"status": "not_found"}
+
+
+@app.delete("/api/workers")
+async def remove_offline_workers():
+    """清理所有离线 worker（超过 60 秒无心跳）"""
+    now = time.time()
+    offline = [wid for wid, info in _worker_registry.items() if now - info["last_seen"] >= 60]
+    for wid in offline:
+        del _worker_registry[wid]
+    return {"status": "ok", "removed": len(offline)}
 
 
 # --- 设置管理 ---
@@ -566,13 +588,15 @@ async def workers_page(request: Request):
     workers = []
     for wid, info in _worker_registry.items():
         elapsed = now - info["last_seen"]
+        is_online = elapsed < 60
+        uptime = (now if is_online else info["last_seen"]) - info["first_seen"]
         workers.append({
             "worker_id": wid,
-            "status": "online" if elapsed < 60 else "offline",
+            "status": "online" if is_online else "offline",
             "last_seen": datetime.fromtimestamp(info["last_seen"]).strftime("%Y-%m-%d %H:%M:%S"),
             "tasks_pulled": info["tasks_pulled"],
             "results_submitted": info["results_submitted"],
-            "uptime_min": int((now - info["first_seen"]) / 60),
+            "uptime_min": int(uptime / 60),
         })
     return templates.TemplateResponse("workers.html", {
         "request": request,
