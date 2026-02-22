@@ -833,16 +833,19 @@ class Worker:
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
         """将截图 POST 到 Server"""
-        import io
         try:
+            from curl_cffi import CurlMime
             url = f"{self.server_url}/api/tasks/screenshot"
-            # curl_cffi 的 multipart 上传
-            resp = curl_requests.post(
-                url,
-                data={"batch_name": batch_name, "asin": asin},
-                files={"file": (f"{asin}.png", io.BytesIO(png_bytes), "image/png")},
-                timeout=15,
+            mp = CurlMime()
+            mp.addpart(name="batch_name", data=batch_name)
+            mp.addpart(name="asin", data=asin)
+            mp.addpart(
+                name="file",
+                filename=f"{asin}.png",
+                content_type="image/png",
+                data=png_bytes,
             )
+            resp = curl_requests.post(url, multipart=mp, timeout=15)
             if resp.status_code != 200:
                 logger.warning(f"📸 截图上传失败 {asin}: HTTP {resp.status_code}")
         except Exception as e:
