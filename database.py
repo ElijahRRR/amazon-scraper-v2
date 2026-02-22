@@ -48,6 +48,8 @@ class Database:
                 asin TEXT NOT NULL,
                 zip_code TEXT DEFAULT '10001',
                 status TEXT DEFAULT 'pending',
+                priority INTEGER DEFAULT 0,
+                needs_screenshot BOOLEAN DEFAULT 0,
                 worker_id TEXT,
                 retry_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -97,6 +99,7 @@ class Database:
                 package_weight TEXT,
                 item_dimensions TEXT,
                 item_weight TEXT,
+                screenshot_path TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -112,7 +115,8 @@ class Database:
 
     # ==================== 任务操作 ====================
 
-    async def create_tasks(self, batch_name: str, asins: List[str], zip_code: str = "10001") -> int:
+    async def create_tasks(self, batch_name: str, asins: List[str], zip_code: str = "10001",
+                           needs_screenshot: bool = False) -> int:
         """
         批量创建采集任务（使用 executemany 高效插入）
         返回: 实际插入的任务数（跳过已存在的）
@@ -120,10 +124,11 @@ class Database:
         # 预处理：去空、去重
         clean_asins = []
         seen = set()
+        screenshot_val = 1 if needs_screenshot else 0
         for asin in asins:
             asin = asin.strip()
             if asin and asin not in seen:
-                clean_asins.append((batch_name, asin, zip_code))
+                clean_asins.append((batch_name, asin, zip_code, screenshot_val))
                 seen.add(asin)
 
         if not clean_asins:
@@ -131,7 +136,7 @@ class Database:
 
         before = self._db.total_changes
         await self._db.executemany(
-            "INSERT OR IGNORE INTO tasks (batch_name, asin, zip_code) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO tasks (batch_name, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
             clean_asins
         )
         await self._db.commit()
@@ -153,10 +158,10 @@ class Database:
         await self._db.execute("BEGIN IMMEDIATE")
         try:
             async with self._db.execute(
-                """SELECT id, batch_name, asin, zip_code, retry_count
+                """SELECT id, batch_name, asin, zip_code, retry_count, priority, needs_screenshot
                    FROM tasks
                    WHERE status = 'pending'
-                   ORDER BY id ASC
+                   ORDER BY priority DESC, id ASC
                    LIMIT ?""",
                 (count,)
             ) as cursor:
@@ -174,6 +179,8 @@ class Database:
                     "asin": row["asin"],
                     "zip_code": row["zip_code"],
                     "retry_count": row["retry_count"],
+                    "priority": row["priority"],
+                    "needs_screenshot": row["needs_screenshot"],
                 }
                 tasks.append(task)
                 ids.append(row["id"])
@@ -259,6 +266,25 @@ class Database:
                    WHERE status = 'failed' AND retry_count < ?""",
                 (now, config.MAX_RETRIES)
             )
+        await self._db.commit()
+
+    async def prioritize_batch(self, batch_name: str, priority: int = 10):
+        """将批次中所有 pending 任务的优先级设为指定值"""
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        result = await self._db.execute(
+            """UPDATE tasks SET priority = ?, updated_at = ?
+               WHERE batch_name = ? AND status = 'pending'""",
+            (priority, now, batch_name)
+        )
+        await self._db.commit()
+        return result.rowcount
+
+    async def update_screenshot_path(self, batch_name: str, asin: str, path: str):
+        """更新结果记录的截图路径"""
+        await self._db.execute(
+            "UPDATE results SET screenshot_path = ? WHERE batch_name = ? AND asin = ?",
+            (path, batch_name, asin)
+        )
         await self._db.commit()
 
     # ==================== 结果操作 ====================

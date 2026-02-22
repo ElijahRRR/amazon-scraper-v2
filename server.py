@@ -105,6 +105,7 @@ async def upload_asin_file(
     file: UploadFile = File(...),
     batch_name: str = Form(None),
     zip_code: str = Form(None),
+    needs_screenshot: bool = Form(False),
 ):
     """
     上传 ASIN 文件（Excel/CSV）
@@ -161,7 +162,7 @@ async def upload_asin_file(
     asins = list(dict.fromkeys(asins))
 
     # 创建任务
-    inserted = await db.create_tasks(batch_name, asins, zip_code)
+    inserted = await db.create_tasks(batch_name, asins, zip_code, needs_screenshot)
 
     return {
         "status": "ok",
@@ -169,6 +170,7 @@ async def upload_asin_file(
         "total_asins": len(asins),
         "inserted": inserted,
         "zip_code": zip_code,
+        "needs_screenshot": needs_screenshot,
     }
 
 
@@ -436,12 +438,50 @@ async def retry_batch(batch_name: str):
     return {"status": "ok"}
 
 
+@app.post("/api/batches/{batch_name}/prioritize")
+async def prioritize_batch(batch_name: str):
+    """将批次中所有 pending 任务设为高优先级"""
+    db = await get_db()
+    count = await db.prioritize_batch(batch_name, priority=10)
+    logger.info(f"🚀 批次 {batch_name} 已设为优先采集 ({count} 个任务)")
+    return {"status": "ok", "updated": count}
+
+
 @app.delete("/api/batches/{batch_name}")
 async def delete_batch(batch_name: str):
     """删除批次"""
     db = await get_db()
     await db.delete_batch(batch_name)
     return {"status": "ok"}
+
+
+# --- 截图上传 ---
+@app.post("/api/tasks/screenshot")
+async def upload_screenshot(
+    file: UploadFile = File(...),
+    batch_name: str = Form(...),
+    asin: str = Form(...),
+):
+    """Worker 上传截图文件，保存到 static/screenshots/ 并更新 results 表"""
+    db = await get_db()
+
+    # 确保目录存在
+    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", batch_name)
+    os.makedirs(screenshot_dir, exist_ok=True)
+
+    # 保存文件
+    filename = f"{asin}.png"
+    filepath = os.path.join(screenshot_dir, filename)
+    content = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    # 更新数据库（存相对路径，前端通过 /static/ 访问）
+    rel_path = f"/static/screenshots/{batch_name}/{filename}"
+    await db.update_screenshot_path(batch_name, asin, rel_path)
+
+    logger.info(f"📸 截图已保存: {batch_name}/{asin} ({len(content)} bytes)")
+    return {"status": "ok", "path": rel_path}
 
 
 # ==================== Web UI 路由 ====================
