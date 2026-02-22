@@ -100,6 +100,9 @@ class Worker:
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
 
+        # 截图队列（非阻塞异步管道）
+        self._screenshot_queue: asyncio.Queue = None
+
     async def start(self):
         """启动 Worker（流水线架构）"""
         logger.info(f"🚀 Worker [{self.worker_id}] 启动（流水线模式）")
@@ -115,6 +118,7 @@ class Worker:
         # 初始化队列
         self._task_queue = asyncio.Queue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
+        self._screenshot_queue = asyncio.Queue(maxsize=50)
 
         # 初始化 session
         await self._init_session()
@@ -122,12 +126,13 @@ class Worker:
         # 启动自适应控制器
         await self._controller.start()
 
-        # 启动三大协程
+        # 启动核心协程（含截图后台 worker）
         try:
             await asyncio.gather(
                 self._task_feeder(),         # 1. 持续从 Server 拉任务
                 self._worker_pool(),         # 2. 工人池：自适应并发
                 self._batch_submitter(),     # 3. 批量回传结果
+                self._screenshot_worker(),   # 4. 截图渲染后台协程
             )
         except asyncio.CancelledError:
             pass
@@ -519,6 +524,18 @@ class Worker:
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
                 logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
 
+                # 截图存证：非阻塞放入截图队列
+                if task.get("needs_screenshot"):
+                    try:
+                        self._screenshot_queue.put_nowait({
+                            "task_id": task_id,
+                            "asin": asin,
+                            "batch_name": task.get("batch_name", ""),
+                            "html": resp.text,
+                        })
+                    except asyncio.QueueFull:
+                        logger.warning(f"📸 截图队列已满，跳过 ASIN {asin}")
+
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测
                 if self._success_since_rotate >= self._rotate_every:
                     await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
@@ -654,6 +671,103 @@ class Worker:
                     logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
             except Exception as e:
                 logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
+
+    # ═══════════════════════════════════════════════
+    # 截图渲染管道
+    # ═══════════════════════════════════════════════
+
+    async def _screenshot_worker(self):
+        """
+        后台截图协程：从截图队列取任务，用 Playwright 渲染 PNG，POST 给 Server。
+        串行处理（每次 1 个），避免 Chrome 占用过多内存。
+        """
+        logger.info("📸 截图后台协程启动")
+
+        while self._running or not self._screenshot_queue.empty():
+            try:
+                # 等待截图任务（最多等 5 秒）
+                try:
+                    item = await asyncio.wait_for(
+                        self._screenshot_queue.get(), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                asin = item["asin"]
+                batch_name = item["batch_name"]
+                html_content = item["html"]
+
+                try:
+                    # 渲染截图
+                    png_bytes = await self._render_screenshot(html_content, asin)
+                    if png_bytes:
+                        # POST 截图到 Server
+                        await self._upload_screenshot(batch_name, asin, png_bytes)
+                        logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes)")
+                    else:
+                        logger.warning(f"📸 截图渲染失败: {asin}")
+                except Exception as e:
+                    logger.error(f"📸 截图异常 {asin}: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"📸 截图协程异常: {e}")
+                await asyncio.sleep(1)
+
+        logger.info("📸 截图后台协程退出")
+
+    async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
+        """用 Playwright 将 HTML 渲染为 PNG 截图"""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("📸 playwright 未安装，跳过截图渲染")
+            return None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page(viewport={"width": 1280, "height": 800})
+
+                # 拦截主文档请求 → 注入我们保存的 HTML
+                # 外部 CSS/图片请求正常发到 Amazon CDN
+                target_url = f"https://www.amazon.com/dp/{asin}"
+
+                async def intercept(route):
+                    await route.fulfill(body=html_content, content_type="text/html")
+
+                await page.route(target_url, intercept)
+
+                try:
+                    await page.goto(target_url, wait_until="networkidle", timeout=30000)
+                except Exception:
+                    # networkidle 超时不影响截图（部分资源可能无法加载）
+                    pass
+
+                screenshot = await page.screenshot(full_page=True, type="png")
+                await browser.close()
+                return screenshot
+        except Exception as e:
+            logger.error(f"📸 Playwright 渲染异常 {asin}: {e}")
+            return None
+
+    async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
+        """将截图 POST 到 Server"""
+        import io
+        try:
+            url = f"{self.server_url}/api/tasks/screenshot"
+            # curl_cffi 的 multipart 上传
+            resp = curl_requests.post(
+                url,
+                data={"batch_name": batch_name, "asin": asin},
+                files={"file": (f"{asin}.png", io.BytesIO(png_bytes), "image/png")},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"📸 截图上传失败 {asin}: HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"📸 截图上传异常 {asin}: {e}")
 
     # ═══════════════════════════════════════════════
     # 生命周期
