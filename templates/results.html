@@ -6,13 +6,41 @@
 <h2 class="page-title">采集结果</h2>
 <p class="page-subtitle">浏览和搜索采集数据</p>
 
+<!-- 统计卡片 -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3">
+        <div class="stat-card accent">
+            <div class="stat-label">总任务</div>
+            <div class="stat-number" id="stat-total">{{ progress.total }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card success">
+            <div class="stat-label">已完成</div>
+            <div class="stat-number" id="stat-done">{{ progress.done }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card warning">
+            <div class="stat-label">采集进度</div>
+            <div class="stat-number" id="stat-rate">{{ progress.success_rate }}%</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card danger">
+            <div class="stat-label">失败</div>
+            <div class="stat-number" id="stat-failed">{{ progress.failed }}</div>
+        </div>
+    </div>
+</div>
+
 <!-- 筛选栏 -->
 <div class="card mb-4">
     <div class="card-body">
-        <form method="get" action="/results" class="row g-2 align-items-end">
+        <div class="row g-2 align-items-end">
             <div class="col-md-3">
                 <label class="form-label">批次筛选</label>
-                <select name="batch_name" class="form-select">
+                <select id="batchFilter" class="form-select">
                     <option value="">全部批次</option>
                     {% for b in batches %}
                     <option value="{{ b.batch_name }}" {% if current_batch == b.batch_name %}selected{% endif %}>
@@ -23,30 +51,28 @@
             </div>
             <div class="col-md-4">
                 <label class="form-label">搜索</label>
-                <input type="text" name="search" class="form-control" placeholder="ASIN 或标题..." value="{{ search }}">
+                <input type="text" id="searchInput" class="form-control" placeholder="ASIN 或标题..." value="{{ search }}">
             </div>
             <div class="col-md-2">
-                <button type="submit" class="btn btn-accent w-100"><i class="bi bi-search"></i> 搜索</button>
+                <button class="btn btn-accent w-100" onclick="loadResults(1)"><i class="bi bi-search"></i> 搜索</button>
             </div>
-            {% if current_batch %}
             <div class="col-md-3 text-end">
-                <a href="/api/export/{{ current_batch }}?format=excel" class="btn btn-outline-accent">
+                <a id="exportExcelBtn" href="#" class="btn btn-outline-accent" style="display:none;">
                     <i class="bi bi-file-earmark-excel"></i> 导出 Excel
                 </a>
-                <a href="/api/export/{{ current_batch }}?format=csv" class="btn btn-outline-accent">
+                <a id="exportCsvBtn" href="#" class="btn btn-outline-accent" style="display:none;">
                     <i class="bi bi-filetype-csv"></i> CSV
                 </a>
             </div>
-            {% endif %}
-        </form>
+        </div>
     </div>
 </div>
 
 <!-- 结果列表 -->
 <div class="card">
     <div class="card-header d-flex justify-content-between">
-        <span><i class="bi bi-table"></i> 共 {{ total }} 条结果</span>
-        <span class="text-secondary">第 {{ current_page }} / {{ total_pages }} 页</span>
+        <span><i class="bi bi-table"></i> 共 <span id="resultTotal">{{ total }}</span> 条结果</span>
+        <span class="text-secondary">第 <span id="currentPage">{{ current_page }}</span> / <span id="totalPages">{{ total_pages }}</span> 页</span>
     </div>
     <div class="card-body p-0">
         <div class="table-responsive">
@@ -64,14 +90,14 @@
                         <th>采集时间</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="resultsBody">
                     {% for r in results %}
                     <tr>
                         <td>
-                            <a href="https://www.amazon.com/dp/{{ r.asin }}" target="_blank" 
+                            <a href="https://www.amazon.com/dp/{{ r.asin }}" target="_blank"
                                class="text-decoration-none" style="color:var(--info)">{{ r.asin }}</a>
                         </td>
-                        <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" 
+                        <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
                             title="{{ r.title }}">{{ r.title }}</td>
                         <td>{{ r.current_price or 'N/A' }}</td>
                         <td>{{ r.buybox_price or 'N/A' }}</td>
@@ -100,35 +126,180 @@
 </div>
 
 <!-- 分页 -->
-{% if total_pages > 1 %}
-<nav class="mt-3">
-    <ul class="pagination justify-content-center">
-        {% if current_page > 1 %}
-        <li class="page-item">
-            <a class="page-link" href="/results?page={{ current_page - 1 }}{% if current_batch %}&batch_name={{ current_batch }}{% endif %}{% if search %}&search={{ search }}{% endif %}">
+<nav class="mt-3" id="paginationNav">
+</nav>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// 状态管理
+let state = {
+    batch: '{{ current_batch or "" }}',
+    search: '{{ search or "" }}',
+    page: {{ current_page }},
+    totalPages: {{ total_pages }},
+    total: {{ total }}
+};
+
+// 初始化
+document.addEventListener('DOMContentLoaded', () => {
+    updateExportButtons();
+    renderPagination();
+    loadProgress();
+
+    // 批次切换 → AJAX 刷新
+    document.getElementById('batchFilter').addEventListener('change', (e) => {
+        state.batch = e.target.value;
+        state.page = 1;
+        loadResults(1);
+        loadProgress();
+        updateExportButtons();
+    });
+
+    // 搜索框回车
+    document.getElementById('searchInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            loadResults(1);
+        }
+    });
+});
+
+// 加载结果（AJAX）
+async function loadResults(page) {
+    state.page = page;
+    state.search = document.getElementById('searchInput').value;
+
+    const params = new URLSearchParams({ page: state.page, per_page: 50 });
+    if (state.batch) params.set('batch_name', state.batch);
+    if (state.search) params.set('search', state.search);
+
+    try {
+        const resp = await fetch(`/api/results?${params}`);
+        const data = await resp.json();
+
+        state.total = data.total;
+        state.totalPages = data.total_pages;
+
+        document.getElementById('resultTotal').textContent = data.total;
+        document.getElementById('currentPage').textContent = data.page;
+        document.getElementById('totalPages').textContent = data.total_pages;
+
+        renderResults(data.results);
+        renderPagination();
+    } catch(e) {
+        console.error('加载结果失败:', e);
+    }
+}
+
+// 渲染结果表格
+function renderResults(results) {
+    const tbody = document.getElementById('resultsBody');
+    if (!results || results.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-secondary py-4">暂无数据</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = results.map(r => {
+        const fbaCell = r.is_fba === 'FBA'
+            ? '<span class="badge-status badge-done">FBA</span>'
+            : r.is_fba === 'FBM'
+                ? '<span class="badge-status badge-pending">FBM</span>'
+                : (r.is_fba || 'N/A');
+
+        const title = r.title || '';
+        const titleEscaped = title.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
+        return `<tr>
+            <td><a href="https://www.amazon.com/dp/${r.asin}" target="_blank"
+                   class="text-decoration-none" style="color:var(--info)">${r.asin}</a></td>
+            <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                title="${titleEscaped}">${titleEscaped}</td>
+            <td>${r.current_price || 'N/A'}</td>
+            <td>${r.buybox_price || 'N/A'}</td>
+            <td>${r.brand || 'N/A'}</td>
+            <td>${r.stock_status || 'N/A'}</td>
+            <td>${fbaCell}</td>
+            <td>${r.delivery_date || 'N/A'}</td>
+            <td><small class="text-secondary">${r.crawl_time || ''}</small></td>
+        </tr>`;
+    }).join('');
+}
+
+// 加载进度统计（卡片）
+async function loadProgress() {
+    try {
+        const url = state.batch
+            ? `/api/progress/${encodeURIComponent(state.batch)}`
+            : '/api/progress';
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        document.getElementById('stat-total').textContent = data.total;
+        document.getElementById('stat-done').textContent = data.done;
+        document.getElementById('stat-rate').textContent = data.success_rate + '%';
+        document.getElementById('stat-failed').textContent = data.failed;
+    } catch(e) {
+        console.error('加载进度失败:', e);
+    }
+}
+
+// 更新导出按钮
+function updateExportButtons() {
+    const excelBtn = document.getElementById('exportExcelBtn');
+    const csvBtn = document.getElementById('exportCsvBtn');
+
+    if (state.batch) {
+        const batchEncoded = encodeURIComponent(state.batch);
+        excelBtn.href = `/api/export/${batchEncoded}?format=excel`;
+        csvBtn.href = `/api/export/${batchEncoded}?format=csv`;
+        excelBtn.style.display = 'inline-block';
+        csvBtn.style.display = 'inline-block';
+    } else {
+        excelBtn.style.display = 'none';
+        csvBtn.style.display = 'none';
+    }
+}
+
+// 渲染分页
+function renderPagination() {
+    const nav = document.getElementById('paginationNav');
+    if (state.totalPages <= 1) {
+        nav.innerHTML = '';
+        return;
+    }
+
+    let pages = [];
+    for (let p = 1; p <= state.totalPages; p++) {
+        if (p <= 3 || p > state.totalPages - 3 || (p >= state.page - 1 && p <= state.page + 1)) {
+            pages.push(p);
+        } else if (pages[pages.length - 1] !== '...') {
+            pages.push('...');
+        }
+    }
+
+    const prevDisabled = state.page <= 1 ? 'disabled' : '';
+    const nextDisabled = state.page >= state.totalPages ? 'disabled' : '';
+
+    nav.innerHTML = `<ul class="pagination justify-content-center">
+        <li class="page-item ${prevDisabled}">
+            <a class="page-link" href="#" onclick="event.preventDefault(); loadResults(${state.page - 1})">
                 <i class="bi bi-chevron-left"></i>
             </a>
         </li>
-        {% endif %}
-        
-        {% for p in range(1, total_pages + 1) %}
-            {% if p <= 3 or p > total_pages - 3 or (p >= current_page - 1 and p <= current_page + 1) %}
-            <li class="page-item {% if p == current_page %}active{% endif %}">
-                <a class="page-link" href="/results?page={{ p }}{% if current_batch %}&batch_name={{ current_batch }}{% endif %}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
-            </li>
-            {% elif p == 4 or p == total_pages - 3 %}
-            <li class="page-item disabled"><span class="page-link">...</span></li>
-            {% endif %}
-        {% endfor %}
-        
-        {% if current_page < total_pages %}
-        <li class="page-item">
-            <a class="page-link" href="/results?page={{ current_page + 1 }}{% if current_batch %}&batch_name={{ current_batch }}{% endif %}{% if search %}&search={{ search }}{% endif %}">
+        ${pages.map(p => {
+            if (p === '...') return '<li class="page-item disabled"><span class="page-link">...</span></li>';
+            const active = p === state.page ? 'active' : '';
+            return `<li class="page-item ${active}">
+                <a class="page-link" href="#" onclick="event.preventDefault(); loadResults(${p})">${p}</a>
+            </li>`;
+        }).join('')}
+        <li class="page-item ${nextDisabled}">
+            <a class="page-link" href="#" onclick="event.preventDefault(); loadResults(${state.page + 1})">
                 <i class="bi bi-chevron-right"></i>
             </a>
         </li>
-        {% endif %}
-    </ul>
-</nav>
-{% endif %}
+    </ul>`;
+}
+</script>
 {% endblock %}

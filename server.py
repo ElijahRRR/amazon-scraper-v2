@@ -489,6 +489,7 @@ async def results_page(
     batches = await db.get_batch_list()
     results, total = await db.get_results(batch_name, page, 50, search)
     total_pages = (total + 49) // 50
+    progress = await db.get_progress(batch_name)
 
     return templates.TemplateResponse("results.html", {
         "request": request,
@@ -499,6 +500,7 @@ async def results_page(
         "total": total,
         "total_pages": total_pages,
         "search": search or "",
+        "progress": progress,
     })
 
 
