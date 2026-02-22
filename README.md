@@ -64,6 +64,7 @@
 | 压缩 | Brotli (`br`) | 比 gzip 小 15-25%，减少传输量 |
 | 模板 | Jinja2 | Web UI 页面渲染 |
 | 导出 | openpyxl / csv | Excel (.xlsx) 和 CSV 导出 |
+| 截图存证 | Playwright (Chromium) | 可选功能，渲染商品页截图用于数据抽查 |
 
 ## 反反爬策略
 
@@ -77,7 +78,7 @@
 
 ### Session 主动轮换
 
-每完成 100 次成功请求，主动关闭当前 Session 并创建新的。更换 User-Agent、重新获取代理 IP、重新初始化 Cookie，防止 Amazon 通过行为指纹（请求频率、Cookie 老化等）识别。
+每完成 1000 次成功请求，主动关闭当前 Session 并创建新的。更换 User-Agent、重新获取代理 IP、重新初始化 Cookie，防止 Amazon 通过行为指纹（请求频率、Cookie 老化等）识别。
 
 ### 请求头仿真
 
@@ -105,7 +106,8 @@
 | `REQUEST_JITTER` | 0.02s | 间隔随机抖动 |
 | `REQUEST_TIMEOUT` | 15s | 单次请求超时（短超时更快释放并发槽位） |
 | `MAX_RETRIES` | 3 | 最大重试次数 |
-| `SESSION_ROTATE_EVERY` | 100 | 每 N 次成功请求轮换 Session |
+| `SESSION_ROTATE_EVERY` | 1000 | 每 N 次成功请求轮换 Session |
+| `TOKEN_BUCKET_RATE` | 4.5 | 全局 QPS 上限（令牌桶速率，每秒请求数） |
 | `IMPERSONATE_BROWSER` | chrome131 | TLS 指纹模拟目标 |
 | `PROXY_REFRESH_INTERVAL` | 30s | 代理刷新间隔 |
 
@@ -113,12 +115,12 @@
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `INITIAL_CONCURRENCY` | 5 | 冷启动并发数（保守开始，自动攀升） |
+| `INITIAL_CONCURRENCY` | 8 | 冷启动并发数（保守开始，自动攀升） |
 | `MIN_CONCURRENCY` | 2 | 并发下限 |
 | `MAX_CONCURRENCY` | 50 | 并发上限 |
 | `ADJUST_INTERVAL_S` | 10s | 评估间隔 |
-| `TARGET_LATENCY_S` | 5.0s | 目标 p50 延迟（低于此加速） |
-| `MAX_LATENCY_S` | 8.0s | 延迟上限（超过则减速） |
+| `TARGET_LATENCY_S` | 6.0s | 目标 p50 延迟（低于此加速） |
+| `MAX_LATENCY_S` | 10.0s | 延迟上限（超过则减速） |
 | `TARGET_SUCCESS_RATE` | 95% | 成功率目标（高于此加速） |
 | `MIN_SUCCESS_RATE` | 85% | 成功率下限（低于此减速） |
 | `BLOCK_RATE_THRESHOLD` | 5% | 封锁率阈值（超过则紧急减半+冷却） |
@@ -143,20 +145,33 @@ task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] →
 ```
 
 - **流水线架构**：任务补给、采集、结果提交三大协程并行，互不阻塞
-- **自适应并发**：冷启动 5 并发，AIMD 算法根据延迟/成功率/封锁率自动探索最优并发数
+- **自适应并发**：冷启动 8 并发，AIMD 算法根据延迟/成功率/封锁率自动探索最优并发数
 - **任务预取**：队列低于 50% 时触发补给，保持 Worker 始终有任务可做
 - **动态工人池**：根据控制器决策动态增加 Worker 协程数量
 - **封锁处理**：检测到 403/503/验证码 → 自动轮换 Session（换 IP + 换 Cookie）
-- **主动轮换**：每 100 次成功请求主动更换 Session
+- **主动轮换**：每 1000 次成功请求主动更换 Session
 - **快速模式** (`--fast`)：优先用 AOD AJAX 获取价格，失败再 fallback 到完整产品页
+- **截图存证**：需要截图的任务自动入队，Playwright 后台串行渲染，复用浏览器实例，裁剪到购物车区域
+- **设置热同步**：每 30 秒从 Server 拉取最新设置，无需重启即可更新并发/速率/AIMD 参数
 - **批量提交**：结果先入队列，攒满 10 条或每 2 秒批量 POST 提交
 - **优雅退出**：SIGINT/SIGTERM 信号处理，退出前刷新队列
+
+**截图存证子系统：**
+
+Worker 内置 Playwright 截图引擎，对标记 `needs_screenshot` 的任务自动渲染商品页 PNG 截图并上传至 Server：
+
+- 持久化 Chromium 实例，避免每次截图冷启动（首次启动 ~2s，后续每张 ~1-2s）
+- 智能裁剪：只截取购物车按钮以上的区域（商品标题、图片、价格、卖家信息），跳过评论和推荐
+- 资源拦截：屏蔽 JS、字体、追踪脚本，只加载 CSS 和图片，大幅减少等待时间
+- 使用 `domcontentloaded` 替代 `networkidle`，不等追踪脚本加载
+- 异常自动恢复：浏览器崩溃时重置实例，不影响后续截图
+- 截图为可选功能，需安装 `requirements-screenshot.txt` 中的依赖
 
 ### `adaptive.py` — AIMD 自适应并发控制器
 
 类 TCP 拥塞控制算法，根据实时指标动态调整并发数：
 
-- **Additive Increase**：一切正常（成功率 ≥ 95%，p50 < 5s）→ 并发 +1
+- **Additive Increase**：一切正常（成功率 ≥ 95%，p50 < 6s）→ 并发 +1
 - **Multiplicative Decrease**：出问题 → 并发 ÷ 2
 - **五级决策链**：封锁率超标 → 成功率/延迟 → 带宽饱和 → 冷却期 → 正常加速
 - **动态信号量**：实时调整 Semaphore 大小，无需重建
@@ -212,6 +227,16 @@ SQLite WAL 模式，两张核心表：
 
 FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和 Web UI：
 
+**运行时设置热同步：**
+
+通过 Web UI 的「设置」页面可实时修改以下参数，Worker 每 30 秒自动同步更新（无需重启）：
+
+- 基础：邮编、最大重试、代理地址、Session 轮换频率
+- 速率与并发：全局 QPS（令牌桶速率）、初始/最小/最大并发
+- AIMD 调控：评估间隔、目标延迟、延迟上限、目标成功率、成功率下限、封锁率阈值、冷却时间
+
+设置使用版本号增量同步——Server 每次更新 `_settings_version` 递增，Worker 对比版本号跳过无变化的轮询。
+
 **API 端点：**
 
 | 方法 | 路径 | 功能 |
@@ -220,15 +245,19 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | GET | `/api/tasks/pull` | Worker 拉取待处理任务 |
 | POST | `/api/tasks/result` | Worker 提交单条结果 |
 | POST | `/api/tasks/result/batch` | Worker 批量提交结果（单次 commit，减少磁盘 IO） |
+| POST | `/api/tasks/screenshot` | Worker 上传截图（multipart/form-data） |
 | GET | `/api/progress` | 获取总体进度 |
 | GET | `/api/progress/{batch}` | 获取批次进度 |
 | GET | `/api/batches` | 获取批次列表 |
 | GET | `/api/results` | 分页查询结果 |
 | GET | `/api/export/{batch}` | 导出数据（Excel/CSV） |
 | GET | `/api/workers` | 查看在线 Worker |
-| GET/PUT | `/api/settings` | 读取/修改运行时设置 |
+| DELETE | `/api/workers` | 清理所有离线 Worker |
+| DELETE | `/api/workers/{id}` | 移除指定 Worker |
+| GET/PUT | `/api/settings` | 读取/修改运行时设置（带版本号增量同步） |
 | POST | `/api/batches/{batch}/retry` | 重试失败任务 |
 | DELETE | `/api/batches/{batch}` | 删除批次 |
+| GET | `/api/worker/download` | 下载 Worker 安装包（ZIP，含启动脚本） |
 
 **Web UI 页面：**
 
@@ -237,8 +266,8 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | `/` | 仪表盘（总览进度、活跃 Worker） |
 | `/tasks` | 任务管理（上传 ASIN、查看批次） |
 | `/results` | 结果浏览（分页、搜索、导出） |
-| `/settings` | 设置（邮编、并发数、代理等） |
-| `/workers` | Worker 监控（在线状态、统计） |
+| `/settings` | 设置（邮编、速率、并发、AIMD 参数，保存后 Worker 自动同步） |
+| `/workers` | Worker 监控（在线状态、统计、下载 Worker 包、清理离线） |
 
 ## 快速开始
 
@@ -274,7 +303,7 @@ docker push yourname/scraper-worker
 docker run -d yourname/scraper-worker --server http://<服务器IP>:8899
 ```
 
-> **关于多 Worker 并发**：`docker compose up -d --scale worker=3` 可以在一台机器上启动多个 Worker。每个 Worker 的**冷启动并发为 5**，默认会自适应探索到 `--concurrency` 上限（默认 50）；但快代理单通道可稳定承载的并发通常约为 14。**单代理通道下跑 1 个 Worker 是最优配置**。多 Worker 并行需要配合多条代理通道，否则会因代理限流导致失败率上升。
+> **关于多 Worker 并发**：`docker compose up -d --scale worker=3` 可以在一台机器上启动多个 Worker。每个 Worker 的**冷启动并发为 8**，默认会自适应探索到 `--concurrency` 上限（默认 50）；但快代理单通道可稳定承载的并发通常约为 14。**单代理通道下跑 1 个 Worker 是最优配置**。多 Worker 并行需要配合多条代理通道，否则会因代理限流导致失败率上升。
 
 Docker 文件说明：
 
@@ -335,7 +364,19 @@ Worker 只需以下文件即可独立运行（不需要完整项目）：
 ```
 worker.py, config.py, models.py, proxy.py, session.py, parser.py, metrics.py, adaptive.py
 requirements-worker.txt（精简依赖，pip install -r requirements-worker.txt）
+requirements-screenshot.txt（可选，截图功能需要 playwright）
 ```
+
+#### 方式三：Web UI 一键下载 Worker
+
+最简单的方式——在 Server 的 Web UI 上下载 Worker 安装包：
+
+1. 打开浏览器访问 Server 地址（如 `http://192.168.1.100:8899`）
+2. 进入「设置」或「Worker 监控」页面，点击「下载 Worker 安装包」
+3. 解压 ZIP 文件，双击 `start.sh`（macOS/Linux）或 `start.bat`（Windows）
+4. 启动脚本会自动创建虚拟环境、安装依赖、连接到 Server
+
+> 安装包内含 8 个 Python 文件 + 依赖清单 + 启动脚本，Server 地址已自动注入。首次启动会自动安装 Playwright Chromium 用于截图功能。
 
 Worker 命令行参数：
 
@@ -383,7 +424,7 @@ Worker 命令行参数：
 | 成功率 | 99.8% (499/500) |
 | 并发数 | 14 |
 | 请求超时 | 15 秒 |
-| Session 轮换 | 每 100 次成功请求 |
+| Session 轮换 | 每 1000 次成功请求 |
 | 封锁率 | 0% |
 
 ### 调优历程
@@ -413,6 +454,7 @@ amazon-scraper-v2/
 ├── models.py              # 数据模型（Task, Result dataclass）
 ├── requirements.txt       # Server 完整依赖
 ├── requirements-worker.txt # Worker 精简依赖（4 个包）
+├── requirements-screenshot.txt # 截图功能依赖（可选，playwright）
 ├── Dockerfile.server      # Server Docker 镜像
 ├── Dockerfile.worker      # Worker Docker 镜像（精简版）
 ├── docker-compose.yml     # Docker 编排（Server + Worker）
@@ -425,5 +467,6 @@ amazon-scraper-v2/
 │   ├── settings.html
 │   └── workers.html
 ├── static/                # 前端静态资源（CSS/JS）
-└── data/                  # 数据目录（SQLite 数据库文件）
+├── data/                  # 数据目录（SQLite 数据库文件）
+└── data/screenshots/      # 截图存证（按批次/ASIN 存储 PNG）
 ```
