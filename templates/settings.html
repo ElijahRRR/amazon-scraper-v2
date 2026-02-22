@@ -4,45 +4,124 @@
 
 {% block content %}
 <h2 class="page-title">系统设置</h2>
-<p class="page-subtitle">配置采集参数</p>
+<p class="page-subtitle">配置采集参数（保存后 Worker 自动同步生效）</p>
 
 <div class="row">
     <div class="col-lg-8">
-        <div class="card">
-            <div class="card-header"><i class="bi bi-gear"></i> 运行时配置</div>
+        <!-- 基础设置 -->
+        <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-sliders"></i> 基础设置</div>
             <div class="card-body">
                 <form id="settingsForm">
                     <div class="row g-3">
-                        <div class="col-md-6">
+                        <div class="col-md-4">
                             <label class="form-label">配送邮编</label>
-                            <input type="text" class="form-control" name="zip_code" 
+                            <input type="text" class="form-control" name="zip_code"
                                    value="{{ settings.zip_code }}" placeholder="10001">
-                            <small class="text-secondary">Worker 将使用此邮编采集</small>
+                            <small class="text-secondary">新建任务使用的默认邮编</small>
                         </div>
-                        <div class="col-md-6">
-                            <label class="form-label">每 Worker 并发数</label>
-                            <input type="number" class="form-control" name="concurrency" 
-                                   value="{{ settings.concurrency }}" min="1" max="20">
-                            <small class="text-secondary">建议不超过 14（匹配代理限制）</small>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">请求间隔（秒）</label>
-                            <input type="number" class="form-control" name="request_interval" 
-                                   value="{{ settings.request_interval }}" step="0.01" min="0">
-                            <small class="text-secondary">每次请求之间的间隔</small>
-                        </div>
-                        <div class="col-md-6">
+                        <div class="col-md-4">
                             <label class="form-label">最大重试次数</label>
-                            <input type="number" class="form-control" name="max_retries" 
+                            <input type="number" class="form-control" name="max_retries"
                                    value="{{ settings.max_retries }}" min="1" max="10">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Session 轮换频率</label>
+                            <input type="number" class="form-control" name="session_rotate_every"
+                                   value="{{ settings.session_rotate_every }}" min="50" max="10000">
+                            <small class="text-secondary">每 N 次成功请求后轮换 Session</small>
                         </div>
                         <div class="col-12">
                             <label class="form-label">代理 API 地址</label>
-                            <input type="text" class="form-control" name="proxy_api_url" 
+                            <input type="text" class="form-control" name="proxy_api_url"
                                    value="{{ settings.proxy_api_url }}">
                             <small class="text-secondary">快代理 TPS API 地址</small>
                         </div>
                     </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- 速率与并发 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-speedometer2"></i> 速率与并发</h6>
+                    <div class="row g-3">
+                        <div class="col-md-3">
+                            <label class="form-label">全局 QPS</label>
+                            <input type="number" class="form-control" name="token_bucket_rate"
+                                   value="{{ settings.token_bucket_rate }}" step="0.5" min="0.5" max="50">
+                            <small class="text-secondary">令牌桶速率（每秒请求数）</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">初始并发</label>
+                            <input type="number" class="form-control" name="initial_concurrency"
+                                   value="{{ settings.initial_concurrency }}" min="1" max="50">
+                            <small class="text-secondary">Worker 冷启动并发数</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">最小并发</label>
+                            <input type="number" class="form-control" name="min_concurrency"
+                                   value="{{ settings.min_concurrency }}" min="1" max="20">
+                            <small class="text-secondary">AIMD 下限</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">最大并发</label>
+                            <input type="number" class="form-control" name="max_concurrency"
+                                   value="{{ settings.max_concurrency }}" min="2" max="100">
+                            <small class="text-secondary">AIMD 上限</small>
+                        </div>
+                    </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- AIMD 调控参数 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);">
+                        <i class="bi bi-graph-up"></i> AIMD 自适应调控
+                        <small class="text-secondary ms-2" style="font-weight:normal;">（高级，谨慎修改）</small>
+                    </h6>
+                    <div class="row g-3">
+                        <div class="col-md-3">
+                            <label class="form-label">评估间隔</label>
+                            <input type="number" class="form-control" name="adjust_interval"
+                                   value="{{ settings.adjust_interval }}" min="3" max="60">
+                            <small class="text-secondary">秒</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">目标延迟</label>
+                            <input type="number" class="form-control" name="target_latency"
+                                   value="{{ settings.target_latency }}" step="0.5" min="1" max="30">
+                            <small class="text-secondary">p50 低于此值才加速</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">延迟上限</label>
+                            <input type="number" class="form-control" name="max_latency"
+                                   value="{{ settings.max_latency }}" step="0.5" min="2" max="60">
+                            <small class="text-secondary">超过此值则减速</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">封锁冷却</label>
+                            <input type="number" class="form-control" name="cooldown_after_block"
+                                   value="{{ settings.cooldown_after_block }}" min="5" max="120">
+                            <small class="text-secondary">秒，被封后暂停加速</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">目标成功率</label>
+                            <input type="number" class="form-control" name="target_success_rate"
+                                   value="{{ settings.target_success_rate }}" step="0.01" min="0.5" max="1">
+                            <small class="text-secondary">高于此值才递增并发</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">成功率下限</label>
+                            <input type="number" class="form-control" name="min_success_rate"
+                                   value="{{ settings.min_success_rate }}" step="0.01" min="0.3" max="1">
+                            <small class="text-secondary">低于此值触发减半</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">封锁率阈值</label>
+                            <input type="number" class="form-control" name="block_rate_threshold"
+                                   value="{{ settings.block_rate_threshold }}" step="0.01" min="0.01" max="0.5">
+                            <small class="text-secondary">超过此值紧急减半</small>
+                        </div>
+                    </div>
+
                     <div class="mt-4">
                         <button type="submit" class="btn btn-accent">
                             <i class="bi bi-check-lg"></i> 保存设置
@@ -75,10 +154,6 @@
                         <small class="text-secondary">请求超时</small><br>
                         <strong>{{ config.timeout }}s</strong>
                     </li>
-                    <li class="mb-2">
-                        <small class="text-secondary">Session 轮换</small><br>
-                        <strong>每 {{ config.rotate_every }} 次</strong>
-                    </li>
                     <li>
                         <small class="text-secondary">版本</small><br>
                         <strong>v2.0.0</strong>
@@ -106,9 +181,12 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     const formData = new FormData(e.target);
     const data = Object.fromEntries(formData);
     // 数值类型转换
-    data.concurrency = parseInt(data.concurrency);
-    data.request_interval = parseFloat(data.request_interval);
-    data.max_retries = parseInt(data.max_retries);
+    const intFields = ['max_retries', 'session_rotate_every', 'initial_concurrency',
+                       'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block'];
+    const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
+                         'target_success_rate', 'min_success_rate', 'block_rate_threshold'];
+    intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
+    floatFields.forEach(f => { if (data[f] !== undefined) data[f] = parseFloat(data[f]); });
 
     const resultDiv = document.getElementById('saveResult');
     try {
@@ -117,16 +195,17 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data),
         });
+        const result = await resp.json();
         if (resp.ok) {
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-success">✅ 设置已保存</div>';
+            resultDiv.innerHTML = `<div class="alert alert-success">设置已保存，Worker 将在 30 秒内自动同步</div>`;
         } else {
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-danger">❌ 保存失败</div>';
+            resultDiv.innerHTML = '<div class="alert alert-danger">保存失败</div>';
         }
     } catch(err) {
         resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<div class="alert alert-danger">❌ 网络错误: ${err.message}</div>`;
+        resultDiv.innerHTML = `<div class="alert alert-danger">网络错误: ${err.message}</div>`;
     }
     setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
 });

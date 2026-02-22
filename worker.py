@@ -103,6 +103,9 @@ class Worker:
         # 截图队列（非阻塞异步管道）
         self._screenshot_queue: asyncio.Queue = None
 
+        # 设置同步
+        self._settings_version = 0
+
     async def start(self):
         """启动 Worker（流水线架构）"""
         logger.info(f"🚀 Worker [{self.worker_id}] 启动（流水线模式）")
@@ -133,6 +136,7 @@ class Worker:
                 self._worker_pool(),         # 2. 工人池：自适应并发
                 self._batch_submitter(),     # 3. 批量回传结果
                 self._screenshot_worker(),   # 4. 截图渲染后台协程
+                self._settings_sync(),       # 5. 定期同步服务端设置
             )
         except asyncio.CancelledError:
             pass
@@ -398,6 +402,81 @@ class Worker:
         except Exception as e:
             logger.error(f"拉取任务异常: {e}")
             return []
+
+    async def _settings_sync(self):
+        """定期从服务端同步设置，热更新运行参数"""
+        logger.info("⚙️ 设置同步协程启动（每 30 秒检查一次）")
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                if not self._running:
+                    break
+
+                resp = curl_requests.get(
+                    f"{self.server_url}/api/settings", timeout=5
+                )
+                if resp.status_code != 200:
+                    continue
+
+                s = resp.json()
+                ver = s.get("_version", 0)
+                if ver <= self._settings_version:
+                    continue  # 没有变化
+
+                self._settings_version = ver
+                changes = []
+
+                # 令牌桶 QPS
+                new_rate = s.get("token_bucket_rate")
+                if new_rate and new_rate != self._rate_limiter.rate:
+                    self._rate_limiter.rate = new_rate
+                    changes.append(f"QPS={new_rate}")
+
+                # 并发范围
+                new_max = s.get("max_concurrency")
+                if new_max and new_max != self._controller._max:
+                    self._controller._max = new_max
+                    changes.append(f"max_c={new_max}")
+
+                new_min = s.get("min_concurrency")
+                if new_min and new_min != self._controller._min:
+                    self._controller._min = new_min
+                    changes.append(f"min_c={new_min}")
+
+                # AIMD 调控参数
+                for attr, key in [
+                    ("_adjust_interval", "adjust_interval"),
+                    ("_target_latency", "target_latency"),
+                    ("_max_latency", "max_latency"),
+                    ("_target_success", "target_success_rate"),
+                    ("_min_success", "min_success_rate"),
+                    ("_block_threshold", "block_rate_threshold"),
+                    ("_cooldown_duration", "cooldown_after_block"),
+                ]:
+                    val = s.get(key)
+                    if val is not None and val != getattr(self._controller, attr, None):
+                        setattr(self._controller, attr, val)
+                        changes.append(f"{key}={val}")
+
+                # Session 轮换
+                new_rotate = s.get("session_rotate_every")
+                if new_rotate and new_rotate != self._rotate_every:
+                    self._rotate_every = new_rotate
+                    changes.append(f"rotate={new_rotate}")
+
+                # 最大重试
+                new_retries = s.get("max_retries")
+                if new_retries and new_retries != config.MAX_RETRIES:
+                    config.MAX_RETRIES = new_retries
+                    changes.append(f"retries={new_retries}")
+
+                if changes:
+                    logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"⚙️ 设置同步异常: {e}")
 
     async def _process_task(self, task: Dict) -> tuple:
         """

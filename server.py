@@ -74,14 +74,31 @@ def _register_worker(worker_id: str):
     _worker_registry[worker_id]["last_seen"] = now
 
 
-# ==================== 运行时设置（可通过 API 修改）====================
+# ==================== 运行时设置（可通过 API 修改，Worker 定期同步）====================
 _runtime_settings = {
+    # 基础
     "zip_code": config.DEFAULT_ZIP_CODE,
-    "concurrency": config.DEFAULT_CONCURRENCY,
-    "proxy_api_url": config.PROXY_API_URL_AUTH,
-    "request_interval": config.REQUEST_INTERVAL,
     "max_retries": config.MAX_RETRIES,
+    "proxy_api_url": config.PROXY_API_URL_AUTH,
+    # 限速
+    "token_bucket_rate": config.TOKEN_BUCKET_RATE,
+    # 并发控制
+    "initial_concurrency": config.INITIAL_CONCURRENCY,
+    "min_concurrency": config.MIN_CONCURRENCY,
+    "max_concurrency": config.MAX_CONCURRENCY,
+    # Session
+    "session_rotate_every": config.SESSION_ROTATE_EVERY,
+    # AIMD 调控
+    "adjust_interval": config.ADJUST_INTERVAL_S,
+    "target_latency": config.TARGET_LATENCY_S,
+    "max_latency": config.MAX_LATENCY_S,
+    "target_success_rate": config.TARGET_SUCCESS_RATE,
+    "min_success_rate": config.MIN_SUCCESS_RATE,
+    "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
+    "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
 }
+# 设置版本号：每次修改 +1，Worker 比对版本号决定是否需要重载
+_settings_version = 0
 
 
 async def _timeout_task_loop():
@@ -437,18 +454,24 @@ async def remove_offline_workers():
 # --- 设置管理 ---
 @app.get("/api/settings")
 async def get_settings():
-    """获取当前运行时设置"""
-    return _runtime_settings.copy()
+    """获取当前运行时设置（含版本号，Worker 用于增量同步）"""
+    return {**_runtime_settings, "_version": _settings_version}
 
 
 @app.put("/api/settings")
 async def update_settings(request: Request):
     """更新运行时设置"""
+    global _settings_version
     data = await request.json()
+    changed = False
     for key in _runtime_settings:
-        if key in data:
+        if key in data and data[key] != _runtime_settings[key]:
             _runtime_settings[key] = data[key]
-    return {"status": "ok", "settings": _runtime_settings}
+            changed = True
+    if changed:
+        _settings_version += 1
+        logger.info(f"⚙️ 设置已更新 (version={_settings_version})")
+    return {"status": "ok", "settings": _runtime_settings, "_version": _settings_version}
 
 
 # --- 批次操作 ---
@@ -576,7 +599,6 @@ async def settings_page(request: Request):
             "port": config.SERVER_PORT,
             "impersonate": config.IMPERSONATE_BROWSER,
             "timeout": config.REQUEST_TIMEOUT,
-            "rotate_every": config.SESSION_ROTATE_EVERY,
         },
     })
 
