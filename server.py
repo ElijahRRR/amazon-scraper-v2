@@ -6,6 +6,7 @@ Amazon 产品采集系统 v2 - 中央服务器（FastAPI）
 import os
 import io
 import csv
+import zipfile
 import re
 import asyncio
 import logging
@@ -527,6 +528,130 @@ async def upload_screenshot(
 
     logger.info(f"📸 截图已保存: {batch_name}/{asin} ({len(content)} bytes)")
     return {"status": "ok", "path": rel_path}
+
+
+# --- Worker 下载包 ---
+_WORKER_FILES = [
+    "worker.py", "config.py", "proxy.py", "session.py",
+    "parser.py", "metrics.py", "adaptive.py", "models.py",
+    "requirements-worker.txt",
+]
+
+
+@app.get("/api/worker/download")
+async def download_worker(request: Request):
+    """打包 Worker 所需文件为 ZIP 下载，内含启动脚本（自动连接本服务器）"""
+    # 推断服务器地址（用请求的 Host 头）
+    host = request.headers.get("host", f"127.0.0.1:{config.SERVER_PORT}")
+    scheme = "https" if request.headers.get("x-forwarded-proto") == "https" else "http"
+    server_url = f"{scheme}://{host}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Python 源码 + requirements
+        for fname in _WORKER_FILES:
+            fpath = os.path.join(config.BASE_DIR, fname)
+            if os.path.exists(fpath):
+                zf.write(fpath, f"worker/{fname}")
+
+        # 可选截图依赖
+        zf.writestr("worker/requirements-screenshot.txt",
+                     "# 截图功能（可选），安装后需运行: playwright install chromium\n"
+                     "playwright>=1.40.0\n")
+
+        # 启动脚本 - macOS/Linux
+        start_sh = f'''#!/bin/bash
+# Amazon Scraper v2 - Worker 启动脚本
+# 服务器地址: {server_url}
+
+set -e
+cd "$(dirname "$0")"
+SERVER="{server_url}"
+
+# 检测 Python
+if command -v python3 &>/dev/null; then
+    PY=python3
+elif command -v python &>/dev/null; then
+    PY=python
+else
+    echo "错误: 未找到 Python，请先安装 Python 3.10+"
+    exit 1
+fi
+
+echo "使用 Python: $($PY --version)"
+
+# 创建虚拟环境（首次运行）
+if [ ! -d ".venv" ]; then
+    echo "创建虚拟环境..."
+    $PY -m venv .venv
+fi
+
+# 激活虚拟环境
+source .venv/bin/activate
+
+# 安装依赖（首次运行或依赖更新）
+if [ ! -f ".deps_installed" ] || [ "requirements-worker.txt" -nt ".deps_installed" ]; then
+    echo "安装依赖..."
+    pip install -q -r requirements-worker.txt
+    touch .deps_installed
+fi
+
+echo ""
+echo "========================================="
+echo "  Amazon Scraper v2 - Worker"
+echo "  服务器: $SERVER"
+echo "========================================="
+echo ""
+
+python worker.py --server "$SERVER" "$@"
+'''
+        zf.writestr("worker/start.sh", start_sh)
+
+        # 启动脚本 - Windows
+        start_bat = f'''@echo off
+chcp 65001 >nul
+title Amazon Scraper v2 - Worker
+cd /d "%~dp0"
+set SERVER={server_url}
+
+where python >nul 2>&1
+if errorlevel 1 (
+    echo 错误: 未找到 Python，请先安装 Python 3.10+
+    pause
+    exit /b 1
+)
+
+if not exist ".venv" (
+    echo 创建虚拟环境...
+    python -m venv .venv
+)
+
+call .venv\\Scripts\\activate.bat
+
+if not exist ".deps_installed" (
+    echo 安装依赖...
+    pip install -q -r requirements-worker.txt
+    echo. > .deps_installed
+)
+
+echo.
+echo =========================================
+echo   Amazon Scraper v2 - Worker
+echo   服务器: %SERVER%
+echo =========================================
+echo.
+
+python worker.py --server "%SERVER%" %*
+pause
+'''
+        zf.writestr("worker/start.bat", start_bat)
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=worker.zip"},
+    )
 
 
 # ==================== Web UI 路由 ====================
