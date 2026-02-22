@@ -102,6 +102,8 @@ class Worker:
 
         # 截图队列（非阻塞异步管道）
         self._screenshot_queue: asyncio.Queue = None
+        self._browser = None           # 持久化 Playwright 浏览器实例
+        self._playwright = None        # Playwright 上下文管理器
 
         # 设置同步
         self._settings_version = 0
@@ -797,7 +799,7 @@ class Worker:
         logger.info("📸 截图后台协程退出")
 
     async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
-        """用 Playwright 将 HTML 渲染为 PNG 截图"""
+        """用 Playwright 将 HTML 渲染为 PNG 截图（优化版：复用浏览器、裁剪到购物车区域）"""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -805,31 +807,106 @@ class Worker:
             return None
 
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page(viewport={"width": 1280, "height": 800})
+            # 懒初始化：首次调用时启动浏览器，后续复用
+            if self._browser is None:
+                self._playwright = await async_playwright().__aenter__()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=True,
+                    args=["--disable-gpu", "--disable-dev-shm-usage",
+                          "--no-sandbox", "--disable-extensions"]
+                )
+                logger.info("📸 Playwright 浏览器已启动（持久化复用）")
 
-                # 拦截主文档请求 → 注入我们保存的 HTML
-                # 外部 CSS/图片请求正常发到 Amazon CDN
-                target_url = f"https://www.amazon.com/dp/{asin}"
+            page = await self._browser.new_page(viewport={"width": 1280, "height": 900})
 
-                async def intercept(route):
-                    await route.fulfill(body=html_content, content_type="text/html")
+            # 拦截无关资源：只保留 CSS 和图片，屏蔽 JS/字体/视频/追踪
+            async def block_resources(route):
+                resource_type = route.request.resource_type
+                url = route.request.url
+                # 放行 CSS 和图片
+                if resource_type in ("stylesheet", "image"):
+                    await route.continue_()
+                # 屏蔽 JS、字体、媒体、WebSocket 等
+                elif resource_type in ("script", "font", "media", "websocket",
+                                       "manifest", "other"):
+                    await route.abort()
+                # 屏蔽追踪/广告请求
+                elif any(x in url for x in ("analytics", "tracking", "beacon",
+                                            "ads", "doubleclick", "facebook")):
+                    await route.abort()
+                else:
+                    await route.continue_()
 
-                await page.route(target_url, intercept)
+            await page.route("**/*", block_resources)
 
-                try:
-                    await page.goto(target_url, wait_until="networkidle", timeout=30000)
-                except Exception:
-                    # networkidle 超时不影响截图（部分资源可能无法加载）
-                    pass
+            # 拦截主文档请求 → 注入保存的 HTML
+            target_url = f"https://www.amazon.com/dp/{asin}"
 
-                screenshot = await page.screenshot(full_page=True, type="png")
-                await browser.close()
-                return screenshot
+            async def intercept_doc(route):
+                await route.fulfill(body=html_content, content_type="text/html")
+
+            await page.route(target_url, intercept_doc)
+
+            try:
+                # domcontentloaded 比 networkidle 快得多（不等追踪脚本）
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                # 短暂等待 CSS 渲染完成
+                await page.wait_for_timeout(800)
+            except Exception:
+                pass  # 超时不影响截图
+
+            # 计算裁剪区域：购物车按钮下方为截止线
+            clip_height = await page.evaluate("""() => {
+                // 优先查找购物车区域底部
+                const selectors = [
+                    '#buybox',           // 购买框
+                    '#rightCol',         // 右侧栏
+                    '#buyBoxAccordion',  // 折叠购买框
+                    '#add-to-cart-button',
+                    '#buy-now-button',
+                    '#submitOrderButtonId'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const rect = el.getBoundingClientRect();
+                        // 元素底部 + 一些边距
+                        return Math.ceil(rect.bottom + 50);
+                    }
+                }
+                // 兜底：只截前 1200px
+                return 1200;
+            }""")
+
+            # 限制高度在合理范围
+            clip_height = max(600, min(clip_height, 2000))
+
+            screenshot = await page.screenshot(
+                type="png",
+                clip={"x": 0, "y": 0, "width": 1280, "height": clip_height}
+            )
+            await page.close()
+            return screenshot
         except Exception as e:
             logger.error(f"📸 Playwright 渲染异常 {asin}: {e}")
+            # 浏览器可能崩溃，重置实例
+            await self._close_browser()
             return None
+
+    async def _close_browser(self):
+        """安全关闭 Playwright 浏览器"""
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                await self._playwright.__aexit__(None, None, None)
+        except Exception:
+            pass
+        self._browser = None
+        self._playwright = None
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
         """将截图 POST 到 Server"""
@@ -870,6 +947,8 @@ class Worker:
                 pass
         if self._session:
             await self._session.close()
+        # 关闭持久化浏览器
+        await self._close_browser()
 
     def _print_stats(self):
         """打印统计信息"""
