@@ -88,6 +88,7 @@
                         <th>FBA</th>
                         <th>配送</th>
                         <th>采集时间</th>
+                        <th>截图</th>
                     </tr>
                 </thead>
                 <tbody id="resultsBody">
@@ -114,10 +115,17 @@
                         </td>
                         <td>{{ r.delivery_date or 'N/A' }}</td>
                         <td><small class="text-secondary">{{ r.crawl_time or '' }}</small></td>
+                        <td>
+                            {% if r.screenshot_path %}
+                            <button class="btn btn-sm btn-outline-accent" onclick="showScreenshot('{{ r.screenshot_path }}', '{{ r.asin }}')" title="查看截图">
+                                <i class="bi bi-camera"></i>
+                            </button>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                     {% if not results %}
-                    <tr><td colspan="9" class="text-center text-secondary py-4">暂无数据</td></tr>
+                    <tr><td colspan="10" class="text-center text-secondary py-4">暂无数据</td></tr>
                     {% endif %}
                 </tbody>
             </table>
@@ -128,6 +136,27 @@
 <!-- 分页 -->
 <nav class="mt-3" id="paginationNav">
 </nav>
+
+<!-- 截图预览 Modal -->
+<div class="modal fade" id="screenshotModal" tabindex="-1">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="screenshotModalTitle">截图预览</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-center p-2">
+                <img id="screenshotImg" src="" style="max-width:100%; border:1px solid var(--border); border-radius:8px;">
+            </div>
+            <div class="modal-footer">
+                <a id="screenshotDownload" href="#" download class="btn btn-accent">
+                    <i class="bi bi-download"></i> 下载截图
+                </a>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -196,7 +225,7 @@ async function loadResults(page) {
 function renderResults(results) {
     const tbody = document.getElementById('resultsBody');
     if (!results || results.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-secondary py-4">暂无数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-secondary py-4">暂无数据</td></tr>';
         return;
     }
 
@@ -210,6 +239,10 @@ function renderResults(results) {
         const title = r.title || '';
         const titleEscaped = title.replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
+        const screenshotCell = r.screenshot_path
+            ? `<button class="btn btn-sm btn-outline-accent" onclick="showScreenshot('${r.screenshot_path}', '${r.asin}')" title="查看截图"><i class="bi bi-camera"></i></button>`
+            : '';
+
         return `<tr>
             <td><a href="https://www.amazon.com/dp/${r.asin}" target="_blank"
                    class="text-decoration-none" style="color:var(--info)">${r.asin}</a></td>
@@ -222,6 +255,7 @@ function renderResults(results) {
             <td>${fbaCell}</td>
             <td>${r.delivery_date || 'N/A'}</td>
             <td><small class="text-secondary">${r.crawl_time || ''}</small></td>
+            <td>${screenshotCell}</td>
         </tr>`;
     }).join('');
 }
@@ -300,6 +334,14 @@ function renderPagination() {
             </a>
         </li>
     </ul>`;
+}
+
+// 截图预览
+function showScreenshot(path, asin) {
+    document.getElementById('screenshotModalTitle').textContent = `截图预览 - ${asin}`;
+    document.getElementById('screenshotImg').src = path;
+    document.getElementById('screenshotDownload').href = path;
+    new bootstrap.Modal(document.getElementById('screenshotModal')).show();
 }
 </script>
 {% endblock %}
