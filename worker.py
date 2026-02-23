@@ -892,11 +892,11 @@ class Worker:
         """
         用 Playwright 渲染 Amazon 网页截图
 
-        优化点（相比旧版 goto + route 拦截）：
+        优化点：
         1. setContent() 直接注入 HTML，省去 URL 导航和主文档拦截开销
         2. 屏蔽 JS/字体/媒体/追踪，只保留 CSS 和图片保证页面外观
         3. 更可靠的裁剪逻辑：扫描多个锚点元素取最大 bottom
-        4. 浏览器持久化复用
+        4. 浏览器持久化复用，page 级错误不杀浏览器（防止级联崩溃）
         """
         try:
             from playwright.async_api import async_playwright
@@ -904,6 +904,7 @@ class Worker:
             logger.warning("📸 playwright 未安装，跳过截图渲染")
             return None
 
+        page = None
         try:
             # 懒初始化：首次调用时启动浏览器（加锁防止并发重复初始化）
             if self._browser is None:
@@ -947,6 +948,8 @@ class Worker:
 
             # 计算裁剪高度：扫描多个锚点元素，取最大 bottom 值
             clip_height = await page.evaluate("""() => {
+                // 防御 document.body 为 null（setContent 异常时可能发生）
+                if (!document.body) return 1200;
                 const anchors = [
                     '#buybox', '#rightCol', '#buyBoxAccordion',
                     '#add-to-cart-button', '#buy-now-button',
@@ -965,7 +968,7 @@ class Worker:
                 // 找到了锚点元素 → 底部加 100px 边距
                 if (maxBottom > 0) return Math.ceil(maxBottom + 100);
                 // 兜底：取页面实际高度，但不超过 3000px
-                return Math.min(document.body.scrollHeight, 3000);
+                return Math.min(document.body.scrollHeight || 1200, 3000);
             }""")
             clip_height = max(800, min(clip_height, 3000))
 
@@ -973,13 +976,23 @@ class Worker:
                 type="png",
                 clip={"x": 0, "y": 0, "width": 1280, "height": clip_height}
             )
-            await page.close()
             return screenshot
         except Exception as e:
-            logger.error(f"📸 Playwright 渲染异常 {asin}: {e}")
-            # 浏览器可能崩溃，重置实例
-            await self._close_browser()
+            err_msg = str(e)
+            # 只有浏览器进程级崩溃才重置浏览器；page 级错误不连坐
+            if "browser has been closed" in err_msg or "Target closed" in err_msg:
+                logger.error(f"📸 浏览器进程崩溃，将重新启动: {asin}")
+                await self._close_browser()
+            else:
+                logger.warning(f"📸 页面渲染失败 {asin}: {e}")
             return None
+        finally:
+            # 无论成功失败都安全关闭 page（不影响浏览器和其他 page）
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     async def _close_browser(self):
         """安全关闭 Playwright 浏览器（加锁防止并发关闭冲突）"""
