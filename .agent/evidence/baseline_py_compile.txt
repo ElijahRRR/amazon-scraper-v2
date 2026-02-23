@@ -1,2 +1,0 @@
-python3 -m py_compile session.py worker.py server.py config.py parser.py
-RESULT: PASS

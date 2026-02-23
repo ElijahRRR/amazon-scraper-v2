@@ -151,7 +151,7 @@ task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] →
 - **封锁处理**：检测到 403/503/验证码 → 自动轮换 Session（换 IP + 换 Cookie）
 - **主动轮换**：每 1000 次成功请求主动更换 Session
 - **快速模式** (`--fast`)：优先用 AOD AJAX 获取价格，失败再 fallback 到完整产品页
-- **截图存证**：需要截图的任务自动入队，Playwright 后台串行渲染，复用浏览器实例，裁剪到购物车区域
+- **截图存证**：需要截图的任务自动入队，Playwright 多协程并发渲染（默认 3，可在设置页调整 1-6），复用共享浏览器实例，裁剪到购物车区域
 - **设置热同步**：每 30 秒从 Server 拉取最新设置，无需重启即可更新并发/速率/AIMD 参数
 - **批量提交**：结果先入队列，攒满 10 条或每 2 秒批量 POST 提交
 - **优雅退出**：SIGINT/SIGTERM 信号处理，退出前刷新队列
@@ -160,11 +160,14 @@ task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] →
 
 Worker 内置 Playwright 截图引擎，对标记 `needs_screenshot` 的任务自动渲染商品页 PNG 截图并上传至 Server：
 
-- 持久化 Chromium 实例，避免每次截图冷启动（首次启动 ~2s，后续每张 ~1-2s）
-- 智能裁剪：只截取购物车按钮以上的区域（商品标题、图片、价格、卖家信息），跳过评论和推荐
-- 资源拦截：屏蔽 JS、字体、追踪脚本，只加载 CSS 和图片，大幅减少等待时间
-- 使用 `domcontentloaded` 替代 `networkidle`，不等追踪脚本加载
-- 异常自动恢复：浏览器崩溃时重置实例，不影响后续截图
+- **多协程并发**：可配置 1-6 个截图协程（默认 3），共享单个 Chromium 浏览器实例，每个协程独立 Page
+- **持久化浏览器**：Chromium 实例在 Worker 生命周期内复用，避免每次冷启动（首次 ~2s，后续每张 ~1-2s）
+- **`setContent()` 渲染**：直接将已获取的 HTML 注入 Page，无需 `page.goto()` 导航，减少 ~500ms 延迟
+- **智能裁剪**：通过 10 个锚点元素（`#buybox`、`#rightCol` 等）定位购物车区域，只截取商品关键信息
+- **资源拦截**：屏蔽 JS、字体、追踪脚本，只加载 CSS 和图片，大幅减少等待时间
+- **级联崩溃防护**：页面级错误仅关闭当前 Page，不影响共享浏览器；仅浏览器进程崩溃才触发实例重建
+- **动态扩容**：截图协程池监控线程每 3 秒检查目标并发数，支持通过设置页热调整
+- 截图保存路径：`static/screenshots/{batch_name}/{asin}.png`
 - 截图为可选功能，需安装 `requirements-screenshot.txt` 中的依赖
 
 ### `adaptive.py` — AIMD 自适应并发控制器
@@ -263,7 +266,7 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 
 通过 Web UI 的「设置」页面可实时修改以下参数，Worker 每 30 秒自动同步更新（无需重启）：
 
-- 基础：邮编、最大重试、代理地址、Session 轮换频率
+- 基础：邮编、最大重试、代理地址、Session 轮换频率、截图并发数
 - 速率与并发：全局 QPS（令牌桶速率）、初始/最小/最大并发
 - AIMD 调控：评估间隔、目标延迟、延迟上限、目标成功率、成功率下限、封锁率阈值、冷却时间
 
@@ -278,16 +281,19 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | POST | `/api/tasks/result` | Worker 提交单条结果 |
 | POST | `/api/tasks/result/batch` | Worker 批量提交结果（单次 commit，减少磁盘 IO） |
 | POST | `/api/tasks/screenshot` | Worker 上传截图（multipart/form-data） |
+| POST | `/api/tasks/release` | Worker 归还未处理任务（优先采集切换时防丢失） |
 | GET | `/api/progress` | 获取总体进度 |
 | GET | `/api/progress/{batch}` | 获取批次进度 |
 | GET | `/api/batches` | 获取批次列表 |
 | GET | `/api/results` | 分页查询结果 |
 | GET | `/api/export/{batch}` | 导出数据（Excel/CSV） |
+| GET | `/api/export/{batch}/screenshots` | 批量下载截图（ZIP 压缩包） |
 | GET | `/api/workers` | 查看在线 Worker |
 | DELETE | `/api/workers` | 清理所有离线 Worker |
 | DELETE | `/api/workers/{id}` | 移除指定 Worker |
 | GET/PUT | `/api/settings` | 读取/修改运行时设置（带版本号增量同步） |
 | POST | `/api/batches/{batch}/retry` | 重试失败任务 |
+| POST | `/api/batches/{batch}/prioritize` | 将批次设为优先采集 |
 | GET | `/api/batches/{batch}/errors` | 查看失败任务错误分类统计与详情 |
 | DELETE | `/api/batches/{batch}` | 删除批次 |
 | GET | `/api/worker/download` | 下载 Worker 安装包（ZIP，含启动脚本） |
@@ -297,9 +303,9 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | 路径 | 页面 |
 |------|------|
 | `/` | 仪表盘（总览进度、活跃 Worker） |
-| `/tasks` | 任务管理（上传 ASIN、查看批次、错误分类详情） |
+| `/tasks` | 任务管理（上传 ASIN、查看批次、错误分类详情、优先采集、截图下载） |
 | `/results` | 结果浏览（分页、搜索、导出） |
-| `/settings` | 设置（邮编、速率、并发、AIMD 参数，保存后 Worker 自动同步） |
+| `/settings` | 设置（邮编、速率、并发、截图并发、AIMD 参数，保存后 Worker 自动同步） |
 | `/workers` | Worker 监控（在线状态、统计、下载 Worker 包、清理离线） |
 
 ## 快速开始
@@ -499,7 +505,10 @@ amazon-scraper-v2/
 │   ├── results.html
 │   ├── settings.html
 │   └── workers.html
-├── static/                # 前端静态资源（CSS/JS）
+├── tests/                 # 单元测试
+│   └── test_worker_session_ready_regression.py
 ├── data/                  # 数据目录（SQLite 数据库文件）
-└── data/screenshots/      # 截图存证（按批次/ASIN 存储 PNG）
+└── static/                # 前端静态资源
+    ├── css/style.css
+    └── screenshots/       # 截图存证（按批次/ASIN 存储 PNG）
 ```

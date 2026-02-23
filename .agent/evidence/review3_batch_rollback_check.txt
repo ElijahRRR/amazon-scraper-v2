@@ -1,2 +1,0 @@
-batch endpoint error: IntegrityError
-pull after batch error: 1 B000000001
