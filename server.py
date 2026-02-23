@@ -231,7 +231,9 @@ async def submit_result(request: Request):
         await db.save_result(result_data)
         await db.mark_task_done(task_id, worker_id)
     else:
-        await db.mark_task_failed(task_id, worker_id)
+        await db.mark_task_failed(task_id, worker_id,
+                                  error_type=data.get("error_type"),
+                                  error_detail=data.get("error_detail"))
 
     return {"status": "ok"}
 
@@ -272,12 +274,15 @@ async def submit_result_batch(request: Request):
                     (worker_id, now, task_id)
                 )
             else:
-                # 标记任务失败
+                # 标记任务失败（含错误分类）
+                error_type = item.get("error_type")
+                error_detail = item.get("error_detail")
                 await db._db.execute(
                     """UPDATE tasks
-                       SET status = 'failed', worker_id = ?, retry_count = retry_count + 1, updated_at = ?
+                       SET status = 'failed', worker_id = ?, retry_count = retry_count + 1,
+                           error_type = ?, error_detail = ?, updated_at = ?
                        WHERE id = ?""",
-                    (worker_id, now, task_id)
+                    (worker_id, error_type, error_detail, now, task_id)
                 )
 
         # 整批统一 commit
@@ -531,6 +536,15 @@ async def update_settings(request: Request):
 
 
 # --- 批次操作 ---
+@app.get("/api/batches/{batch_name}/errors")
+async def batch_errors(batch_name: str):
+    """获取批次的错误分类统计和失败任务详情"""
+    db = await get_db()
+    summary = await db.get_error_summary(batch_name)
+    failed_tasks = await db.get_failed_tasks(batch_name)
+    return {"summary": summary, "tasks": failed_tasks}
+
+
 @app.post("/api/batches/{batch_name}/retry")
 async def retry_batch(batch_name: str):
     """重试批次中所有失败的任务"""

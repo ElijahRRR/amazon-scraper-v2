@@ -491,6 +491,8 @@ class Worker:
         zip_code = task.get("zip_code", self.zip_code)
         max_retries = config.MAX_RETRIES
         resp_bytes = 0
+        last_error_type = "network"
+        last_error_detail = ""
 
         attempt = 0
         while attempt < max_retries:
@@ -545,6 +547,8 @@ class Worker:
                 if self._session.is_blocked(resp):
                     attempt += 1
                     self._stats["blocked"] += 1
+                    last_error_type = "blocked"
+                    last_error_detail = f"HTTP {resp.status_code}"
                     logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
                     await self._rotate_session(reason="被封锁")
                     return (False, True, resp_bytes)  # 标记被封，让控制器知道
@@ -566,15 +570,28 @@ class Worker:
 
                 # 检查是否是拦截或空页面
                 title = result_data.get("title", "")
-                if title in ["[验证码拦截]", "[API封锁]"]:
+                if title == "[验证码拦截]":
                     attempt += 1
                     self._stats["blocked"] += 1
+                    last_error_type = "captcha"
+                    last_error_detail = "validateCaptcha / Robot Check"
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
+                    await self._rotate_session(reason="页面拦截")
+                    continue
+
+                if title == "[API封锁]":
+                    attempt += 1
+                    self._stats["blocked"] += 1
+                    last_error_type = "blocked"
+                    last_error_detail = "api-services-support@amazon.com"
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await self._rotate_session(reason="页面拦截")
                     continue
 
                 if title in ["[页面为空]", "[HTML解析失败]"]:
                     attempt += 1
+                    last_error_type = "parse_error"
+                    last_error_detail = title
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
@@ -582,6 +599,8 @@ class Worker:
                 # 标题为空视为软拦截，重试
                 if not title or title == "N/A":
                     attempt += 1
+                    last_error_type = "parse_error"
+                    last_error_detail = "标题为空"
                     logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
@@ -592,6 +611,8 @@ class Worker:
                     # 价格应包含 $ 符号；出现 CNY/¥/€/£ 说明邮编没生效
                     if any(c in price for c in ["¥", "€", "£", "CNY"]) or "$" not in price:
                         attempt += 1
+                        last_error_type = "parse_error"
+                        last_error_detail = f"非美国价格: {price}"
                         logger.warning(f"ASIN {asin} 检测到非美国价格 '{price}'，邮编可能未生效 (尝试 {attempt}/{max_retries})")
                         await self._rotate_session(reason="非美国区域数据")
                         continue
@@ -625,12 +646,21 @@ class Worker:
 
             except Exception as e:
                 attempt += 1
+                err_name = type(e).__name__
+                if "timeout" in err_name.lower() or "Timeout" in str(e):
+                    last_error_type = "timeout"
+                elif "connect" in err_name.lower() or "ConnectionError" in err_name:
+                    last_error_type = "network"
+                else:
+                    last_error_type = "network"
+                last_error_detail = f"{err_name}: {str(e)[:200]}"
                 logger.error(f"ASIN {asin} 异常 (尝试 {attempt}/{max_retries}): {e}")
                 await asyncio.sleep(2)
 
         # 所有重试用完，标记失败
-        logger.error(f"ASIN {asin} 采集失败 (已重试 {max_retries} 次)")
-        await self._submit_result(task_id, None, success=False)
+        logger.error(f"ASIN {asin} 采集失败 (已重试 {max_retries} 次) [{last_error_type}]")
+        await self._submit_result(task_id, None, success=False,
+                                  error_type=last_error_type, error_detail=last_error_detail)
         self._stats["failed"] += 1
         self._stats["total"] += 1
         return (False, False, resp_bytes)
@@ -673,7 +703,8 @@ class Worker:
     # 结果提交（保持不变）
     # ═══════════════════════════════════════════════
 
-    async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool):
+    async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool,
+                             error_type: str = None, error_detail: str = None):
         """将结果放入批量提交队列"""
         payload = {
             "task_id": task_id,
@@ -681,6 +712,9 @@ class Worker:
             "success": success,
             "result": result_data,
         }
+        if error_type:
+            payload["error_type"] = error_type
+            payload["error_detail"] = (error_detail or "")[:500]
         await self._result_queue.put(payload)
 
     async def _batch_submitter(self):

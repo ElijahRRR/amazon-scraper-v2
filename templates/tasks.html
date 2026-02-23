@@ -69,7 +69,14 @@
                     <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
                     <td><span class="badge-status badge-processing">{{ b.processing }}</span></td>
                     <td><span class="badge-status badge-done">{{ b.done }}</span></td>
-                    <td><span class="badge-status badge-failed">{{ b.failed }}</span></td>
+                    <td>
+                        <span class="badge-status badge-failed">{{ b.failed }}</span>
+                        {% if b.failed > 0 %}
+                        <button class="btn btn-sm btn-link p-0 ms-1" onclick="showErrors('{{ b.batch_name }}')" title="查看错误详情" style="color:var(--danger);">
+                            <i class="bi bi-exclamation-circle"></i>
+                        </button>
+                        {% endif %}
+                    </td>
                     <td>
                         <div class="progress" style="width:100px; height:6px;">
                             <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
@@ -102,6 +109,21 @@
                 {% endif %}
             </tbody>
         </table>
+    </div>
+</div>
+
+<!-- 错误详情弹窗 -->
+<div class="modal fade" id="errorModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content" style="background:var(--card-bg); border:1px solid var(--border);">
+            <div class="modal-header" style="border-color:var(--border);">
+                <h5 class="modal-title" id="errorModalTitle">错误详情</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="errorModalBody">
+                <div class="text-center py-3"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>
+            </div>
+        </div>
     </div>
 </div>
 {% endblock %}
@@ -174,6 +196,59 @@ async function deleteBatch(name) {
     if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
     await fetch(`/api/batches/${name}`, { method: 'DELETE' });
     location.reload();
+}
+
+const ERROR_LABELS = {
+    blocked: '被封锁', captcha: '验证码', timeout: '超时',
+    parse_error: '解析失败', network: '网络异常', unknown: '未知'
+};
+
+async function showErrors(batchName) {
+    const body = document.getElementById('errorModalBody');
+    document.getElementById('errorModalTitle').textContent = `错误详情 — ${batchName}`;
+    body.innerHTML = '<div class="text-center py-3"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>';
+    new bootstrap.Modal(document.getElementById('errorModal')).show();
+
+    try {
+        const resp = await fetch(`/api/batches/${encodeURIComponent(batchName)}/errors`);
+        const data = await resp.json();
+
+        let html = '<h6 style="color:var(--accent-light);">错误类型分布</h6>';
+        html += '<div class="row g-2 mb-3">';
+        for (const [etype, count] of Object.entries(data.summary || {})) {
+            const label = ERROR_LABELS[etype] || etype;
+            html += `<div class="col-auto"><span class="badge bg-danger bg-opacity-75 px-3 py-2">${esc(label)} <strong>${count}</strong></span></div>`;
+        }
+        html += '</div>';
+
+        if (data.tasks && data.tasks.length > 0) {
+            html += '<h6 style="color:var(--accent-light);">失败任务列表</h6>';
+            html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0"><thead><tr>';
+            html += '<th>ASIN</th><th>错误类型</th><th>详情</th><th>重试</th><th>时间</th></tr></thead><tbody>';
+            for (const t of data.tasks) {
+                const label = ERROR_LABELS[t.error_type] || t.error_type || '未知';
+                html += `<tr>
+                    <td><a href="https://www.amazon.com/dp/${encodeURIComponent(t.asin)}" target="_blank"
+                           style="color:var(--info)">${esc(t.asin)}</a></td>
+                    <td><span class="badge bg-secondary">${esc(label)}</span></td>
+                    <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                        title="${esc(t.error_detail || '')}">${esc(t.error_detail || '-')}</td>
+                    <td>${t.retry_count || 0}</td>
+                    <td><small class="text-secondary">${esc(t.updated_at || '')}</small></td>
+                </tr>`;
+            }
+            html += '</tbody></table></div>';
+        }
+
+        body.innerHTML = html;
+    } catch(e) {
+        body.innerHTML = `<div class="alert alert-danger">加载失败: ${esc(e.message)}</div>`;
+    }
+}
+
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 </script>
 {% endblock %}

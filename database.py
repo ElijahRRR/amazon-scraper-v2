@@ -52,6 +52,8 @@ class Database:
                 needs_screenshot BOOLEAN DEFAULT 0,
                 worker_id TEXT,
                 retry_count INTEGER DEFAULT 0,
+                error_type TEXT,
+                error_detail TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(batch_name, asin)
@@ -116,6 +118,8 @@ class Database:
         migrations = [
             ("tasks", "priority", "INTEGER DEFAULT 0"),
             ("tasks", "needs_screenshot", "BOOLEAN DEFAULT 0"),
+            ("tasks", "error_type", "TEXT"),
+            ("tasks", "error_detail", "TEXT"),
             ("results", "screenshot_path", "TEXT"),
         ]
         for table, column, col_type in migrations:
@@ -226,14 +230,16 @@ class Database:
         """标记任务完成"""
         await self.update_task_status(task_id, "done", worker_id)
 
-    async def mark_task_failed(self, task_id: int, worker_id: str = None):
-        """标记任务失败，增加重试次数"""
+    async def mark_task_failed(self, task_id: int, worker_id: str = None,
+                               error_type: str = None, error_detail: str = None):
+        """标记任务失败，增加重试次数，记录错误类型"""
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         await self._db.execute(
             """UPDATE tasks
-               SET status = 'failed', worker_id = ?, retry_count = retry_count + 1, updated_at = ?
+               SET status = 'failed', worker_id = ?, retry_count = retry_count + 1,
+                   error_type = ?, error_detail = ?, updated_at = ?
                WHERE id = ?""",
-            (worker_id, now, task_id)
+            (worker_id, error_type, error_detail, now, task_id)
         )
         await self._db.commit()
 
@@ -444,6 +450,38 @@ class Database:
                     "progress": round(done / total * 100, 1) if total > 0 else 0,
                 })
             return batches
+
+    async def get_error_summary(self, batch_name: str = None) -> Dict[str, int]:
+        """获取失败任务的错误类型统计"""
+        if batch_name:
+            condition = "WHERE status = 'failed' AND batch_name = ?"
+            params = (batch_name,)
+        else:
+            condition = "WHERE status = 'failed'"
+            params = ()
+
+        async with self._db.execute(
+            f"""SELECT COALESCE(error_type, 'unknown') as etype, COUNT(*) as cnt
+                FROM tasks {condition}
+                GROUP BY error_type
+                ORDER BY cnt DESC""",
+            params
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {row["etype"]: row["cnt"] for row in rows}
+
+    async def get_failed_tasks(self, batch_name: str, limit: int = 50) -> List[Dict]:
+        """获取批次中失败任务的详情（含错误类型）"""
+        async with self._db.execute(
+            """SELECT asin, error_type, error_detail, retry_count, updated_at
+               FROM tasks
+               WHERE status = 'failed' AND batch_name = ?
+               ORDER BY updated_at DESC
+               LIMIT ?""",
+            (batch_name, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
     async def delete_batch(self, batch_name: str):
         """删除整个批次（任务 + 结果）"""

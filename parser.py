@@ -56,14 +56,17 @@ class AmazonParser:
             result["title"] = "[页面为空]"
             return result
 
+        # JSON-LD 优先提取：从结构化数据获取核心字段
+        jsonld = self._extract_jsonld(html_text)
+
         if _USE_SELECTOLAX:
-            return self._parse_with_selectolax(html_text, asin, zip_code, result)
+            return self._parse_with_selectolax(html_text, asin, zip_code, result, jsonld)
         else:
-            return self._parse_with_lxml(html_text, asin, zip_code, result)
+            return self._parse_with_lxml(html_text, asin, zip_code, result, jsonld)
 
     # ==================== selectolax 解析路径 ====================
 
-    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str, result: Dict) -> Dict:
+    def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
         """使用 selectolax 解析"""
         try:
             tree = SlxParser(html_text)
@@ -81,16 +84,16 @@ class AmazonParser:
         # 全页预扫描 — 提取 Product Information 表格
         page_details = self._slx_parse_all_details(tree, html_text)
 
-        # 逐字段提取
-        result["title"] = self._slx_parse_title(tree)
+        # 逐字段提取：JSON-LD 优先，CSS 补充
+        result["title"] = jsonld.get("title") or self._slx_parse_title(tree)
         result["zip_code"] = self._slx_parse_zip_code(tree) or zip_code
 
         # 商品可售状态检测
         is_unavailable = self._slx_check_unavailable(tree)
         is_see_price_in_cart = self._slx_check_see_price_in_cart(tree)
 
-        # 品牌
-        result["brand"] = page_details.get("brand") or self._slx_parse_brand(tree)
+        # 品牌（JSON-LD > 表格 > CSS）
+        result["brand"] = jsonld.get("brand") or page_details.get("brand") or self._slx_parse_brand(tree)
 
         # 价格 & 库存 & 配送
         if is_unavailable:
@@ -117,7 +120,8 @@ class AmazonParser:
             result["delivery_date"] = d_date
             result["delivery_time"] = d_time
         else:
-            result["current_price"] = self._slx_parse_current_price(tree)
+            css_price = self._slx_parse_current_price(tree)
+            result["current_price"] = css_price if css_price != "N/A" else jsonld.get("current_price", "N/A")
             bb = self._slx_parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._slx_parse_original_price(tree)
@@ -125,7 +129,7 @@ class AmazonParser:
             result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
             avail_node = tree.css_first('div#availability span')
             stock_text = avail_node.text(strip=True) if avail_node else ""
-            result["stock_status"] = stock_text if stock_text else "In Stock"
+            result["stock_status"] = stock_text if stock_text else jsonld.get("stock_status", "In Stock")
             result["stock_count"] = str(self._slx_parse_stock_count(result["stock_status"], tree))
             d_date, d_time = self._slx_parse_delivery(tree)
             result["delivery_date"] = d_date
@@ -150,15 +154,22 @@ class AmazonParser:
         # 五点描述
         result["bullet_points"] = self._slx_parse_bullet_points(tree)
 
-        # 长描述
-        result["long_description"] = self._slx_parse_long_description(tree, html_text)
+        # 长描述（CSS 优先，JSON-LD 兜底）
+        css_desc = self._slx_parse_long_description(tree, html_text)
+        result["long_description"] = css_desc if css_desc else jsonld.get("_jsonld_description", "")
 
-        # 图片
-        result["image_urls"] = self._slx_parse_images(tree, html_text)
+        # 图片（CSS 优先，JSON-LD 兜底）
+        css_imgs = self._slx_parse_images(tree, html_text)
+        result["image_urls"] = css_imgs if css_imgs else jsonld.get("image_urls", "")
 
-        # UPC / EAN
+        # UPC / EAN（合并 JSON-LD 的 gtin13）
         result["upc_list"] = self._slx_parse_upc(tree, html_text, page_details)
-        result["ean_list"] = self._parse_ean(html_text)
+        css_ean = self._parse_ean(html_text)
+        jsonld_ean = jsonld.get("ean_list", "")
+        if css_ean and jsonld_ean and jsonld_ean not in css_ean:
+            result["ean_list"] = f"{css_ean},{jsonld_ean}"
+        else:
+            result["ean_list"] = css_ean or jsonld_ean
 
         # 父体 ASIN / 变体
         result["parent_asin"] = self._parse_parent_asin(html_text, asin)
@@ -642,7 +653,7 @@ class AmazonParser:
 
     # ==================== lxml 解析路径 (fallback) ====================
 
-    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str, result: Dict) -> Dict:
+    def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
         """使用 lxml 解析（fallback）"""
         try:
             tree = lxml_html.fromstring(html_text)
@@ -660,16 +671,16 @@ class AmazonParser:
         # 全页预扫描 — 提取 Product Information 表格
         page_details = self._parse_all_details(tree, html_text)
 
-        # 逐字段提取（每个都有 try-except 保护）
-        result["title"] = self._parse_title(tree)
+        # 逐字段提取（JSON-LD 优先，CSS/XPath 补充）
+        result["title"] = jsonld.get("title") or self._parse_title(tree)
         result["zip_code"] = self._parse_zip_code(tree) or zip_code
 
         # 商品可售状态检测
         is_unavailable = self._check_unavailable(tree)
         is_see_price_in_cart = self._check_see_price_in_cart(tree)
 
-        # 品牌
-        result["brand"] = page_details.get("brand") or self._parse_brand(tree)
+        # 品牌（JSON-LD > 表格 > XPath）
+        result["brand"] = jsonld.get("brand") or page_details.get("brand") or self._parse_brand(tree)
 
         # 价格 & 库存 & 配送
         if is_unavailable:
@@ -695,14 +706,15 @@ class AmazonParser:
             result["delivery_date"] = d_date
             result["delivery_time"] = d_time
         else:
-            result["current_price"] = self._parse_current_price(tree)
+            css_price = self._parse_current_price(tree)
+            result["current_price"] = css_price if css_price != "N/A" else jsonld.get("current_price", "N/A")
             bb = self._parse_buybox_price(tree)
             result["buybox_price"] = bb if bb else result["current_price"]
             result["original_price"] = self._parse_original_price(tree)
             result["buybox_shipping"] = self._parse_buybox_shipping(tree, result["current_price"])
             result["is_fba"] = self._parse_fulfillment(tree, html_text)
             stock_text = self._get_text(tree, ['//div[@id="availability"]/span/text()'])
-            result["stock_status"] = stock_text.strip() if stock_text else "In Stock"
+            result["stock_status"] = stock_text.strip() if stock_text else jsonld.get("stock_status", "In Stock")
             result["stock_count"] = str(self._parse_stock_count(result["stock_status"], tree))
             d_date, d_time = self._parse_delivery(tree)
             result["delivery_date"] = d_date
@@ -727,15 +739,22 @@ class AmazonParser:
         # 五点描述
         result["bullet_points"] = self._parse_bullet_points(tree)
 
-        # 长描述
-        result["long_description"] = self._parse_long_description(tree, html_text)
+        # 长描述（XPath 优先，JSON-LD 兜底）
+        css_desc = self._parse_long_description(tree, html_text)
+        result["long_description"] = css_desc if css_desc else jsonld.get("_jsonld_description", "")
 
-        # 图片
-        result["image_urls"] = self._parse_images(tree, html_text)
+        # 图片（XPath 优先，JSON-LD 兜底）
+        css_imgs = self._parse_images(tree, html_text)
+        result["image_urls"] = css_imgs if css_imgs else jsonld.get("image_urls", "")
 
-        # UPC / EAN
+        # UPC / EAN（合并 JSON-LD 的 gtin13）
         result["upc_list"] = self._parse_upc(tree, html_text, page_details)
-        result["ean_list"] = self._parse_ean(html_text)
+        css_ean = self._parse_ean(html_text)
+        jsonld_ean = jsonld.get("ean_list", "")
+        if css_ean and jsonld_ean and jsonld_ean not in css_ean:
+            result["ean_list"] = f"{css_ean},{jsonld_ean}"
+        else:
+            result["ean_list"] = css_ean or jsonld_ean
 
         # 父体 ASIN / 变体
         result["parent_asin"] = self._parse_parent_asin(html_text, asin)
@@ -800,6 +819,113 @@ class AmazonParser:
         if "api-services-support@amazon.com" in html_text and len(html_text) < 20000:
             return "[API封锁]"
         return None
+
+    def _extract_jsonld(self, html_text: str) -> Dict[str, Any]:
+        """
+        从 <script type="application/ld+json"> 中提取 Product 结构化数据。
+        Amazon 页面通常包含 Schema.org Product 对象，字段稳定性远高于 CSS class。
+        返回扁平化的字段字典，未找到则返回空字典。
+        """
+        result = {}
+        try:
+            # 提取所有 JSON-LD 块
+            blocks = re.findall(
+                r'<script\s+type="application/ld\+json"[^>]*>(.*?)</script>',
+                html_text, re.DOTALL
+            )
+            product = None
+            for block in blocks:
+                try:
+                    data = json.loads(block.strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                # 可能是单个对象或数组
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    t = item.get("@type", "")
+                    if t == "Product" or (isinstance(t, list) and "Product" in t):
+                        product = item
+                        break
+                if product:
+                    break
+
+            if not product:
+                return result
+
+            # 标题
+            name = product.get("name")
+            if name and isinstance(name, str) and len(name) > 1:
+                result["title"] = name.strip()
+
+            # 品牌
+            brand = product.get("brand")
+            if isinstance(brand, dict):
+                brand = brand.get("name", "")
+            if brand and isinstance(brand, str) and brand.strip():
+                result["brand"] = brand.strip()
+
+            # 图片
+            image = product.get("image")
+            if image:
+                if isinstance(image, str):
+                    result["image_urls"] = image
+                elif isinstance(image, list):
+                    result["image_urls"] = "\n".join(
+                        u for u in image if isinstance(u, str)
+                    )
+
+            # 价格 (offers)
+            offers = product.get("offers")
+            if isinstance(offers, dict):
+                offers_list = [offers]
+            elif isinstance(offers, list):
+                offers_list = offers
+            else:
+                offers_list = []
+
+            for offer in offers_list:
+                if not isinstance(offer, dict):
+                    continue
+                currency = offer.get("priceCurrency", "USD")
+                if currency != "USD":
+                    continue
+                price = offer.get("price") or offer.get("lowPrice")
+                if price is not None:
+                    try:
+                        price_val = float(price)
+                        result["current_price"] = f"${price_val:,.2f}"
+                    except (ValueError, TypeError):
+                        pass
+
+                # 库存状态
+                avail = offer.get("availability", "")
+                if "InStock" in avail:
+                    result["stock_status"] = "In Stock"
+                elif "OutOfStock" in avail:
+                    result["stock_status"] = "Out of Stock"
+                break  # 只取第一个 USD offer
+
+            # EAN / GTIN
+            gtin13 = product.get("gtin13")
+            if gtin13 and isinstance(gtin13, str) and gtin13.isdigit():
+                result["ean_list"] = gtin13
+
+            # 描述 (仅作兜底，CSS 提取的更完整)
+            desc = product.get("description")
+            if desc and isinstance(desc, str) and len(desc) > 10:
+                result["_jsonld_description"] = desc.strip()
+
+            # 评分信息 (当前 Result 模型不含此字段，但提取出来备用)
+            agg = product.get("aggregateRating")
+            if isinstance(agg, dict):
+                result["_rating"] = agg.get("ratingValue")
+                result["_review_count"] = agg.get("reviewCount")
+
+        except Exception as e:
+            logger.debug(f"JSON-LD 提取异常: {e}")
+
+        return result
 
     # ==================== 纯文本/正则方法（两种引擎共用）====================
 
