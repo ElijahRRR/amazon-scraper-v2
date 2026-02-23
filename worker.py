@@ -102,8 +102,10 @@ class Worker:
 
         # 截图队列（非阻塞异步管道）
         self._screenshot_queue: asyncio.Queue = None
-        self._browser = None           # 持久化 Playwright 浏览器实例
-        self._playwright = None        # Playwright 上下文管理器
+        self._screenshot_concurrency = 3   # 并发截图协程数
+        self._browser = None               # 持久化 Playwright 浏览器实例
+        self._playwright = None            # Playwright 上下文管理器
+        self._browser_lock = asyncio.Lock()  # 浏览器初始化/关闭锁
 
         # 设置同步
         self._settings_version = 0
@@ -123,7 +125,7 @@ class Worker:
         # 初始化队列
         self._task_queue = asyncio.Queue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
-        self._screenshot_queue = asyncio.Queue(maxsize=500)
+        self._screenshot_queue = asyncio.Queue()  # 无限队列，不丢任务
 
         # 初始化 session
         await self._init_session()
@@ -137,7 +139,7 @@ class Worker:
                 self._task_feeder(),         # 1. 持续从 Server 拉任务
                 self._worker_pool(),         # 2. 工人池：自适应并发
                 self._batch_submitter(),     # 3. 批量回传结果
-                self._screenshot_worker(),   # 4. 截图渲染后台协程
+                self._screenshot_workers(),   # 4. 截图渲染（多协程并发）
                 self._settings_sync(),       # 5. 定期同步服务端设置
             )
         except asyncio.CancelledError:
@@ -626,17 +628,14 @@ class Worker:
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
                 logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
 
-                # 截图存证：非阻塞放入截图队列
+                # 截图存证：放入截图队列（无限队列，不会丢失）
                 if task.get("needs_screenshot"):
-                    try:
-                        self._screenshot_queue.put_nowait({
-                            "task_id": task_id,
-                            "asin": asin,
-                            "batch_name": task.get("batch_name", ""),
-                            "html": resp.text,
-                        })
-                    except asyncio.QueueFull:
-                        logger.warning(f"📸 截图队列已满，跳过 ASIN {asin}")
+                    await self._screenshot_queue.put({
+                        "task_id": task_id,
+                        "asin": asin,
+                        "batch_name": task.get("batch_name", ""),
+                        "html": resp.text,
+                    })
 
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测
                 if self._success_since_rotate >= self._rotate_every:
@@ -805,16 +804,18 @@ class Worker:
     # 截图渲染管道
     # ═══════════════════════════════════════════════
 
-    async def _screenshot_worker(self):
-        """
-        后台截图协程：从截图队列取任务，用 Playwright 渲染 PNG，POST 给 Server。
-        串行处理（每次 1 个），避免 Chrome 占用过多内存。
-        """
-        logger.info("📸 截图后台协程启动")
+    async def _screenshot_workers(self):
+        """启动多个并发截图协程，共享同一个 Playwright 浏览器实例"""
+        n = self._screenshot_concurrency
+        logger.info(f"📸 截图协程池启动（{n} 并发）")
+        workers = [self._screenshot_loop(i) for i in range(n)]
+        await asyncio.gather(*workers)
+        logger.info("📸 截图协程池退出")
 
+    async def _screenshot_loop(self, idx: int):
+        """单个截图协程：从队列取任务，渲染并上传"""
         while self._running or not self._screenshot_queue.empty():
             try:
-                # 等待截图任务（最多等 5 秒）
                 try:
                     item = await asyncio.wait_for(
                         self._screenshot_queue.get(), timeout=5.0
@@ -827,12 +828,10 @@ class Worker:
                 html_content = item["html"]
 
                 try:
-                    # 渲染 Amazon 网页截图
                     png_bytes = await self._render_screenshot(html_content, asin)
                     if png_bytes:
-                        # POST 截图到 Server
                         await self._upload_screenshot(batch_name, asin, png_bytes)
-                        logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes)")
+                        logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes) [worker-{idx}]")
                     else:
                         logger.warning(f"📸 截图渲染失败: {asin}")
                 except Exception as e:
@@ -841,10 +840,8 @@ class Worker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"📸 截图协程异常: {e}")
+                logger.error(f"📸 截图协程 #{idx} 异常: {e}")
                 await asyncio.sleep(1)
-
-        logger.info("📸 截图后台协程退出")
 
     async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
         """
@@ -863,15 +860,17 @@ class Worker:
             return None
 
         try:
-            # 懒初始化：首次调用时启动浏览器
+            # 懒初始化：首次调用时启动浏览器（加锁防止并发重复初始化）
             if self._browser is None:
-                self._playwright = await async_playwright().__aenter__()
-                self._browser = await self._playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-gpu", "--disable-dev-shm-usage",
-                          "--no-sandbox", "--disable-extensions"]
-                )
-                logger.info("📸 Playwright 浏览器已启动（持久化复用）")
+                async with self._browser_lock:
+                    if self._browser is None:  # double-check
+                        self._playwright = await async_playwright().__aenter__()
+                        self._browser = await self._playwright.chromium.launch(
+                            headless=True,
+                            args=["--disable-gpu", "--disable-dev-shm-usage",
+                                  "--no-sandbox", "--disable-extensions"]
+                        )
+                        logger.info("📸 Playwright 浏览器已启动（持久化复用）")
 
             page = await self._browser.new_page(viewport={"width": 1280, "height": 900})
 
@@ -938,19 +937,20 @@ class Worker:
             return None
 
     async def _close_browser(self):
-        """安全关闭 Playwright 浏览器"""
-        try:
-            if self._browser:
-                await self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright:
-                await self._playwright.__aexit__(None, None, None)
-        except Exception:
-            pass
-        self._browser = None
-        self._playwright = None
+        """安全关闭 Playwright 浏览器（加锁防止并发关闭冲突）"""
+        async with self._browser_lock:
+            try:
+                if self._browser:
+                    await self._browser.close()
+            except Exception:
+                pass
+            try:
+                if self._playwright:
+                    await self._playwright.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._browser = None
+            self._playwright = None
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
         """将截图 POST 到 Server"""
