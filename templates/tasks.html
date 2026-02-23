@@ -85,13 +85,13 @@
                     </td>
                     <td>
                         <div class="btn-group btn-group-sm">
-                            <a href="/results?batch_name={{ b.batch_name }}" class="btn btn-outline-accent" title="查看结果">
+                            <a href="/results?batch_name={{ b.batch_name|urlencode }}" class="btn btn-outline-accent" title="查看结果">
                                 <i class="bi bi-eye"></i>
                             </a>
-                            <a href="/api/export/{{ b.batch_name }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
+                            <a href="/api/export/{{ b.batch_name|urlencode }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
                                 <i class="bi bi-download"></i>
                             </a>
-                            <a href="/api/export/{{ b.batch_name }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
+                            <a href="/api/export/{{ b.batch_name|urlencode }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
                                 <i class="bi bi-images"></i>
                             </a>
                             <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.batch_name }}')" title="优先采集">
@@ -180,13 +180,13 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
 
 async function retryBatch(name) {
     if (!confirm(`确定重试批次 "${name}" 中所有失败的任务？`)) return;
-    await fetch(`/api/batches/${name}/retry`, { method: 'POST' });
+    await fetch(`/api/batches/${encodeURIComponent(name)}/retry`, { method: 'POST' });
     location.reload();
 }
 
 async function prioritizeBatch(name) {
     if (!confirm(`确定将批次 "${name}" 设为优先采集？Worker 将立即切换到该批次。`)) return;
-    const resp = await fetch(`/api/batches/${name}/prioritize`, { method: 'POST' });
+    const resp = await fetch(`/api/batches/${encodeURIComponent(name)}/prioritize`, { method: 'POST' });
     const data = await resp.json();
     if (resp.ok) {
         alert(`已将 ${data.updated} 个待处理任务设为优先采集`);
@@ -197,7 +197,7 @@ async function prioritizeBatch(name) {
 
 async function deleteBatch(name) {
     if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
-    await fetch(`/api/batches/${name}`, { method: 'DELETE' });
+    await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
     location.reload();
 }
 

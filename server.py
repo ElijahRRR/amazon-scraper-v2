@@ -138,6 +138,12 @@ async def upload_asin_file(
     if not batch_name:
         batch_name = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+    # 批次名消毒：禁止路径分隔符等特殊字符
+    import re as _re
+    batch_name = _re.sub(r'[/\\<>:"|?*]', '_', batch_name).strip()
+    if not batch_name:
+        batch_name = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
     # 读取文件内容
     content = await file.read()
     filename = file.filename.lower()
@@ -377,8 +383,9 @@ async def export_data(
 
 @app.get("/api/export/{batch_name}/screenshots")
 async def export_screenshots(batch_name: str):
-    """批量下载某批次的所有截图（ZIP 打包）"""
+    """批量下载某批次的所有截图（ZIP 打包，使用临时文件避免内存峰值）"""
     import zipfile
+    import tempfile
     screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", batch_name)
     if not os.path.isdir(screenshot_dir):
         raise HTTPException(status_code=404, detail="该批次无截图")
@@ -387,16 +394,34 @@ async def export_screenshots(batch_name: str):
     if not png_files:
         raise HTTPException(status_code=404, detail="该批次无截图文件")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in sorted(png_files):
-            fpath = os.path.join(screenshot_dir, fname)
-            zf.write(fpath, fname)
-    buf.seek(0)
+    # 写入临时文件，避免大批次截图撑爆内存
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in sorted(png_files):
+                fpath = os.path.join(screenshot_dir, fname)
+                zf.write(fpath, fname)
+        tmp_path = tmp.name
+        tmp.close()
+    except Exception:
+        tmp.close()
+        os.unlink(tmp.name)
+        raise
+
+    async def _stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            os.unlink(tmp_path)
 
     safe_name = batch_name.replace("/", "_").replace("\\", "_")
     return StreamingResponse(
-        buf,
+        _stream_and_cleanup(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}_screenshots.zip"'},
     )
@@ -535,6 +560,7 @@ async def update_settings(request: Request):
 
     changed = False
     errors = []
+    old_values = {}  # 保存旧值用于交叉校验失败回滚
     for key in _runtime_settings:
         if key not in data or data[key] == _runtime_settings[key]:
             continue
@@ -564,15 +590,43 @@ async def update_settings(request: Request):
             errors.append(f"{key}: 不能大于 {hi}")
             continue
 
+        old_values[key] = _runtime_settings[key]
         _runtime_settings[key] = val
         changed = True
 
     if errors:
+        # 单字段校验失败，回滚已写入的值
+        for k, v in old_values.items():
+            _runtime_settings[k] = v
         return JSONResponse(
             status_code=422,
             content={"status": "error", "errors": errors,
                      "settings": _runtime_settings, "_version": _settings_version}
         )
+
+    # 交叉约束校验（所有单字段校验通过后）
+    cross_errors = []
+    s = _runtime_settings
+    if s["min_concurrency"] > s["max_concurrency"]:
+        cross_errors.append(f"min_concurrency({s['min_concurrency']}) 不能大于 max_concurrency({s['max_concurrency']})")
+    if s["initial_concurrency"] > s["max_concurrency"]:
+        cross_errors.append(f"initial_concurrency({s['initial_concurrency']}) 不能大于 max_concurrency({s['max_concurrency']})")
+    if s["initial_concurrency"] < s["min_concurrency"]:
+        cross_errors.append(f"initial_concurrency({s['initial_concurrency']}) 不能小于 min_concurrency({s['min_concurrency']})")
+    if s["target_latency"] >= s["max_latency"]:
+        cross_errors.append(f"target_latency({s['target_latency']}) 必须小于 max_latency({s['max_latency']})")
+    if s["min_success_rate"] > s["target_success_rate"]:
+        cross_errors.append(f"min_success_rate({s['min_success_rate']}) 不能大于 target_success_rate({s['target_success_rate']})")
+    if cross_errors:
+        # 交叉校验失败，回滚所有已写入的值
+        for k, v in old_values.items():
+            _runtime_settings[k] = v
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "errors": cross_errors,
+                     "settings": _runtime_settings, "_version": _settings_version}
+        )
+
     if changed:
         _settings_version += 1
         logger.info(f"⚙️ 设置已更新 (version={_settings_version})")

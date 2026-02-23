@@ -29,7 +29,7 @@ class WorkerSessionReadyRegressionTest(unittest.IsolatedAsyncioTestCase):
 
         submit_calls = []
 
-        async def fake_submit(task_id, data, success):
+        async def fake_submit(task_id, data, success, error_type=None, error_detail=None):
             submit_calls.append((task_id, success))
 
         async def fast_sleep(_delay):

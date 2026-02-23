@@ -497,6 +497,12 @@ class Worker:
                     self._screenshot_concurrency = new_sc
                     changes.append(f"screenshot_c={new_sc}")
 
+                # 代理 API 地址
+                new_proxy_url = s.get("proxy_api_url")
+                if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
+                    config.PROXY_API_URL_AUTH = new_proxy_url
+                    changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+
                 if changes:
                     logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
 
