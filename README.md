@@ -198,6 +198,24 @@ Worker 内置 Playwright 截图引擎，对标记 `needs_screenshot` 的任务�
 - 规格参数：包装/商品尺寸重量、上架时间
 - 内容：五点描述、长描述、图片 URL
 
+**三层数据提取策略（稳定性优先）：**
+
+```
+JSON-LD（结构化数据）→ CSS/XPath（页面元素）→ 正则/JSON 文本
+```
+
+1. **JSON-LD 优先提取**：从 `<script type="application/ld+json">` 中提取 Schema.org Product 对象。这是 Google SEO 标准，Amazon 不会轻易改变结构，字段稳定性远高于 CSS class。
+2. **CSS/XPath 补充**：对于 JSON-LD 缺失或不够精确的字段（如 BuyBox 价格、FBA 状态、配送日期），使用 CSS 选择器 / XPath 从页面 DOM 提取。
+3. **正则兜底**：UPC/EAN、父体 ASIN、变体列表等通过正则从页面 JS 变量中提取。
+
+| 字段 | 优先数据源 | 说明 |
+|------|-----------|------|
+| title, brand | JSON-LD | 最稳定，Amazon 改版不影响 |
+| current_price | CSS → JSON-LD | CSS 能区分 BuyBox/原价，JSON-LD 做兜底 |
+| stock_status | CSS → JSON-LD | CSS 有更细粒度文本，JSON-LD 只有 InStock/OutOfStock |
+| image_urls | CSS → JSON-LD | CSS 从 JS 变量提取 hiRes 大图，JSON-LD 兜底 |
+| ean_list | 合并 | CSS 正则 + JSON-LD gtin13 合并去重 |
+
 解析引擎优先使用 selectolax（基于 Lexbor C 引擎），比 lxml 快 2-5 倍。
 
 ### `proxy.py` — 代理管理
@@ -213,8 +231,22 @@ Worker 内置 Playwright 截图引擎，对标记 `needs_screenshot` 的任务�
 
 SQLite WAL 模式，两张核心表：
 
-- `tasks`：采集任务队列（pending → processing → done/failed）
+- `tasks`：采集任务队列（pending → processing → done/failed），含 `error_type` / `error_detail` 错误分类
 - `results`：采集结果存储（37 个商品字段，`batch_name + asin` 唯一索引自动去重）
+
+**错误分类（error_type）：**
+
+失败任务自动按错误类型分类，便于快速定位问题根因：
+
+| error_type | 触发条件 | 处理建议 |
+|------------|----------|----------|
+| `blocked` | HTTP 403/503、API 封锁页面 | 降低并发 / 检查代理质量 |
+| `captcha` | 验证码拦截（Robot Check） | 降低 QPS / 更换代理通道 |
+| `timeout` | 请求超时 | 检查网络 / 增大超时时间 |
+| `parse_error` | 页面为空、解析失败、标题为空、非美国价格 | 检查邮编设置 / 页面结构变化 |
+| `network` | 连接异常、DNS 解析失败等 | 检查代理连通性 |
+
+在任务管理页面，失败数字旁点击图标可查看错误类型分布和逐条详情。
 
 关键机制：
 - 任务拉取为原子操作（`BEGIN IMMEDIATE` 写锁 + SELECT + UPDATE 同一事务，防并发重复分发）
@@ -256,6 +288,7 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | DELETE | `/api/workers/{id}` | 移除指定 Worker |
 | GET/PUT | `/api/settings` | 读取/修改运行时设置（带版本号增量同步） |
 | POST | `/api/batches/{batch}/retry` | 重试失败任务 |
+| GET | `/api/batches/{batch}/errors` | 查看失败任务错误分类统计与详情 |
 | DELETE | `/api/batches/{batch}` | 删除批次 |
 | GET | `/api/worker/download` | 下载 Worker 安装包（ZIP，含启动脚本） |
 
@@ -264,7 +297,7 @@ FastAPI 应用（`lifespan` 上下文管理生命周期），提供 REST API 和
 | 路径 | 页面 |
 |------|------|
 | `/` | 仪表盘（总览进度、活跃 Worker） |
-| `/tasks` | 任务管理（上传 ASIN、查看批次） |
+| `/tasks` | 任务管理（上传 ASIN、查看批次、错误分类详情） |
 | `/results` | 结果浏览（分页、搜索、导出） |
 | `/settings` | 设置（邮编、速率、并发、AIMD 参数，保存后 Worker 自动同步） |
 | `/workers` | Worker 监控（在线状态、统计、下载 Worker 包、清理离线） |
