@@ -89,6 +89,8 @@ _runtime_settings = {
     "max_concurrency": config.MAX_CONCURRENCY,
     # Session
     "session_rotate_every": config.SESSION_ROTATE_EVERY,
+    # 截图
+    "screenshot_concurrency": 3,
     # AIMD 调控
     "adjust_interval": config.ADJUST_INTERVAL_S,
     "target_latency": config.TARGET_LATENCY_S,
@@ -208,6 +210,20 @@ async def pull_tasks(
         _worker_registry[worker_id]["tasks_pulled"] += len(tasks)
 
     return {"tasks": tasks}
+
+
+# --- Worker 释放任务（优先采集队列切换时归还旧任务）---
+@app.post("/api/tasks/release")
+async def release_tasks(request: Request):
+    """Worker 归还未处理的任务，立即重置为 pending（避免等 5 分钟超时）"""
+    db = await get_db()
+    data = await request.json()
+    task_ids = data.get("task_ids", [])
+    if not task_ids:
+        return {"status": "ok", "released": 0}
+    count = await db.release_tasks(task_ids)
+    logger.info(f"🔄 Worker 归还了 {count} 个任务")
+    return {"status": "ok", "released": count}
 
 
 # --- Worker 提交结果 ---
@@ -480,6 +496,7 @@ async def update_settings(request: Request):
         "min_concurrency":      (int,   1,    20),
         "max_concurrency":      (int,   2,    100),
         "session_rotate_every": (int,   50,   10000),
+        "screenshot_concurrency": (int, 1,    6),
         "adjust_interval":      (int,   3,    60),
         "target_latency":       (float, 1,    30),
         "max_latency":          (float, 2,    60),

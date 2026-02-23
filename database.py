@@ -298,6 +298,23 @@ class Database:
         await self._db.commit()
         return result.rowcount
 
+    async def release_tasks(self, task_ids: List[int]):
+        """
+        将指定任务从 processing 释放回 pending
+        用于优先采集时清空队列后立即归还旧任务，避免等 5 分钟超时
+        """
+        if not task_ids:
+            return 0
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        placeholders = ",".join(["?"] * len(task_ids))
+        result = await self._db.execute(
+            f"""UPDATE tasks SET status = 'pending', worker_id = NULL, updated_at = ?
+               WHERE id IN ({placeholders}) AND status = 'processing'""",
+            [now] + list(task_ids)
+        )
+        await self._db.commit()
+        return result.rowcount
+
     async def update_screenshot_path(self, batch_name: str, asin: str, path: str):
         """更新结果记录的截图路径"""
         await self._db.execute(

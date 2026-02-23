@@ -195,15 +195,19 @@ class Worker:
                         # 检测是否有高优先级任务（优先采集）
                         has_priority = any(t.get("priority", 0) > 0 for t in tasks)
                         if has_priority and not self._task_queue.empty():
-                            # 清空当前队列中的旧任务（靠 5 分钟超时机制自动回收为 pending）
-                            dropped = 0
+                            # 收集被清空的旧任务 ID，通知 Server 立即归还
+                            dropped_ids = []
                             while not self._task_queue.empty():
                                 try:
-                                    self._task_queue.get_nowait()
-                                    dropped += 1
+                                    old_task = self._task_queue.get_nowait()
+                                    if old_task and isinstance(old_task, dict):
+                                        dropped_ids.append(old_task["id"])
                                 except asyncio.QueueEmpty:
                                     break
-                            logger.info(f"🚀 检测到优先采集任务，已清空队列中 {dropped} 个旧任务")
+                            logger.info(f"🚀 检测到优先采集任务，已清空队列中 {len(dropped_ids)} 个旧任务")
+                            # 异步通知 Server 归还旧任务（不阻塞补给流程）
+                            if dropped_ids:
+                                asyncio.create_task(self._release_tasks(dropped_ids))
 
                         for task in tasks:
                             await self._task_queue.put(task)
@@ -407,6 +411,19 @@ class Worker:
             logger.error(f"拉取任务异常: {e}")
             return []
 
+    async def _release_tasks(self, task_ids: List[int]):
+        """通知 Server 归还未处理的任务（优先采集切换时调用）"""
+        try:
+            url = f"{self.server_url}/api/tasks/release"
+            resp = curl_requests.post(url, json={"task_ids": task_ids}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"🔄 已归还 {data.get('released', 0)} 个旧任务到 pending")
+            else:
+                logger.warning(f"归还任务失败: HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"归还任务异常: {e}")
+
     async def _settings_sync(self):
         """定期从服务端同步设置，热更新运行参数"""
         logger.info("⚙️ 设置同步协程启动（每 30 秒检查一次）")
@@ -473,6 +490,12 @@ class Worker:
                 if new_retries and new_retries != config.MAX_RETRIES:
                     config.MAX_RETRIES = new_retries
                     changes.append(f"retries={new_retries}")
+
+                # 截图并发数
+                new_sc = s.get("screenshot_concurrency")
+                if new_sc and new_sc != self._screenshot_concurrency:
+                    self._screenshot_concurrency = new_sc
+                    changes.append(f"screenshot_c={new_sc}")
 
                 if changes:
                     logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
@@ -805,11 +828,33 @@ class Worker:
     # ═══════════════════════════════════════════════
 
     async def _screenshot_workers(self):
-        """启动多个并发截图协程，共享同一个 Playwright 浏览器实例"""
+        """
+        截图协程池：动态管理多个并发截图协程，共享同一个 Playwright 浏览器实例。
+        Playwright 原生支持多 page 并发（每个 page 独立渲染管线），无线程安全问题。
+        """
         n = self._screenshot_concurrency
         logger.info(f"📸 截图协程池启动（{n} 并发）")
-        workers = [self._screenshot_loop(i) for i in range(n)]
-        await asyncio.gather(*workers)
+        tasks: List[asyncio.Task] = []
+        for i in range(n):
+            tasks.append(asyncio.create_task(self._screenshot_loop(i)))
+
+        # 监控循环：动态增减截图协程
+        while self._running or not self._screenshot_queue.empty():
+            await asyncio.sleep(3)
+            target = self._screenshot_concurrency
+            active = [t for t in tasks if not t.done()]
+            current = len(active)
+            if target > current:
+                for i in range(target - current):
+                    idx = len(tasks)
+                    tasks.append(asyncio.create_task(self._screenshot_loop(idx)))
+                logger.info(f"📸 截图协程扩容: {current} → {target}")
+            tasks = [t for t in tasks if not t.done()]
+
+        # 等待所有截图协程完成
+        remaining = [t for t in tasks if not t.done()]
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
         logger.info("📸 截图协程池退出")
 
     async def _screenshot_loop(self, idx: int):

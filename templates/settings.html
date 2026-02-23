@@ -31,6 +31,12 @@
                                    value="{{ settings.session_rotate_every }}" min="50" max="10000">
                             <small class="text-secondary">每 N 次成功请求后轮换 Session</small>
                         </div>
+                        <div class="col-md-4">
+                            <label class="form-label">截图并发数</label>
+                            <input type="number" class="form-control" name="screenshot_concurrency"
+                                   value="{{ settings.screenshot_concurrency }}" min="1" max="6">
+                            <small class="text-secondary">同时渲染的截图数量（共享浏览器）</small>
+                        </div>
                         <div class="col-12">
                             <label class="form-label">代理 API 地址</label>
                             <input type="text" class="form-control" name="proxy_api_url"
@@ -186,7 +192,8 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     const data = Object.fromEntries(formData);
     // 数值类型转换
     const intFields = ['max_retries', 'session_rotate_every', 'initial_concurrency',
-                       'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block'];
+                       'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
+                       'screenshot_concurrency'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold'];
     intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
