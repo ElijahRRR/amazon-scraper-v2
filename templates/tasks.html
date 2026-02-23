@@ -91,6 +91,9 @@
                             <a href="/api/export/{{ b.batch_name }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
                                 <i class="bi bi-download"></i>
                             </a>
+                            <a href="/api/export/{{ b.batch_name }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
+                                <i class="bi bi-images"></i>
+                            </a>
                             <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.batch_name }}')" title="优先采集">
                                 <i class="bi bi-lightning-charge"></i>
                             </button>

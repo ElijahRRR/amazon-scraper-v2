@@ -375,6 +375,33 @@ async def export_data(
         return _export_excel(results, batch_name)
 
 
+@app.get("/api/export/{batch_name}/screenshots")
+async def export_screenshots(batch_name: str):
+    """批量下载某批次的所有截图（ZIP 打包）"""
+    import zipfile
+    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", batch_name)
+    if not os.path.isdir(screenshot_dir):
+        raise HTTPException(status_code=404, detail="该批次无截图")
+
+    png_files = [f for f in os.listdir(screenshot_dir) if f.endswith(".png")]
+    if not png_files:
+        raise HTTPException(status_code=404, detail="该批次无截图文件")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in sorted(png_files):
+            fpath = os.path.join(screenshot_dir, fname)
+            zf.write(fpath, fname)
+    buf.seek(0)
+
+    safe_name = batch_name.replace("/", "_").replace("\\", "_")
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_screenshots.zip"'},
+    )
+
+
 def _export_excel(results: List[Dict], batch_name: str):
     """导出 Excel 文件"""
     wb = openpyxl.Workbook()
