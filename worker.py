@@ -11,7 +11,6 @@ Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发
 """
 import asyncio
 import argparse
-import html as html_module
 import logging
 import random
 import time
@@ -627,14 +626,14 @@ class Worker:
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
                 logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
 
-                # 截图存证：非阻塞放入截图队列（传递解析后的结构化数据，而非原始 HTML）
+                # 截图存证：非阻塞放入截图队列
                 if task.get("needs_screenshot"):
                     try:
                         self._screenshot_queue.put_nowait({
                             "task_id": task_id,
                             "asin": asin,
                             "batch_name": task.get("batch_name", ""),
-                            "result_data": result_data,
+                            "html": resp.text,
                         })
                     except asyncio.QueueFull:
                         logger.warning(f"📸 截图队列已满，跳过 ASIN {asin}")
@@ -825,11 +824,11 @@ class Worker:
 
                 asin = item["asin"]
                 batch_name = item["batch_name"]
-                result_data = item["result_data"]
+                html_content = item["html"]
 
                 try:
-                    # 渲染取证卡片
-                    png_bytes = await self._render_screenshot(result_data, asin)
+                    # 渲染 Amazon 网页截图
+                    png_bytes = await self._render_screenshot(html_content, asin)
                     if png_bytes:
                         # POST 截图到 Server
                         await self._upload_screenshot(batch_name, asin, png_bytes)
@@ -847,12 +846,15 @@ class Worker:
 
         logger.info("📸 截图后台协程退出")
 
-    async def _render_screenshot(self, result_data: Dict, asin: str) -> Optional[bytes]:
+    async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
         """
-        用 Playwright 渲染产品取证卡片为 PNG
+        用 Playwright 渲染 Amazon 网页截图
 
-        Satori 思路：不渲染原始 Amazon HTML，而是从解析好的结构化数据生成轻量卡片。
-        使用 page.setContent() 代替 page.goto() + route 拦截，快 10 倍以上。
+        优化点（相比旧版 goto + route 拦截）：
+        1. setContent() 直接注入 HTML，省去 URL 导航和主文档拦截开销
+        2. 屏蔽 JS/字体/媒体/追踪，只保留 CSS 和图片保证页面外观
+        3. 更可靠的裁剪逻辑：扫描多个锚点元素取最大 bottom
+        4. 浏览器持久化复用
         """
         try:
             from playwright.async_api import async_playwright
@@ -871,19 +873,57 @@ class Worker:
                 )
                 logger.info("📸 Playwright 浏览器已启动（持久化复用）")
 
-            # 构建取证卡片 HTML（纯内联 CSS，无外部资源）
-            card_html = self._build_evidence_card(result_data, asin)
-
-            # 新建页面 + setContent（比 goto + route 拦截快 10 倍）
             page = await self._browser.new_page(viewport={"width": 1280, "height": 900})
-            await page.set_content(card_html, wait_until="domcontentloaded")
 
-            # 极短等待确保 CSS 布局完成
-            await page.wait_for_timeout(50)
+            # 屏蔽无关资源：只保留 CSS 和图片，保证页面外观
+            async def block_resources(route):
+                rt = route.request.resource_type
+                url = route.request.url
+                if rt in ("stylesheet", "image"):
+                    await route.continue_()
+                elif rt in ("script", "font", "media", "websocket",
+                            "manifest", "other"):
+                    await route.abort()
+                elif any(x in url for x in ("analytics", "tracking", "beacon",
+                                            "ads", "doubleclick", "facebook")):
+                    await route.abort()
+                else:
+                    await route.continue_()
 
-            # 获取内容实际高度并截图
-            body_height = await page.evaluate("() => document.body.scrollHeight")
-            clip_height = min(body_height + 20, 2400)
+            await page.route("**/*", block_resources)
+
+            # setContent 直接注入 HTML（比 goto + route 拦截快 ~500ms）
+            try:
+                await page.set_content(html_content, wait_until="domcontentloaded", timeout=10000)
+            except Exception:
+                pass  # 超时不影响截图
+
+            # 等待 CSS 和关键图片加载
+            await page.wait_for_timeout(1000)
+
+            # 计算裁剪高度：扫描多个锚点元素，取最大 bottom 值
+            clip_height = await page.evaluate("""() => {
+                const anchors = [
+                    '#buybox', '#rightCol', '#buyBoxAccordion',
+                    '#add-to-cart-button', '#buy-now-button',
+                    '#submitOrderButtonId', '#averageCustomerReviews',
+                    '#productOverview_feature_div', '#centerCol',
+                    '#apex_desktop_newAccordionRow'
+                ];
+                let maxBottom = 0;
+                for (const sel of anchors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.bottom > maxBottom) maxBottom = rect.bottom;
+                    }
+                }
+                // 找到了锚点元素 → 底部加 100px 边距
+                if (maxBottom > 0) return Math.ceil(maxBottom + 100);
+                // 兜底：取页面实际高度，但不超过 3000px
+                return Math.min(document.body.scrollHeight, 3000);
+            }""")
+            clip_height = max(800, min(clip_height, 3000))
 
             screenshot = await page.screenshot(
                 type="png",
@@ -896,125 +936,6 @@ class Worker:
             # 浏览器可能崩溃，重置实例
             await self._close_browser()
             return None
-
-    def _build_evidence_card(self, result_data: Dict, asin: str) -> str:
-        """
-        构建产品数据取证卡片 HTML
-
-        纯内联样式，无外部资源依赖，Playwright 渲染仅需 ~100ms。
-        包含完整的价格、库存、品牌、分类等关键取证数据。
-        """
-        esc = html_module.escape
-
-        def v(key, default="N/A"):
-            val = result_data.get(key, "") or default
-            return esc(str(val))
-
-        # 处理 bullet points：按换行分割为列表
-        bullets_raw = result_data.get("bullet_points", "") or ""
-        if bullets_raw:
-            bullet_items = [esc(b.strip()) for b in bullets_raw.split("\n") if b.strip()]
-            bullets_html = "".join(f"<li>{b}</li>" for b in bullet_items[:8])
-            bullets_html = f"<ul style='margin:0;padding-left:18px;'>{bullets_html}</ul>"
-        else:
-            bullets_html = "<span style='color:#999;'>无</span>"
-
-        # 主图（尝试加载第一张，加载失败自动隐藏）
-        image_urls = result_data.get("image_urls", "") or ""
-        first_img = ""
-        if image_urls:
-            # 支持逗号或竖线分隔
-            for sep in (",", "|"):
-                if sep in image_urls:
-                    first_img = image_urls.split(sep)[0].strip()
-                    break
-            if not first_img:
-                first_img = image_urls.strip()
-
-        image_html = ""
-        if first_img and first_img.startswith("http"):
-            image_html = (
-                f'<div style="text-align:center;margin:8px 0;">'
-                f'<img src="{esc(first_img)}" '
-                f'style="max-height:180px;max-width:280px;border:1px solid #ddd;border-radius:4px;" '
-                f'onerror="this.style.display=\'none\'">'
-                f'</div>'
-            )
-
-        return f'''<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,'Segoe UI',Arial,sans-serif;background:#fff;padding:24px;width:1280px;color:#333}}
-.hdr{{display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid #ff9900;padding-bottom:12px;margin-bottom:14px}}
-.hdr-l h1{{font-size:18px;color:#232f3e}}.hdr-l .meta{{font-size:12px;color:#666;margin-top:4px}}
-.badge{{background:#ff9900;color:#fff;padding:3px 12px;border-radius:3px;font-size:12px;font-weight:700}}
-.ttl{{font-size:14px;color:#0066c0;line-height:1.4;margin-bottom:12px;padding:8px 12px;background:#f7f8fa;border-left:4px solid #0066c0;border-radius:2px}}
-.g{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
-.s{{border:1px solid #e0e0e0;border-radius:6px;padding:12px}}
-.s h3{{font-size:13px;color:#ff9900;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #f0f0f0}}
-.r{{display:flex;margin-bottom:3px;font-size:12px;line-height:1.6}}
-.l{{color:#666;min-width:90px;flex-shrink:0}}.v{{color:#333;font-weight:500;word-break:break-all}}
-.pb{{font-size:22px;color:#B12704;font-weight:700}}
-.ft{{border-top:2px solid #e0e0e0;margin-top:12px;padding-top:8px;font-size:11px;color:#999;display:flex;justify-content:space-between}}
-</style></head><body>
-
-<div class="hdr">
-<div class="hdr-l">
-<h1>Amazon Product Evidence</h1>
-<div class="meta">ASIN: <strong>{esc(asin)}</strong> &nbsp;|&nbsp; 采集时间: {v("crawl_time")} &nbsp;|&nbsp; 邮编: {v("zip_code")}</div>
-</div>
-<div class="badge">数据取证</div>
-</div>
-
-<div class="ttl">{v("title")}</div>
-{image_html}
-
-<div class="g">
-<div class="s">
-<h3>价格信息</h3>
-<div class="r"><span class="l">原价:</span><span class="v">{v("original_price")}</span></div>
-<div class="r"><span class="l">当前价格:</span><span class="v pb">{v("current_price")}</span></div>
-<div class="r"><span class="l">BuyBox 价格:</span><span class="v">{v("buybox_price")}</span></div>
-<div class="r"><span class="l">运费:</span><span class="v">{v("buybox_shipping")}</span></div>
-<div class="r"><span class="l">FBA 发货:</span><span class="v">{v("is_fba")}</span></div>
-</div>
-<div class="s">
-<h3>库存与配送</h3>
-<div class="r"><span class="l">库存数量:</span><span class="v">{v("stock_count")}</span></div>
-<div class="r"><span class="l">库存状态:</span><span class="v">{v("stock_status")}</span></div>
-<div class="r"><span class="l">配送日期:</span><span class="v">{v("delivery_date")}</span></div>
-<div class="r"><span class="l">配送时效:</span><span class="v">{v("delivery_time")}</span></div>
-</div>
-<div class="s">
-<h3>商品信息</h3>
-<div class="r"><span class="l">品牌:</span><span class="v">{v("brand")}</span></div>
-<div class="r"><span class="l">制造商:</span><span class="v">{v("manufacturer")}</span></div>
-<div class="r"><span class="l">型号:</span><span class="v">{v("model_number")}</span></div>
-<div class="r"><span class="l">部件编号:</span><span class="v">{v("part_number")}</span></div>
-<div class="r"><span class="l">原产国:</span><span class="v">{v("country_of_origin")}</span></div>
-<div class="r"><span class="l">畅销排名:</span><span class="v">{v("best_sellers_rank")}</span></div>
-<div class="r"><span class="l">上架时间:</span><span class="v">{v("first_available_date")}</span></div>
-</div>
-<div class="s">
-<h3>分类与编码</h3>
-<div class="r"><span class="l">类目路径:</span><span class="v">{v("category_tree")}</span></div>
-<div class="r"><span class="l">父体 ASIN:</span><span class="v">{v("parent_asin")}</span></div>
-<div class="r"><span class="l">UPC:</span><span class="v">{v("upc_list")}</span></div>
-<div class="r"><span class="l">EAN:</span><span class="v">{v("ean_list")}</span></div>
-</div>
-</div>
-
-<div class="s">
-<h3>商品要点</h3>
-<div style="font-size:12px;line-height:1.5;">{bullets_html}</div>
-</div>
-
-<div class="ft">
-<span>来源: https://www.amazon.com/dp/{esc(asin)}</span>
-<span>站点: {v("site")} &nbsp;|&nbsp; 批次: {v("batch_name")}</span>
-</div>
-
-</body></html>'''
 
     async def _close_browser(self):
         """安全关闭 Playwright 浏览器"""
