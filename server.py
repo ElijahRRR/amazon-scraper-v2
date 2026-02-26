@@ -585,7 +585,7 @@ async def export_screenshots(batch_name: str):
     return StreamingResponse(
         _stream_and_cleanup(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{re.sub(r"[^a-zA-Z0-9_\\-]", "_", batch_name)}_screenshots.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_screenshots.zip"'},
     )
 
 
