@@ -1062,47 +1062,55 @@ python worker.py --server "$SERVER" "$@"
 '''
         zf.writestr("worker/start.sh", start_sh)
 
-        # 启动脚本 - Windows
-        start_bat = f'''@echo off
-chcp 65001 >nul
-title Amazon Scraper v2 - Worker
-cd /d "%~dp0"
-set SERVER={server_url}
-
-where python >nul 2>&1
-if errorlevel 1 (
-    echo 错误: 未找到 Python，请先安装 Python 3.10+
-    pause
-    exit /b 1
-)
-
-if not exist ".venv" (
-    echo 创建虚拟环境...
-    python -m venv .venv
-)
-
-call .venv\\Scripts\\activate.bat
-
-if not exist ".deps_installed" (
-    echo 安装核心依赖...
-    pip install -q -r requirements-worker.txt
-    echo 安装截图组件 (playwright^)...
-    pip install -q -r requirements-screenshot.txt
-    playwright install chromium
-    echo. > .deps_installed
-)
-
-echo.
-echo =========================================
-echo   Amazon Scraper v2 - Worker
-echo   服务器: %SERVER%
-echo =========================================
-echo.
-
-python worker.py --server "%SERVER%" %*
-pause
-'''
-        zf.writestr("worker/start.bat", start_bat)
+        # 启动脚本 - Windows（CRLF 行尾 + 纯 ASCII，兼容所有 Windows 区域设置）
+        start_bat_lines = [
+            '@echo off',
+            'chcp 65001 >nul 2>&1',
+            'title Amazon Scraper v2 - Worker',
+            'cd /d "%~dp0"',
+            f'set SERVER={server_url}',
+            '',
+            'REM Check Python installation',
+            'python --version >nul 2>&1',
+            'if errorlevel 1 (',
+            '    echo [ERROR] Python not found. Please install Python 3.10+ first.',
+            '    echo Download: https://www.python.org/downloads/',
+            '    echo Make sure to check "Add Python to PATH" during installation.',
+            '    pause',
+            '    exit /b 1',
+            ')',
+            '',
+            'echo Python found: ',
+            'python --version',
+            '',
+            'if not exist ".venv" (',
+            '    echo Creating virtual environment...',
+            '    python -m venv .venv',
+            ')',
+            '',
+            'call .venv\\Scripts\\activate.bat',
+            '',
+            'if not exist ".deps_installed" (',
+            '    echo Installing dependencies...',
+            '    pip install -q -r requirements-worker.txt',
+            '    echo Installing screenshot component (playwright)...',
+            '    pip install -q -r requirements-screenshot.txt',
+            '    playwright install chromium',
+            '    echo. > .deps_installed',
+            ')',
+            '',
+            'echo.',
+            'echo =========================================',
+            'echo   Amazon Scraper v2 - Worker',
+            'echo   Server: %SERVER%',
+            'echo =========================================',
+            'echo.',
+            '',
+            'python worker.py --server "%SERVER%" %*',
+            'pause',
+        ]
+        start_bat = '\r\n'.join(start_bat_lines) + '\r\n'
+        zf.writestr("worker/start.bat", start_bat.encode('ascii'))
 
     buf.seek(0)
     return StreamingResponse(

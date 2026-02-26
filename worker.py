@@ -1154,9 +1154,9 @@ class Worker:
             except Exception:
                 pass  # 超时不影响截图
 
-            # 等待网络空闲（CSS/图片加载完毕），比固定 1s 更可靠
+            # 等待网络空闲（CSS/图片加载完毕），超时 2s 兼顾速度与质量
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
+                await page.wait_for_load_state("networkidle", timeout=2000)
             except Exception:
                 pass  # 超时仍继续截图，大部分资源应已加载
 
