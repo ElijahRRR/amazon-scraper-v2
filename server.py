@@ -6,6 +6,7 @@ Amazon 产品采集系统 v2 - 中央服务器（FastAPI）
 import os
 import io
 import csv
+import random
 import zipfile
 import re
 import asyncio
@@ -99,22 +100,176 @@ _runtime_settings = {
     "min_success_rate": config.MIN_SUCCESS_RATE,
     "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
     "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
+    # 全局并发协调
+    "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
+    "global_max_qps": config.GLOBAL_MAX_QPS,
 }
 # 设置版本号：每次修改 +1，Worker 比对版本号决定是否需要重载
 _settings_version = 0
 
+# ==================== 全局并发协调器 ====================
+_global_coordinator = {
+    "worker_metrics": {},       # {worker_id: {snapshot 字段 + reported_at}}
+    "worker_quotas": {},        # {worker_id: {concurrency, qps, assigned_at}}
+    "global_block_until": 0.0,  # monotonic 时间戳；> now 表示全局冷却中
+    "block_count": 0,           # 累计全局封锁次数
+    "recovery_epoch": 0,        # 每次全局封锁 +1，Worker 用于去重
+    "recovery_jitter": {},      # {worker_id: float 0.0~1.0} 恢复抖动系数
+}
+
+
+def _allocate_quotas():
+    """按健康度加权分配全局并发/QPS 预算给活跃 Worker"""
+    now = time.time()
+    active = {wid: info for wid, info in _worker_registry.items()
+              if now - info["last_seen"] < 60}
+    n = len(active)
+    if n == 0:
+        _global_coordinator["worker_quotas"] = {}
+        return
+
+    g = _global_coordinator
+    total_conc = _runtime_settings["global_max_concurrency"]
+    total_qps = _runtime_settings["global_max_qps"]
+
+    # 全局冷却期内预算减半
+    now_mono = time.monotonic()
+    in_cooldown = now_mono < g["global_block_until"]
+    if in_cooldown:
+        total_conc = max(n * _runtime_settings["min_concurrency"], total_conc // 2)
+        total_qps = max(n * 0.5, total_qps / 2)
+
+    # 计算每个 Worker 的健康分（0.1 ~ 1.0）
+    scores = {}
+    for wid in active:
+        metrics = g["worker_metrics"].get(wid, {})
+        if not metrics or now - metrics.get("reported_at", 0) > 90:
+            scores[wid] = 0.5  # 无数据或过期 → 默认分
+        else:
+            sr = metrics.get("success_rate", 0.95)
+            br = metrics.get("block_rate", 0.0)
+            # 封锁率惩罚权重 ×5：block_rate=10% → 分数减半
+            score = sr * max(0.0, 1.0 - br * 5)
+            scores[wid] = max(0.1, min(1.0, score))
+
+    total_score = sum(scores.values())
+
+    # 第一轮：按权重计算原始配额（不设下限，纯比例分配）
+    raw_conc = {}
+    raw_qps = {}
+    for wid in active:
+        weight = scores[wid] / total_score
+        raw_conc[wid] = total_conc * weight
+        raw_qps[wid] = total_qps * weight
+
+        # 冷却期叠加抖动系数
+        if in_cooldown:
+            jitter = g["recovery_jitter"].get(wid, 0.5)
+            raw_conc[wid] *= (0.5 + 0.5 * jitter)
+            raw_qps[wid] *= (0.5 + 0.5 * jitter)
+
+    # 第二轮：取整 + 下限保护，然后裁剪总量不超预算
+    min_c = _runtime_settings["min_concurrency"]
+    # 当 min_c × n > budget 时，预算优先：降低有效下限
+    effective_min_c = min(min_c, max(1, int(total_conc / n)))
+    int_conc = {wid: max(effective_min_c, int(v)) for wid, v in raw_conc.items()}
+
+    # 如果总和超预算，按比例缩减（保留有效下限）
+    sum_conc = sum(int_conc.values())
+    if sum_conc > total_conc:
+        excess = sum_conc - total_conc
+        reducible = {wid: v - effective_min_c for wid, v in int_conc.items() if v > effective_min_c}
+        total_reducible = sum(reducible.values())
+        if total_reducible > 0:
+            for wid in reducible:
+                cut = int(excess * reducible[wid] / total_reducible)
+                int_conc[wid] = max(effective_min_c, int_conc[wid] - cut)
+        # 最终兜底：逐个削减直到不超预算
+        while sum(int_conc.values()) > total_conc:
+            for wid in sorted(int_conc, key=lambda w: int_conc[w], reverse=True):
+                if int_conc[wid] > effective_min_c and sum(int_conc.values()) > total_conc:
+                    int_conc[wid] -= 1
+
+    sum_qps = sum(raw_qps.values())
+    if sum_qps > total_qps and sum_qps > 0:
+        scale = total_qps / sum_qps
+        raw_qps = {wid: v * scale for wid, v in raw_qps.items()}
+
+    new_quotas = {}
+    for wid in active:
+        new_quotas[wid] = {
+            "concurrency": int_conc[wid],
+            "qps": round(max(0.1, raw_qps[wid]), 2),
+            "assigned_at": now,
+        }
+
+    g["worker_quotas"] = new_quotas
+
+
+def _handle_worker_metrics(worker_id: str, metrics: dict):
+    """处理 Worker 上报的 metrics，必要时触发全局封锁"""
+    g = _global_coordinator
+    now_mono = time.monotonic()
+
+    # 存储 metrics
+    g["worker_metrics"][worker_id] = {
+        **metrics,
+        "reported_at": time.time(),
+    }
+
+    # 检查是否触发全局封锁
+    block_rate = metrics.get("block_rate", 0.0)
+    threshold = _runtime_settings.get("block_rate_threshold", 0.05)
+
+    if block_rate > threshold and now_mono >= g["global_block_until"]:
+        cooldown = _runtime_settings.get("cooldown_after_block", 30)
+        g["global_block_until"] = now_mono + cooldown
+        g["block_triggered_by"] = worker_id
+        g["block_count"] += 1
+        g["recovery_epoch"] += 1
+
+        # 为每个活跃 Worker 分配不同的恢复抖动系数
+        for wid in _worker_registry:
+            g["recovery_jitter"][wid] = random.random()
+
+        logger.warning(
+            f"⚠️ 全局封锁触发 by {worker_id} "
+            f"(block_rate={block_rate:.1%}), "
+            f"冷却 {cooldown}s, epoch={g['recovery_epoch']}"
+        )
+
+        # 立即重新分配配额（减半生效）
+        _allocate_quotas()
+
 
 async def _timeout_task_loop():
-    """定期回退超时 processing 任务"""
+    """定期回退超时 processing 任务，并清理长期离线 Worker"""
     while True:
         try:
             db = await get_db()
             count = await db.reset_timeout_tasks()
             if count > 0:
-                logger.info(f"🔄 回退了 {count} 个超时任务")
+                logger.info(f"回退了 {count} 个超时任务")
         except Exception as e:
             logger.error(f"超时任务回退异常: {e}")
-        await asyncio.sleep(60)  # 每分钟检查一次
+
+        # 清理超过 10 分钟无心跳的 Worker（防止注册表无限增长）
+        now = time.time()
+        stale = [wid for wid, info in _worker_registry.items()
+                 if now - info["last_seen"] > 600]
+        for wid in stale:
+            del _worker_registry[wid]
+            # 同步清理协调器中的过期数据
+            _global_coordinator["worker_metrics"].pop(wid, None)
+            _global_coordinator["worker_quotas"].pop(wid, None)
+            _global_coordinator["recovery_jitter"].pop(wid, None)
+        if stale:
+            logger.info(f"清理了 {len(stale)} 个长期离线 Worker")
+
+        # 兜底配额重算（确保 Worker 离线后配额被回收）
+        _allocate_quotas()
+
+        await asyncio.sleep(60)
 
 
 # ==================== API 端点 ====================
@@ -138,15 +293,19 @@ async def upload_asin_file(
     if not batch_name:
         batch_name = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # 批次名消毒：禁止路径分隔符等特殊字符
-    import re as _re
-    batch_name = _re.sub(r'[/\\<>:"|?*]', '_', batch_name).strip()
+    # 批次名白名单净化：只允许字母、数字、下划线、连字符
+    batch_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name).strip('_')
     if not batch_name:
         batch_name = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # 读取文件内容
     content = await file.read()
-    filename = file.filename.lower()
+    filename = (file.filename or "").lower()
+
+    # 文件类型白名单
+    allowed_extensions = ('.xlsx', '.xls', '.csv', '.txt')
+    if not any(filename.endswith(ext) for ext in allowed_extensions):
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型，仅允许: {', '.join(allowed_extensions)}")
 
     asins = []
     try:
@@ -210,7 +369,7 @@ async def pull_tasks(
     db = await get_db()
     _register_worker(worker_id)
     
-    tasks = await db.pull_tasks(worker_id, min(count, 50))
+    tasks = await db.pull_tasks(worker_id, max(1, min(count, 50)))
     
     if worker_id in _worker_registry:
         _worker_registry[worker_id]["tasks_pulled"] += len(tasks)
@@ -384,9 +543,13 @@ async def export_data(
 @app.get("/api/export/{batch_name}/screenshots")
 async def export_screenshots(batch_name: str):
     """批量下载某批次的所有截图（ZIP 打包，使用临时文件避免内存峰值）"""
-    import zipfile
     import tempfile
-    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", batch_name)
+    # 防路径穿越：只允许安全字符
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+    screenshot_dir = os.path.realpath(os.path.join(config.STATIC_DIR, "screenshots", safe_name))
+    screenshots_root = os.path.realpath(os.path.join(config.STATIC_DIR, "screenshots"))
+    if not screenshot_dir.startswith(screenshots_root + os.sep):
+        raise HTTPException(status_code=400, detail="非法批次名")
     if not os.path.isdir(screenshot_dir):
         raise HTTPException(status_code=404, detail="该批次无截图")
 
@@ -419,11 +582,10 @@ async def export_screenshots(batch_name: str):
         finally:
             os.unlink(tmp_path)
 
-    safe_name = batch_name.replace("/", "_").replace("\\", "_")
     return StreamingResponse(
         _stream_and_cleanup(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}_screenshots.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{re.sub(r"[^a-zA-Z0-9_\\-]", "_", batch_name)}_screenshots.zip"'},
     )
 
 
@@ -495,6 +657,8 @@ async def get_workers():
         is_online = elapsed < 60
         # 在线：now - first_seen；离线：last_seen - first_seen（冻结时长）
         uptime = (now if is_online else info["last_seen"]) - info["first_seen"]
+        quota = _global_coordinator["worker_quotas"].get(wid, {})
+        metrics = _global_coordinator["worker_metrics"].get(wid, {})
         workers.append({
             "worker_id": wid,
             "status": "online" if is_online else "offline",
@@ -502,6 +666,12 @@ async def get_workers():
             "tasks_pulled": info["tasks_pulled"],
             "results_submitted": info["results_submitted"],
             "uptime": int(uptime),
+            "quota_concurrency": quota.get("concurrency"),
+            "quota_qps": quota.get("qps"),
+            "success_rate": metrics.get("success_rate"),
+            "block_rate": metrics.get("block_rate"),
+            "latency_p50": metrics.get("latency_p50"),
+            "inflight": metrics.get("inflight"),
         })
     return {"workers": workers}
 
@@ -523,6 +693,93 @@ async def remove_offline_workers():
     for wid in offline:
         del _worker_registry[wid]
     return {"status": "ok", "removed": len(offline)}
+
+
+# --- 全局并发协调 ---
+@app.post("/api/worker/sync")
+async def worker_sync(request: Request):
+    """
+    Worker 综合同步端点（每 30s 调用一次）
+    功能：心跳 + 上报 metrics + 拉取 settings + 接收配额
+    """
+    data = await request.json()
+    worker_id = data.get("worker_id")
+    if not worker_id:
+        raise HTTPException(400, "worker_id required")
+
+    metrics = data.get("metrics")
+
+    _register_worker(worker_id)
+
+    # 处理 metrics（可能触发全局封锁）
+    if metrics:
+        _handle_worker_metrics(worker_id, metrics)
+
+    # 确保配额是最新的
+    _allocate_quotas()
+
+    # 构建响应
+    g = _global_coordinator
+    quota = g["worker_quotas"].get(worker_id, {})
+    now_mono = time.monotonic()
+    in_cooldown = now_mono < g["global_block_until"]
+
+    return {
+        **_runtime_settings,
+        "_version": _settings_version,
+        "_quota": {
+            "concurrency": quota.get("concurrency", _runtime_settings["max_concurrency"]),
+            "qps": quota.get("qps", _runtime_settings["token_bucket_rate"]),
+        },
+        "_global_block": {
+            "active": in_cooldown,
+            "remaining_s": max(0, int(g["global_block_until"] - now_mono)) if in_cooldown else 0,
+            "triggered_by": g.get("block_triggered_by") if in_cooldown else None,
+            "epoch": g["recovery_epoch"],
+        },
+        "_recovery_jitter": g["recovery_jitter"].get(worker_id, 0.5),
+    }
+
+
+@app.get("/api/coordinator")
+async def get_coordinator_state():
+    """全局并发协调状态（可观测性端点）"""
+    g = _global_coordinator
+    now_mono = time.monotonic()
+    in_cooldown = now_mono < g["global_block_until"]
+
+    per_worker = {}
+    for wid in g["worker_quotas"]:
+        quota = g["worker_quotas"].get(wid, {})
+        metrics = g["worker_metrics"].get(wid, {})
+        per_worker[wid] = {
+            "quota_concurrency": quota.get("concurrency"),
+            "quota_qps": quota.get("qps"),
+            "success_rate": metrics.get("success_rate"),
+            "block_rate": metrics.get("block_rate"),
+            "latency_p50": metrics.get("latency_p50"),
+            "inflight": metrics.get("inflight"),
+            "current_concurrency": metrics.get("current_concurrency"),
+        }
+
+    return {
+        "global_max_concurrency": _runtime_settings["global_max_concurrency"],
+        "global_max_qps": _runtime_settings["global_max_qps"],
+        "allocated_concurrency": sum(
+            q.get("concurrency", 0) for q in g["worker_quotas"].values()
+        ),
+        "allocated_qps": round(sum(
+            q.get("qps", 0) for q in g["worker_quotas"].values()
+        ), 2),
+        "active_workers": len(g["worker_quotas"]),
+        "global_block": {
+            "active": in_cooldown,
+            "remaining_s": max(0, int(g["global_block_until"] - now_mono)) if in_cooldown else 0,
+            "block_count": g["block_count"],
+            "recovery_epoch": g["recovery_epoch"],
+        },
+        "per_worker": per_worker,
+    }
 
 
 # --- 设置管理 ---
@@ -556,6 +813,8 @@ async def update_settings(request: Request):
         "min_success_rate":     (float, 0.3,  1),
         "block_rate_threshold": (float, 0.01, 0.5),
         "cooldown_after_block": (int,   5,    120),
+        "global_max_concurrency": (int,  2,    500),
+        "global_max_qps":         (float, 0.5, 100),
     }
 
     changed = False
@@ -668,6 +927,14 @@ async def delete_batch(batch_name: str):
     return {"status": "ok"}
 
 
+@app.delete("/api/database")
+async def clear_database():
+    """清空数据库中所有数据（tasks + results）"""
+    db = await get_db()
+    counts = await db.clear_all()
+    return {"status": "ok", **counts}
+
+
 # --- 截图上传 ---
 @app.post("/api/tasks/screenshot")
 async def upload_screenshot(
@@ -678,19 +945,19 @@ async def upload_screenshot(
     """Worker 上传截图文件，保存到 static/screenshots/ 并更新 results 表"""
     db = await get_db()
 
-    # 确保目录存在
-    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", batch_name)
+    # 净化路径，防路径穿越
+    safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+    safe_asin = re.sub(r'[^A-Z0-9]', '', asin.upper())
+    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", safe_batch)
     os.makedirs(screenshot_dir, exist_ok=True)
 
-    # 保存文件
-    filename = f"{asin}.png"
+    filename = f"{safe_asin}.png"
     filepath = os.path.join(screenshot_dir, filename)
     content = await file.read()
     with open(filepath, "wb") as f:
         f.write(content)
 
-    # 更新数据库（存相对路径，前端通过 /static/ 访问）
-    rel_path = f"/static/screenshots/{batch_name}/{filename}"
+    rel_path = f"/static/screenshots/{safe_batch}/{filename}"
     await db.update_screenshot_path(batch_name, asin, rel_path)
 
     logger.info(f"📸 截图已保存: {batch_name}/{asin} ({len(content)} bytes)")

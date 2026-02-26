@@ -10,8 +10,12 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 
+import logging
+
 import config
 from models import Task, Result, RESULT_FIELDS
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -125,8 +129,10 @@ class Database:
         for table, column, col_type in migrations:
             try:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-            except Exception:
-                pass  # 列已存在，忽略
+            except Exception as e:
+                # 列已存在时 SQLite 会报 "duplicate column name"，属正常情况
+                if "duplicate column name" not in str(e).lower():
+                    logger.warning(f"Migration 异常 ({table}.{column}): {e}")
 
         await self._db.commit()
 
@@ -506,18 +512,40 @@ class Database:
         await self._db.execute("DELETE FROM results WHERE batch_name = ?", (batch_name,))
         await self._db.commit()
 
+    async def clear_all(self) -> Dict[str, int]:
+        """清空所有数据（tasks + results 表）"""
+        async with self._db.execute("SELECT COUNT(*) as cnt FROM tasks") as cursor:
+            tasks_count = (await cursor.fetchone())["cnt"]
+        async with self._db.execute("SELECT COUNT(*) as cnt FROM results") as cursor:
+            results_count = (await cursor.fetchone())["cnt"]
+        await self._db.execute("DELETE FROM tasks")
+        await self._db.execute("DELETE FROM results")
+        await self._db.commit()
+        return {"tasks_deleted": tasks_count, "results_deleted": results_count}
+
 
 # ==================== 便捷函数 ====================
 
 _db_instance: Optional[Database] = None
+_db_init_lock: Optional[asyncio.Lock] = None
+
+
+def _get_init_lock() -> asyncio.Lock:
+    """延迟创建 Lock（必须在 event loop 存在后调用）"""
+    global _db_init_lock
+    if _db_init_lock is None:
+        _db_init_lock = asyncio.Lock()
+    return _db_init_lock
 
 
 async def get_db() -> Database:
-    """获取全局数据库实例（单例）"""
+    """获取全局数据库实例（异步安全单例）"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
-        await _db_instance.connect()
+        async with _get_init_lock():
+            if _db_instance is None:
+                _db_instance = Database()
+                await _db_instance.connect()
     return _db_instance
 
 

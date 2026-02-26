@@ -63,6 +63,9 @@
                 <a id="exportCsvBtn" href="#" class="btn btn-outline-accent" style="display:none;">
                     <i class="bi bi-filetype-csv"></i> CSV
                 </a>
+                <button class="btn btn-outline-danger" onclick="clearDatabase()">
+                    <i class="bi bi-trash3"></i> 清空数据库
+                </button>
             </div>
         </div>
     </div>
@@ -340,6 +343,20 @@ function renderPagination() {
             </a>
         </li>
     </ul>`;
+}
+
+// 清空数据库
+async function clearDatabase() {
+    if (!confirm('确定要清空数据库中的所有任务和采集结果吗？此操作不可撤销！')) return;
+    if (!confirm('再次确认：所有数据将被永久删除，是否继续？')) return;
+    try {
+        const resp = await fetch('/api/database', { method: 'DELETE' });
+        const data = await resp.json();
+        alert(`已清空：${data.tasks_deleted} 条任务，${data.results_deleted} 条结果`);
+        location.reload();
+    } catch(e) {
+        alert('清空失败: ' + e.message);
+    }
 }
 
 // 截图预览
