@@ -6,6 +6,7 @@ Amazon 产品采集系统 v2 - 中央服务器（FastAPI）
 import os
 import io
 import csv
+import json
 import random
 import zipfile
 import re
@@ -77,33 +78,59 @@ def _register_worker(worker_id: str):
 
 
 # ==================== 运行时设置（可通过 API 修改，Worker 定期同步）====================
-_runtime_settings = {
-    # 基础
-    "zip_code": config.DEFAULT_ZIP_CODE,
-    "max_retries": config.MAX_RETRIES,
-    "proxy_api_url": config.PROXY_API_URL_AUTH,
-    # 限速
-    "token_bucket_rate": config.TOKEN_BUCKET_RATE,
-    # 并发控制
-    "initial_concurrency": config.INITIAL_CONCURRENCY,
-    "min_concurrency": config.MIN_CONCURRENCY,
-    "max_concurrency": config.MAX_CONCURRENCY,
-    # Session
-    "session_rotate_every": config.SESSION_ROTATE_EVERY,
-    # 截图
-    "screenshot_concurrency": 3,
-    # AIMD 调控
-    "adjust_interval": config.ADJUST_INTERVAL_S,
-    "target_latency": config.TARGET_LATENCY_S,
-    "max_latency": config.MAX_LATENCY_S,
-    "target_success_rate": config.TARGET_SUCCESS_RATE,
-    "min_success_rate": config.MIN_SUCCESS_RATE,
-    "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
-    "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
-    # 全局并发协调
-    "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
-    "global_max_qps": config.GLOBAL_MAX_QPS,
-}
+
+def _default_settings() -> dict:
+    """从 config.py 生成默认设置（用于初始化和恢复默认）"""
+    return {
+        "zip_code": config.DEFAULT_ZIP_CODE,
+        "max_retries": config.MAX_RETRIES,
+        "proxy_api_url": config.PROXY_API_URL_AUTH,
+        "token_bucket_rate": config.TOKEN_BUCKET_RATE,
+        "initial_concurrency": config.INITIAL_CONCURRENCY,
+        "min_concurrency": config.MIN_CONCURRENCY,
+        "max_concurrency": config.MAX_CONCURRENCY,
+        "session_rotate_every": config.SESSION_ROTATE_EVERY,
+        "screenshot_concurrency": 3,
+        "adjust_interval": config.ADJUST_INTERVAL_S,
+        "target_latency": config.TARGET_LATENCY_S,
+        "max_latency": config.MAX_LATENCY_S,
+        "target_success_rate": config.TARGET_SUCCESS_RATE,
+        "min_success_rate": config.MIN_SUCCESS_RATE,
+        "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
+        "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
+        "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
+        "global_max_qps": config.GLOBAL_MAX_QPS,
+    }
+
+_SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
+
+def _save_settings():
+    """将当前设置持久化到 JSON 文件"""
+    try:
+        with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_runtime_settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"⚠️ 设置保存失败: {e}")
+
+def _load_settings() -> dict:
+    """启动时加载持久化设置，不存在则返回默认值"""
+    defaults = _default_settings()
+    if not os.path.exists(_SETTINGS_FILE):
+        return defaults
+    try:
+        with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        # 用保存的值覆盖默认值（兼容新增字段）
+        for k in defaults:
+            if k in saved:
+                defaults[k] = saved[k]
+        logger.info(f"⚙️ 已从 {_SETTINGS_FILE} 加载持久化设置")
+        return defaults
+    except Exception as e:
+        logger.warning(f"⚠️ 加载持久化设置失败: {e}，使用默认值")
+        return defaults
+
+_runtime_settings = _load_settings()
 # 设置版本号：每次修改 +1，Worker 比对版本号决定是否需要重载
 _settings_version = 0
 
@@ -888,7 +915,20 @@ async def update_settings(request: Request):
 
     if changed:
         _settings_version += 1
-        logger.info(f"⚙️ 设置已更新 (version={_settings_version})")
+        _save_settings()
+        logger.info(f"⚙️ 设置已更新并持久化 (version={_settings_version})")
+    return {"status": "ok", "settings": _runtime_settings, "_version": _settings_version}
+
+
+@app.post("/api/settings/reset")
+async def reset_settings():
+    """恢复所有设置为默认值"""
+    global _settings_version
+    _runtime_settings.clear()
+    _runtime_settings.update(_default_settings())
+    _settings_version += 1
+    _save_settings()
+    logger.info(f"⚙️ 设置已恢复默认并持久化 (version={_settings_version})")
     return {"status": "ok", "settings": _runtime_settings, "_version": _settings_version}
 
 

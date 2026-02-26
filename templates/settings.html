@@ -140,9 +140,12 @@
                         </div>
                     </div>
 
-                    <div class="mt-4">
+                    <div class="mt-4 d-flex gap-2">
                         <button type="submit" class="btn btn-accent">
                             <i class="bi bi-check-lg"></i> 保存设置
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" onclick="resetDefaults()">
+                            <i class="bi bi-arrow-counterclockwise"></i> 恢复默认
                         </button>
                     </div>
                 </form>
@@ -233,5 +236,25 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     }
     setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
 });
+
+async function resetDefaults() {
+    if (!confirm('确定要恢复所有设置为默认值吗？')) return;
+    const resultDiv = document.getElementById('saveResult');
+    try {
+        const resp = await fetch('/api/settings/reset', { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-success">已恢复默认设置，页面即将刷新...</div>';
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-danger">恢复失败</div>';
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = `<div class="alert alert-danger">网络错误: ${err.message}</div>`;
+    }
+}
 </script>
 {% endblock %}
