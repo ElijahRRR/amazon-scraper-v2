@@ -283,6 +283,73 @@ body {
     color: var(--danger);
 }
 
+/* Worker 监控看板 */
+.worker-card {
+    border-radius: 12px;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.worker-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+
+.worker-card-offline {
+    background: var(--bg-primary) !important;
+    opacity: 0.75;
+}
+
+.worker-card .card-header {
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.worker-metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 16px;
+}
+
+.wm-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(0,0,0,0.04);
+}
+
+.wm-item:nth-last-child(-n+2) {
+    border-bottom: none;
+}
+
+.wm-label {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+}
+
+.wm-value {
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.text-metric-good { color: var(--success) !important; }
+.text-metric-warn { color: var(--warning) !important; }
+.text-metric-bad  { color: var(--danger) !important; }
+
+.worker-footer {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.worker-footer i {
+    margin-right: 3px;
+}
+
 /* 响应式 */
 @media (max-width: 768px) {
     .sidebar {
