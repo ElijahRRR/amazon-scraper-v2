@@ -18,7 +18,9 @@
                 </div>
                 <div class="col-md-4">
                     <label class="form-label">配送邮编</label>
-                    <input type="text" class="form-control" name="zip_code" value="10001" placeholder="10001">
+                    <input type="text" class="form-control" name="zip_code"
+                           value="{{ default_zip_code }}" placeholder="10001">
+                    <small class="text-secondary">可在系统设置中修改默认值</small>
                 </div>
                 <div class="col-md-4">
                     <label class="form-label">ASIN 文件</label>

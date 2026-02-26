@@ -8,3 +8,8 @@ data/
 worker*.log
 .agent/
 static/screenshots/
+.env
+tmp/
+.pytest_cache/
+.vscode/
+.claude/

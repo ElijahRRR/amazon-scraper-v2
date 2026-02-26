@@ -668,8 +668,8 @@ async def get_workers():
             "uptime": int(uptime),
             "quota_concurrency": quota.get("concurrency"),
             "quota_qps": quota.get("qps"),
-            "success_rate": metrics.get("success_rate"),
-            "block_rate": metrics.get("block_rate"),
+            "success_rate": round(metrics["success_rate"] * 100, 2) if "success_rate" in metrics else None,
+            "block_rate": round(metrics["block_rate"] * 100, 2) if "block_rate" in metrics else None,
             "latency_p50": metrics.get("latency_p50"),
             "inflight": metrics.get("inflight"),
         })
@@ -755,8 +755,8 @@ async def get_coordinator_state():
         per_worker[wid] = {
             "quota_concurrency": quota.get("concurrency"),
             "quota_qps": quota.get("qps"),
-            "success_rate": metrics.get("success_rate"),
-            "block_rate": metrics.get("block_rate"),
+            "success_rate": round(metrics["success_rate"] * 100, 2) if "success_rate" in metrics else None,
+            "block_rate": round(metrics["block_rate"] * 100, 2) if "block_rate" in metrics else None,
             "latency_p50": metrics.get("latency_p50"),
             "inflight": metrics.get("inflight"),
             "current_concurrency": metrics.get("current_concurrency"),
@@ -921,17 +921,35 @@ async def prioritize_batch(batch_name: str):
 
 @app.delete("/api/batches/{batch_name}")
 async def delete_batch(batch_name: str):
-    """删除批次"""
+    """删除批次（含数据库记录 + 截图文件）"""
     db = await get_db()
     await db.delete_batch(batch_name)
+
+    # 清理该批次的截图目录
+    safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+    screenshot_dir = os.path.join(config.STATIC_DIR, "screenshots", safe_batch)
+    if os.path.isdir(screenshot_dir):
+        import shutil
+        shutil.rmtree(screenshot_dir, ignore_errors=True)
+        logger.info(f"🗑️ 已清理截图目录: {safe_batch}")
+
     return {"status": "ok"}
 
 
 @app.delete("/api/database")
 async def clear_database():
-    """清空数据库中所有数据（tasks + results）"""
+    """清空数据库中所有数据（tasks + results + 截图文件）"""
     db = await get_db()
     counts = await db.clear_all()
+
+    # 清理整个截图目录
+    screenshots_root = os.path.join(config.STATIC_DIR, "screenshots")
+    if os.path.isdir(screenshots_root):
+        import shutil
+        shutil.rmtree(screenshots_root, ignore_errors=True)
+        os.makedirs(screenshots_root, exist_ok=True)  # 重建空目录
+        logger.info("🗑️ 已清理所有截图文件")
+
     return {"status": "ok", **counts}
 
 
@@ -1124,6 +1142,7 @@ async def tasks_page(request: Request):
     return templates.TemplateResponse("tasks.html", {
         "request": request,
         "batches": batches,
+        "default_zip_code": _runtime_settings["zip_code"],
     })
 
 

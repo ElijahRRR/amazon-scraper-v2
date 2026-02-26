@@ -18,7 +18,7 @@
                             <label class="form-label">配送邮编</label>
                             <input type="text" class="form-control" name="zip_code"
                                    value="{{ settings.zip_code }}" placeholder="10001">
-                            <small class="text-secondary">新建任务使用的默认邮编</small>
+                            <small class="text-secondary">任务上传页的默认邮编（上传时可逐批覆盖）</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">最大重试次数</label>
@@ -51,10 +51,22 @@
                     <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-speedometer2"></i> 速率与并发</h6>
                     <div class="row g-3">
                         <div class="col-md-3">
-                            <label class="form-label">全局 QPS</label>
+                            <label class="form-label">全局总并发上限</label>
+                            <input type="number" class="form-control" name="global_max_concurrency"
+                                   value="{{ settings.global_max_concurrency }}" min="2" max="500">
+                            <small class="text-secondary">所有 Worker 总并发预算</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">全局总 QPS 上限</label>
+                            <input type="number" class="form-control" name="global_max_qps"
+                                   value="{{ settings.global_max_qps }}" step="0.5" min="0.5" max="100">
+                            <small class="text-secondary">所有 Worker 总 QPS 预算</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">单 Worker QPS</label>
                             <input type="number" class="form-control" name="token_bucket_rate"
                                    value="{{ settings.token_bucket_rate }}" step="0.5" min="0.5" max="50">
-                            <small class="text-secondary">令牌桶速率（每秒请求数）</small>
+                            <small class="text-secondary">令牌桶速率（无协调时生效）</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">初始并发</label>
@@ -72,7 +84,7 @@
                             <label class="form-label">最大并发</label>
                             <input type="number" class="form-control" name="max_concurrency"
                                    value="{{ settings.max_concurrency }}" min="2" max="100">
-                            <small class="text-secondary">AIMD 上限</small>
+                            <small class="text-secondary">单 Worker AIMD 上限</small>
                         </div>
                     </div>
 
@@ -193,9 +205,10 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     // 数值类型转换
     const intFields = ['max_retries', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
-                       'screenshot_concurrency'];
+                       'screenshot_concurrency', 'global_max_concurrency'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
-                         'target_success_rate', 'min_success_rate', 'block_rate_threshold'];
+                         'target_success_rate', 'min_success_rate', 'block_rate_threshold',
+                         'global_max_qps'];
     intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
     floatFields.forEach(f => { if (data[f] !== undefined) data[f] = parseFloat(data[f]); });
 

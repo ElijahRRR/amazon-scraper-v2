@@ -6,17 +6,20 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# 系统依赖（curl_cffi 需要）
+# 系统依赖（curl_cffi 需要 gcc + openssl）
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc && \
+    apt-get install -y --no-install-recommends gcc build-essential libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Python 依赖（精简，不含 fastapi/uvicorn/aiosqlite 等）
+# 先复制依赖文件，利用 Docker layer 缓存
 COPY requirements-worker.txt .
 RUN pip install --no-cache-dir -r requirements-worker.txt
 
 # 只复制 Worker 需要的文件
 COPY config.py models.py proxy.py session.py parser.py worker.py metrics.py adaptive.py ./
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
 
 ENTRYPOINT ["python", "worker.py"]
 CMD ["--server", "http://host.docker.internal:8899"]

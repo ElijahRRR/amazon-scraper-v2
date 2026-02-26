@@ -1,6 +1,7 @@
 # ============================================================
 # Amazon Scraper v2 - Docker Compose
 # 一键启动 Server + Worker
+# 凭证通过环境变量注入：KDL_SECRET_ID / KDL_SIGNATURE
 # ============================================================
 
 services:
@@ -11,8 +12,26 @@ services:
     ports:
       - "8899:8899"
     volumes:
-      - ./data:/app/data    # 数据库和导出文件持久化
+      - ./data:/app/data
+    environment:
+      - KDL_SECRET_ID=${KDL_SECRET_ID}
+      - KDL_SIGNATURE=${KDL_SIGNATURE}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8899/api/progress')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   worker:
     build:
@@ -20,6 +39,19 @@ services:
       dockerfile: Dockerfile.worker
     command: ["--server", "http://server:8899"]
     depends_on:
-      - server
+      server:
+        condition: service_healthy
+    environment:
+      - KDL_SECRET_ID=${KDL_SECRET_ID}
+      - KDL_SIGNATURE=${KDL_SIGNATURE}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     # 需要更多 Worker 时：docker compose up --scale worker=3

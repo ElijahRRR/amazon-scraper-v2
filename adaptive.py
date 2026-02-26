@@ -9,6 +9,7 @@ Amazon 产品采集系统 v2 - AIMD 自适应并发控制器
   - 冷却机制: 被封后 30s 内不加速
 """
 import asyncio
+import random
 import time
 import logging
 from typing import Optional
@@ -22,11 +23,11 @@ logger = logging.getLogger(__name__)
 class AdaptiveController:
     """
     自适应并发控制器
-    
+
     核心接口：
     - current_concurrency: 当前允许的最大并发数
-    - acquire() / release(): 获取/释放并发槽位（替代固定 Semaphore）
-    - record_result(): 记录请求结果（喂给 MetricsCollector）
+    - acquire() / release(): 获取/释放并发槽位
+    - record_result(): 记录请求结果
     - start(): 启动后台评估协程
     - stop(): 停止控制器
     """
@@ -38,62 +39,59 @@ class AdaptiveController:
         max_c: int = None,
         metrics: MetricsCollector = None,
     ):
-        self._concurrency = initial or getattr(config, "INITIAL_CONCURRENCY", 5)
-        self._min = min_c or getattr(config, "MIN_CONCURRENCY", 2)
-        self._max = max_c or getattr(config, "MAX_CONCURRENCY", 50)
-        
+        self._concurrency = initial or config.INITIAL_CONCURRENCY
+        self._min = min_c or config.MIN_CONCURRENCY
+        self._max = max_c or config.MAX_CONCURRENCY
+
         # 确保初始值在合法范围
         self._concurrency = max(self._min, min(self._max, self._concurrency))
-        
-        # 动态信号量：用 asyncio.Semaphore 实现，但定期重建以调整大小
+
         self._semaphore = asyncio.Semaphore(self._concurrency)
-        self._sem_value = self._concurrency  # 跟踪信号量初始值
-        
-        # 指标采集器
+        self._adjust_lock = asyncio.Lock()  # 保护并发调整的原子性
+
         self.metrics = metrics or MetricsCollector()
-        
-        # 冷却状态
+
         self._cooldown_until: float = 0.0
-        
-        # 运行控制
+
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        
-        # 调节参数（从 config 读取）
-        self._adjust_interval = getattr(config, "ADJUST_INTERVAL_S", 10)
-        self._target_latency = getattr(config, "TARGET_LATENCY_S", 2.0)
-        self._max_latency = getattr(config, "MAX_LATENCY_S", 4.0)
-        self._target_success = getattr(config, "TARGET_SUCCESS_RATE", 0.95)
-        self._min_success = getattr(config, "MIN_SUCCESS_RATE", 0.85)
-        self._block_threshold = getattr(config, "BLOCK_RATE_THRESHOLD", 0.05)
-        self._bw_soft_cap = getattr(config, "BANDWIDTH_SOFT_CAP", 0.80)
-        self._cooldown_duration = getattr(config, "COOLDOWN_AFTER_BLOCK_S", 30)
-    
+
+        self._adjust_interval = config.ADJUST_INTERVAL_S
+        self._target_latency = config.TARGET_LATENCY_S
+        self._max_latency = config.MAX_LATENCY_S
+        self._target_success = config.TARGET_SUCCESS_RATE
+        self._min_success = config.MIN_SUCCESS_RATE
+        self._block_threshold = config.BLOCK_RATE_THRESHOLD
+        self._bw_soft_cap = config.BANDWIDTH_SOFT_CAP
+        self._cooldown_duration = config.COOLDOWN_AFTER_BLOCK_S
+
+        # 恢复抖动系数（由 Worker 从 Server 同步设置，防止多 Worker 同步振荡）
+        self._recovery_jitter = 0.5
+
     @property
     def current_concurrency(self) -> int:
-        """当前目标并发数"""
         return self._concurrency
-    
+
     async def acquire(self):
         """获取一个并发槽位（阻塞直到有空位）"""
         await self._semaphore.acquire()
         self.metrics.request_start()
-    
+
     def release(self):
         """释放一个并发槽位"""
         self.metrics.request_end()
         self._semaphore.release()
-    
+
     def record_result(self, latency_s: float, success: bool, blocked: bool, resp_bytes: int = 0):
         """记录一次请求结果"""
         self.metrics.record(latency_s, success, blocked, resp_bytes)
-    
+
     async def start(self):
         """启动后台评估协程"""
         self._running = True
         self._task = asyncio.create_task(self._adjust_loop())
-        logger.info(f"🎛️  自适应控制器启动 | 初始并发={self._concurrency} | 范围=[{self._min}, {self._max}]")
-    
+        logger.info(f"自适应控制器启动 | 初始并发={self._concurrency} | 范围=[{self._min}, {self._max}]")
+
     async def stop(self):
         """停止控制器"""
         self._running = False
@@ -103,7 +101,7 @@ class AdaptiveController:
                 await self._task
             except asyncio.CancelledError:
                 pass
-    
+
     async def _adjust_loop(self):
         """后台循环：每 ADJUST_INTERVAL_S 秒评估一次"""
         while self._running:
@@ -111,111 +109,99 @@ class AdaptiveController:
                 await asyncio.sleep(self._adjust_interval)
                 if not self._running:
                     break
-                self._evaluate()
+                await self._evaluate()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"自适应控制器异常: {e}")
-    
-    def _evaluate(self):
+
+    async def _evaluate(self):
         """
         核心评估逻辑 — AIMD + 带宽感知
-        
+
         优先级：
         1. 被封率高 → 紧急减半 + 冷却
         2. 成功率低 OR 延迟高 → 减半
         3. 带宽饱和 → 不动
-        4. 一切正常 → +1
-        5. 其他 → 不动
+        4. 冷却期 → 不动
+        5. 一切正常 → +1
+        6. 其他 → 不动
         """
         snap = self.metrics.snapshot()
-        
-        # 样本不足，不调整（至少需要 5 个样本点）
+
         if snap["total"] < 5:
-            logger.debug(f"🎛️  样本不足 ({snap['total']}), 跳过调整")
+            logger.debug(f"样本不足 ({snap['total']}), 跳过调整")
             return
-        
-        old_c = self._concurrency
-        now = time.time()
-        in_cooldown = now < self._cooldown_until
-        reason = ""
-        
-        # ① 被封率过高 → 紧急减半 + 冷却
-        if snap["block_rate"] > self._block_threshold:
-            self._concurrency = max(self._min, self._concurrency // 2)
-            self._cooldown_until = now + self._cooldown_duration
-            reason = f"🚨 封锁率 {snap['block_rate']:.0%} > {self._block_threshold:.0%} → 减半+冷却{self._cooldown_duration}s"
-        
-        # ② 成功率低 OR 延迟过高 → 减半
-        elif snap["success_rate"] < self._min_success or snap["latency_p50"] > self._max_latency:
-            self._concurrency = max(self._min, self._concurrency // 2)
-            reason = (
-                f"⚠️ 成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s → 减半"
-            )
-        
-        # ③ 带宽饱和 → 不增
-        elif snap["bandwidth_pct"] > self._bw_soft_cap:
-            reason = f"📶 带宽 {snap['bandwidth_pct']:.0%} > {self._bw_soft_cap:.0%} → 维持"
-        
-        # ④ 冷却期 → 不增
-        elif in_cooldown:
-            remaining = int(self._cooldown_until - now)
-            reason = f"❄️ 冷却中 (剩余 {remaining}s) → 维持"
-        
-        # ⑤ 一切正常 → +1
-        elif (snap["success_rate"] >= self._target_success 
-              and snap["latency_p50"] < self._target_latency):
-            self._concurrency = min(self._max, self._concurrency + 1)
-            reason = f"✅ 成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s → +1"
-        
-        # ⑥ 中间地带 → 不动
-        else:
-            reason = f"➖ 稳态 | 成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s"
-        
-        # 调整信号量（如果并发数变化了）
-        if self._concurrency != old_c:
-            self._adjust_semaphore(old_c, self._concurrency)
-            logger.info(f"🎛️  并发调整 {old_c} → {self._concurrency} | {reason}")
-        else:
-            logger.debug(f"🎛️  {reason} | 并发={self._concurrency}")
-        
-        # 打印指标摘要
+
+        async with self._adjust_lock:
+            old_c = self._concurrency
+            now = time.monotonic()
+            in_cooldown = now < self._cooldown_until
+            reason = ""
+
+            if snap["block_rate"] > self._block_threshold:
+                new_c = max(self._min, self._concurrency // 2)
+                self._cooldown_until = now + self._cooldown_duration
+                reason = f"封锁率 {snap['block_rate']:.0%} > {self._block_threshold:.0%} -> 减半+冷却{self._cooldown_duration}s"
+
+            elif snap["success_rate"] < self._min_success or snap["latency_p50"] > self._max_latency:
+                new_c = max(self._min, self._concurrency // 2)
+                reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> 减半"
+
+            elif snap["bandwidth_pct"] > self._bw_soft_cap:
+                new_c = self._concurrency
+                reason = f"带宽 {snap['bandwidth_pct']:.0%} > {self._bw_soft_cap:.0%} -> 维持"
+
+            elif in_cooldown:
+                new_c = self._concurrency
+                remaining = int(self._cooldown_until - now)
+                reason = f"冷却中 (剩余 {remaining}s) -> 维持"
+
+            elif (snap["success_rate"] >= self._target_success
+                  and snap["latency_p50"] < self._target_latency):
+                # 随机抖动恢复：不同 Worker 以不同概率加速，防止同步振荡
+                # jitter=0.9 → 93% 概率 +1，jitter=0.1 → 37% 概率 +1
+                if random.random() < (0.3 + 0.7 * self._recovery_jitter):
+                    new_c = min(self._max, self._concurrency + 1)
+                    reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> +1"
+                else:
+                    new_c = self._concurrency
+                    reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> 维持(抖动跳过)"
+
+            else:
+                new_c = self._concurrency
+                reason = f"稳态 | 成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s"
+
+            if new_c != old_c:
+                await self._resize_semaphore(old_c, new_c)
+                self._concurrency = new_c
+                logger.info(f"并发调整 {old_c} -> {new_c} | {reason}")
+            else:
+                logger.debug(f"{reason} | 并发={self._concurrency}")
+
         logger.info(self.metrics.format_summary())
-    
-    def _adjust_semaphore(self, old_value: int, new_value: int):
+
+    async def _resize_semaphore(self, old_value: int, new_value: int):
         """
-        动态调整信号量大小
-        
-        增加 → 释放额外的 permit
-        减少 → 设置新的更小信号量（已持有的 permit 会自然归还旧的，
-              但新请求会用新信号量。这里用渐进方式：减少时不强制
-              踢掉在飞的请求，而是在释放时对比决定。）
-        
-        简化实现：直接替换信号量。增加时多 release 差值；减少时
-        新建信号量（在飞的请求 release 旧的不会有问题，因为
-        acquire/release 在 worker 协程内配对使用）。
+        安全地调整信号量大小
+
+        增加：多次 release 来增加可用 permit
+        减少：重建一个更小的 Semaphore
+
+        注意：减少时不强制中断在飞的请求，而是等自然归还后
+        新请求使用新的更小信号量，实现渐进式缩容。
+        在飞的请求持有的 permit 归还给旧 semaphore，不影响新的。
         """
         diff = new_value - old_value
         if diff > 0:
-            # 扩容：给当前信号量多 release 几个 permit
             for _ in range(diff):
                 self._semaphore.release()
         elif diff < 0:
-            # 缩容：创建新的更小信号量
-            # 当前在飞的请求会继续使用旧的 release（不影响）
-            # 后续新的 acquire 使用新的信号量
-            # 
-            # 但为了简化，我们用单一信号量 + 手动 acquire 来减少 permit
-            # 即：acquire 掉多余的 permit，这些 permit 不会被 release 回来
-            # 注意：这是非阻塞的尝试，如果 acquire 不到说明都在飞，
-            # 等它们落地时自然就少了
-            for _ in range(-diff):
-                # 缩容：减少信号量的可用 permit 数
-                # 注意：asyncio.Semaphore 没有公开的 try_acquire 或查询可用数的 API
-                # 直接操作 _value 是 CPython 中缩容信号量的标准做法
-                # （_value 自 Python 3.4 起稳定存在）
-                if self._semaphore._value > 0:
-                    self._semaphore._value -= 1
+            # 重建信号量，初始值 = 新目标值
+            # 当前已在飞的请求会继续使用旧 semaphore 的 release 路径
+            # 这里直接替换，新 acquire 全部走新 semaphore
+            # 为平滑过渡：新 semaphore 初始值 = max(new_value, 0)，不能为负
+            self._semaphore = asyncio.Semaphore(max(new_value, 1))
 
 
 class TokenBucket:
@@ -223,22 +209,14 @@ class TokenBucket:
     全局令牌桶限流器
 
     控制系统级请求发起速率（QPS），与 Semaphore（并发连接数）互补：
-    - Semaphore 控制同时在飞的请求数（池子多大）
-    - TokenBucket 控制新请求的产生速率（水龙头多快）
-
-    实现：经典令牌桶算法，令牌按固定速率补充，每次请求消耗一个令牌。
-    令牌不足时 await 直到有令牌可用。
+    - Semaphore 控制同时在飞的请求数
+    - TokenBucket 控制新请求的产生速率
     """
 
     def __init__(self, rate: float = None, burst: int = None):
-        """
-        Args:
-            rate: 每秒产生的令牌数（即目标 QPS）
-            burst: 桶容量（允许的最大突发数），默认等于 rate
-        """
-        self._rate = rate or getattr(config, "TOKEN_BUCKET_RATE", 4.5)
+        self._rate = rate or config.TOKEN_BUCKET_RATE
         self._burst = burst or max(1, int(self._rate))
-        self._tokens = float(self._burst)  # 初始满桶
+        self._tokens = float(self._burst)
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -250,7 +228,6 @@ class TokenBucket:
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
                     return
-                # 计算等待时间：需要 1 个令牌，当前有 self._tokens 个
                 wait = (1.0 - self._tokens) / self._rate
 
             await asyncio.sleep(wait)

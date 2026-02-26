@@ -12,17 +12,16 @@ Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发
 import asyncio
 import argparse
 import logging
-import random
 import time
 import uuid
 import signal
 import sys
 from typing import Optional, Dict, List
 
-from curl_cffi import requests as curl_requests
+import httpx
 
 import config
-from proxy import ProxyManager, get_proxy_manager
+from proxy import get_proxy_manager
 from session import AmazonSession
 from parser import AmazonParser
 from metrics import MetricsCollector
@@ -53,8 +52,6 @@ class Worker:
         self._session: Optional[AmazonSession] = None
 
         # 速率控制
-        self._interval = config.REQUEST_INTERVAL
-        self._jitter = config.REQUEST_JITTER
         self._rate_limiter = TokenBucket()
 
         # 自适应并发控制
@@ -90,17 +87,20 @@ class Worker:
         self._batch_size = 10
         self._batch_interval = 2.0  # 秒
 
+        # 实例级运行参数（不污染全局 config）
+        self._max_retries = config.MAX_RETRIES
+
         # Session 轮换控制
         self._success_since_rotate = 0
         self._rotate_every = config.SESSION_ROTATE_EVERY
         self._rotate_lock = asyncio.Lock()
-        self._last_rotate_time = 0.0  # 轮换防抖
+        self._last_rotate_time = 0.0  # 轮换防抖（monotonic）
         self._session_ready = asyncio.Event()  # Session 就绪信号
 
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
 
-        # 截图队列（非阻塞异步管道）
+        # 截图队列（有界，防止内存无限增长）
         self._screenshot_queue: asyncio.Queue = None
         self._screenshot_concurrency = 3   # 并发截图协程数
         self._browser = None               # 持久化 Playwright 浏览器实例
@@ -109,6 +109,10 @@ class Worker:
 
         # 设置同步
         self._settings_version = 0
+
+        # 全局并发协调
+        self._global_block_epoch = 0   # 已处理的全局封锁 epoch
+        self._recovery_jitter = 0.5    # Server 分配的恢复抖动系数
 
     async def start(self):
         """启动 Worker（流水线架构）"""
@@ -125,9 +129,12 @@ class Worker:
         # 初始化队列
         self._task_queue = asyncio.Queue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
-        self._screenshot_queue = asyncio.Queue()  # 无限队列，不丢任务
+        self._screenshot_queue = asyncio.Queue(maxsize=200)  # 有界队列，防止内存无限增长
 
-        # 初始化 session
+        # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
+        await self._pull_initial_settings()
+
+        # 初始化 session（此时 proxy_api_url 已从 Server 同步）
         await self._init_session()
 
         # 启动自适应控制器
@@ -331,6 +338,101 @@ class Worker:
     # 核心处理逻辑（保持不变）
     # ═══════════════════════════════════════════════
 
+    async def _pull_initial_settings(self):
+        """启动时从 Server 拉取一次设置，确保所有运行参数与 Server 一致。
+        远程 Worker 无需本地 .env 或环境变量，所有配置由 Server 统一下发。"""
+        logger.info("⚙️ 从服务器拉取初始设置...")
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self.server_url}/api/settings")
+                if resp.status_code != 200:
+                    logger.warning(f"⚠️ 拉取初始设置失败: HTTP {resp.status_code}")
+                    return
+                s = resp.json()
+
+            changes = []
+
+            # 代理 API 地址（最关键：远程 Worker 本地凭证为空，必须从 Server 获取）
+            new_proxy_url = s.get("proxy_api_url")
+            if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
+                config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
+                changes.append("proxy_api_url")
+
+            # 邮编（命令行未指定时，用 Server 端设置覆盖）
+            new_zip = s.get("zip_code")
+            if new_zip and self.zip_code == config.DEFAULT_ZIP_CODE and new_zip != self.zip_code:
+                self.zip_code = new_zip
+                changes.append(f"zip_code={new_zip}")
+
+            # 令牌桶 QPS
+            new_rate = s.get("token_bucket_rate")
+            if new_rate and new_rate != self._rate_limiter.rate:
+                self._rate_limiter.rate = new_rate
+                changes.append(f"QPS={new_rate}")
+
+            # 并发控制：min / max / initial（顺序：先设范围，再设初始值）
+            new_min = s.get("min_concurrency")
+            if new_min and new_min != self._controller._min:
+                self._controller._min = new_min
+                changes.append(f"min_c={new_min}")
+
+            new_max = s.get("max_concurrency")
+            if new_max and new_max != self._controller._max:
+                self._controller._max = new_max
+                changes.append(f"max_c={new_max}")
+
+            new_initial = s.get("initial_concurrency")
+            if new_initial and new_initial != self._controller._concurrency:
+                # 确保在合法范围内
+                clamped = max(self._controller._min, min(self._controller._max, new_initial))
+                self._controller._concurrency = clamped
+                # 启动前重建信号量，使其与新并发值匹配
+                self._controller._semaphore = asyncio.Semaphore(clamped)
+                changes.append(f"initial_c={clamped}")
+
+            # 最大重试
+            new_retries = s.get("max_retries")
+            if new_retries and new_retries != self._max_retries:
+                self._max_retries = new_retries
+                changes.append(f"retries={new_retries}")
+
+            # Session 轮换
+            new_rotate = s.get("session_rotate_every")
+            if new_rotate and new_rotate != self._rotate_every:
+                self._rotate_every = new_rotate
+                changes.append(f"rotate={new_rotate}")
+
+            # 截图并发
+            new_sc = s.get("screenshot_concurrency")
+            if new_sc and new_sc != self._screenshot_concurrency:
+                self._screenshot_concurrency = new_sc
+                changes.append(f"screenshot_c={new_sc}")
+
+            # AIMD 调控参数
+            for attr, key in [
+                ("_adjust_interval", "adjust_interval"),
+                ("_target_latency", "target_latency"),
+                ("_max_latency", "max_latency"),
+                ("_target_success", "target_success_rate"),
+                ("_min_success", "min_success_rate"),
+                ("_block_threshold", "block_rate_threshold"),
+                ("_cooldown_duration", "cooldown_after_block"),
+            ]:
+                val = s.get(key)
+                if val is not None and val != getattr(self._controller, attr, None):
+                    setattr(self._controller, attr, val)
+                    changes.append(f"{key}={val}")
+
+            self._settings_version = s.get("_version", 0)
+
+            if changes:
+                logger.info(f"⚙️ 初始设置已同步: {', '.join(changes)}")
+            else:
+                logger.info("⚙️ 初始设置已确认（与本地一致）")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 拉取初始设置异常（将使用本地配置）: {e}")
+
     async def _init_session(self):
         """初始化 Amazon session（失败时重试，确保 _session_ready 最终被 set）"""
         logger.info("🔧 初始化 Amazon session...")
@@ -357,7 +459,7 @@ class Worker:
         """轮换 session：关闭旧的，刷新代理，创建新的（带防抖 + 就绪信号 + 失败重试）"""
         async with self._rotate_lock:
             # 防抖：5秒内不重复轮换
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_rotate_time < 5:
                 logger.debug(f"🔄 跳过轮换（距上次不足5秒）")
                 return
@@ -375,7 +477,7 @@ class Worker:
                 self._session = AmazonSession(self.proxy_manager, self.zip_code)
                 success = await self._session.initialize()
                 self._success_since_rotate = 0
-                self._last_rotate_time = time.time()
+                self._last_rotate_time = time.monotonic()
                 if success:
                     self._session_ready.set()
                     logger.info("🔄 Session 轮换成功")
@@ -400,13 +502,12 @@ class Worker:
                 "worker_id": self.worker_id,
                 "count": count or self._controller.current_concurrency,
             }
-            resp = curl_requests.get(url, params=params, timeout=10)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, params=params)
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("tasks", [])
-            else:
-                logger.warning(f"拉取任务失败: HTTP {resp.status_code}")
-                return []
+                return resp.json().get("tasks", [])
+            logger.warning(f"拉取任务失败: HTTP {resp.status_code}")
+            return []
         except Exception as e:
             logger.error(f"拉取任务异常: {e}")
             return []
@@ -415,96 +516,181 @@ class Worker:
         """通知 Server 归还未处理的任务（优先采集切换时调用）"""
         try:
             url = f"{self.server_url}/api/tasks/release"
-            resp = curl_requests.post(url, json={"task_ids": task_ids}, timeout=10)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, json={"task_ids": task_ids})
             if resp.status_code == 200:
                 data = resp.json()
-                logger.info(f"🔄 已归还 {data.get('released', 0)} 个旧任务到 pending")
+                logger.info(f"已归还 {data.get('released', 0)} 个旧任务到 pending")
             else:
                 logger.warning(f"归还任务失败: HTTP {resp.status_code}")
         except Exception as e:
             logger.error(f"归还任务异常: {e}")
 
     async def _settings_sync(self):
-        """定期从服务端同步设置，热更新运行参数"""
-        logger.info("⚙️ 设置同步协程启动（每 30 秒检查一次）")
+        """定期与 Server 同步：上报 metrics + 拉取 settings + 接收配额"""
+        logger.info("⚙️ 设置同步协程启动（每 30 秒）")
         while self._running:
             try:
                 await asyncio.sleep(30)
                 if not self._running:
                     break
 
-                resp = curl_requests.get(
-                    f"{self.server_url}/api/settings", timeout=5
-                )
-                if resp.status_code != 200:
+                # 收集本地 metrics 快照
+                snap = self._metrics.snapshot()
+                payload = {
+                    "worker_id": self.worker_id,
+                    "metrics": {
+                        "total": snap["total"],
+                        "success_rate": snap["success_rate"],
+                        "block_rate": snap["block_rate"],
+                        "latency_p50": snap["latency_p50"],
+                        "latency_p95": snap["latency_p95"],
+                        "inflight": snap["inflight"],
+                        "bandwidth_bps": snap["bandwidth_bps"],
+                        "current_concurrency": self._controller.current_concurrency,
+                    },
+                }
+
+                # 优先使用新的综合同步端点
+                s = None
+                async with httpx.AsyncClient(timeout=5) as client:
+                    try:
+                        resp = await client.post(
+                            f"{self.server_url}/api/worker/sync",
+                            json=payload,
+                        )
+                        if resp.status_code == 200:
+                            s = resp.json()
+                    except Exception:
+                        pass
+
+                    # 降级：旧版 Server 没有 /api/worker/sync
+                    if s is None:
+                        resp = await client.get(f"{self.server_url}/api/settings")
+                        if resp.status_code == 200:
+                            s = resp.json()
+
+                if s is None:
                     continue
 
-                s = resp.json()
+                # === 现有 settings 同步 ===
                 ver = s.get("_version", 0)
-                if ver <= self._settings_version:
-                    continue  # 没有变化
-
-                self._settings_version = ver
                 changes = []
 
-                # 令牌桶 QPS
-                new_rate = s.get("token_bucket_rate")
-                if new_rate and new_rate != self._rate_limiter.rate:
-                    self._rate_limiter.rate = new_rate
-                    changes.append(f"QPS={new_rate}")
+                if ver > self._settings_version:
+                    self._settings_version = ver
 
-                # 并发范围
-                new_max = s.get("max_concurrency")
-                if new_max and new_max != self._controller._max:
-                    self._controller._max = new_max
-                    changes.append(f"max_c={new_max}")
+                    # 令牌桶 QPS（仅在无配额时使用全局值）
+                    if "_quota" not in s:
+                        new_rate = s.get("token_bucket_rate")
+                        if new_rate and new_rate != self._rate_limiter.rate:
+                            self._rate_limiter.rate = new_rate
+                            changes.append(f"QPS={new_rate}")
 
-                new_min = s.get("min_concurrency")
-                if new_min and new_min != self._controller._min:
-                    self._controller._min = new_min
-                    changes.append(f"min_c={new_min}")
+                    # 并发范围（仅在无配额时使用全局值）
+                    if "_quota" not in s:
+                        new_max = s.get("max_concurrency")
+                        if new_max and new_max != self._controller._max:
+                            self._controller._max = new_max
+                            changes.append(f"max_c={new_max}")
 
-                # AIMD 调控参数
-                for attr, key in [
-                    ("_adjust_interval", "adjust_interval"),
-                    ("_target_latency", "target_latency"),
-                    ("_max_latency", "max_latency"),
-                    ("_target_success", "target_success_rate"),
-                    ("_min_success", "min_success_rate"),
-                    ("_block_threshold", "block_rate_threshold"),
-                    ("_cooldown_duration", "cooldown_after_block"),
-                ]:
-                    val = s.get(key)
-                    if val is not None and val != getattr(self._controller, attr, None):
-                        setattr(self._controller, attr, val)
-                        changes.append(f"{key}={val}")
+                    new_min = s.get("min_concurrency")
+                    if new_min and new_min != self._controller._min:
+                        self._controller._min = new_min
+                        changes.append(f"min_c={new_min}")
 
-                # Session 轮换
-                new_rotate = s.get("session_rotate_every")
-                if new_rotate and new_rotate != self._rotate_every:
-                    self._rotate_every = new_rotate
-                    changes.append(f"rotate={new_rotate}")
+                    # AIMD 调控参数
+                    for attr, key in [
+                        ("_adjust_interval", "adjust_interval"),
+                        ("_target_latency", "target_latency"),
+                        ("_max_latency", "max_latency"),
+                        ("_target_success", "target_success_rate"),
+                        ("_min_success", "min_success_rate"),
+                        ("_block_threshold", "block_rate_threshold"),
+                        ("_cooldown_duration", "cooldown_after_block"),
+                    ]:
+                        val = s.get(key)
+                        if val is not None and val != getattr(self._controller, attr, None):
+                            setattr(self._controller, attr, val)
+                            changes.append(f"{key}={val}")
 
-                # 最大重试
-                new_retries = s.get("max_retries")
-                if new_retries and new_retries != config.MAX_RETRIES:
-                    config.MAX_RETRIES = new_retries
-                    changes.append(f"retries={new_retries}")
+                    # Session 轮换
+                    new_rotate = s.get("session_rotate_every")
+                    if new_rotate and new_rotate != self._rotate_every:
+                        self._rotate_every = new_rotate
+                        changes.append(f"rotate={new_rotate}")
 
-                # 截图并发数
-                new_sc = s.get("screenshot_concurrency")
-                if new_sc and new_sc != self._screenshot_concurrency:
-                    self._screenshot_concurrency = new_sc
-                    changes.append(f"screenshot_c={new_sc}")
+                    # 最大重试
+                    new_retries = s.get("max_retries")
+                    if new_retries and new_retries != self._max_retries:
+                        self._max_retries = new_retries
+                        changes.append(f"retries={new_retries}")
 
-                # 代理 API 地址
-                new_proxy_url = s.get("proxy_api_url")
-                if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
-                    config.PROXY_API_URL_AUTH = new_proxy_url
-                    changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+                    # 截图并发数
+                    new_sc = s.get("screenshot_concurrency")
+                    if new_sc and new_sc != self._screenshot_concurrency:
+                        self._screenshot_concurrency = new_sc
+                        changes.append(f"screenshot_c={new_sc}")
 
-                if changes:
-                    logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
+                    # 代理 API 地址
+                    new_proxy_url = s.get("proxy_api_url")
+                    if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
+                        config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
+                        changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+
+                    if changes:
+                        logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
+
+                # === 配额执行（每次都执行，不受 version 限制）===
+                quota = s.get("_quota")
+                if quota:
+                    new_max_c = quota.get("concurrency")
+                    if new_max_c and new_max_c != self._controller._max:
+                        old_max = self._controller._max
+                        self._controller._max = new_max_c
+                        # 当前并发超出配额 → 强制缩容
+                        if self._controller._concurrency > new_max_c:
+                            await self._controller._resize_semaphore(
+                                self._controller._concurrency, new_max_c
+                            )
+                            self._controller._concurrency = new_max_c
+                        logger.info(f"📊 配额: max_c {old_max}->{new_max_c}")
+
+                    new_qps = quota.get("qps")
+                    if new_qps and abs(new_qps - self._rate_limiter.rate) > 0.1:
+                        old_qps = self._rate_limiter.rate
+                        self._rate_limiter.rate = new_qps
+                        logger.info(f"📊 配额: QPS {old_qps:.1f}->{new_qps:.1f}")
+
+                # === 全局封锁处理 ===
+                block_info = s.get("_global_block", {})
+                if block_info.get("active"):
+                    epoch = block_info.get("epoch", 0)
+                    if epoch > self._global_block_epoch:
+                        self._global_block_epoch = epoch
+                        # 立即并发减半
+                        new_c = max(
+                            self._controller._min,
+                            self._controller._concurrency // 2,
+                        )
+                        if new_c < self._controller._concurrency:
+                            await self._controller._resize_semaphore(
+                                self._controller._concurrency, new_c
+                            )
+                            self._controller._concurrency = new_c
+                            # 设置本地冷却
+                            remaining = block_info.get("remaining_s", 30)
+                            self._controller._cooldown_until = time.monotonic() + remaining
+                        logger.warning(
+                            f"⚠️ 全局封锁 epoch={epoch}, "
+                            f"并发 -> {new_c}, 冷却 {block_info.get('remaining_s')}s"
+                        )
+
+                # === 恢复抖动系数 ===
+                jitter = s.get("_recovery_jitter")
+                if jitter is not None:
+                    self._recovery_jitter = jitter
+                    self._controller._recovery_jitter = jitter
 
             except asyncio.CancelledError:
                 break
@@ -520,7 +706,7 @@ class Worker:
         asin = task["asin"]
         task_id = task["id"]
         zip_code = task.get("zip_code", self.zip_code)
-        max_retries = config.MAX_RETRIES
+        max_retries = self._max_retries
         resp_bytes = 0
         last_error_type = "network"
         last_error_detail = ""
@@ -541,7 +727,7 @@ class Worker:
                         attempt += 1
                         continue
 
-                if self._session is None or self._session._session is None:
+                if self._session is None or not self._session.is_ready():
                     attempt += 1
                     logger.warning(f"ASIN {asin} session 仍未就绪 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
@@ -800,34 +986,36 @@ class Worker:
         if batch:
             await self._submit_batch(batch)
 
-    async def _submit_batch(self, batch: List[Dict]):
-        """批量 POST 提交结果到服务器"""
-        try:
-            url = f"{self.server_url}/api/tasks/result/batch"
-            resp = curl_requests.post(
-                url,
-                json={"results": batch},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                logger.debug(f"批量提交 {len(batch)} 条结果成功")
-            else:
-                logger.warning(f"批量提交失败 HTTP {resp.status_code}，回退逐条提交")
-                await self._submit_batch_fallback(batch)
-        except Exception as e:
-            logger.error(f"批量提交异常: {e}，回退逐条提交")
-            await self._submit_batch_fallback(batch)
+    async def _submit_batch(self, batch: List[Dict], retry: int = 3):
+        """批量 POST 提交结果到服务器（含重试）"""
+        url = f"{self.server_url}/api/tasks/result/batch"
+        for attempt in range(retry):
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(url, json={"results": batch})
+                if resp.status_code == 200:
+                    logger.debug(f"批量提交 {len(batch)} 条结果成功")
+                    return
+                logger.warning(f"批量提交失败 HTTP {resp.status_code} (尝试 {attempt+1}/{retry})")
+            except Exception as e:
+                logger.error(f"批量提交异常 (尝试 {attempt+1}/{retry}): {e}")
+            if attempt < retry - 1:
+                await asyncio.sleep(2 ** attempt)
+        # 全部重试失败，回退逐条提交
+        logger.error("批量提交多次失败，回退逐条提交")
+        await self._submit_batch_fallback(batch)
 
     async def _submit_batch_fallback(self, batch: List[Dict]):
         """逐条提交 fallback（批量接口不可用时）"""
         url = f"{self.server_url}/api/tasks/result"
-        for payload in batch:
-            try:
-                resp = curl_requests.post(url, json=payload, timeout=10)
-                if resp.status_code != 200:
-                    logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
-            except Exception as e:
-                logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
+        async with httpx.AsyncClient(timeout=10) as client:
+            for payload in batch:
+                try:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code != 200:
+                        logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
+                except Exception as e:
+                    logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
 
     # ═══════════════════════════════════════════════
     # 截图渲染管道
@@ -943,14 +1131,34 @@ class Worker:
 
             await page.route("**/*", block_resources)
 
+            # 注入 <base> 标签，使 protocol-relative URL (//...) 和相对路径都能正确解析
+            # setContent 在 about:blank 上下文中运行，没有 base 则 //cdn... 会变成 about://cdn...
+            base_tag = '<base href="https://www.amazon.com/">'
+            lower_head = html_content[:2000].lower()
+            if "<base " not in lower_head:
+                # 找到 <head> 或 <head ...> 的结束位置
+                head_pos = lower_head.find("<head")
+                if head_pos != -1:
+                    close_pos = html_content.index(">", head_pos) + 1
+                    html_content = html_content[:close_pos] + base_tag + html_content[close_pos:]
+                else:
+                    html_content = base_tag + html_content
+
             # setContent 直接注入 HTML（比 goto + route 拦截快 ~500ms）
             try:
-                await page.set_content(html_content, wait_until="domcontentloaded", timeout=10000)
+                await page.set_content(
+                    html_content,
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
             except Exception:
                 pass  # 超时不影响截图
 
-            # 等待 CSS 和关键图片加载
-            await page.wait_for_timeout(1000)
+            # 等待网络空闲（CSS/图片加载完毕），比固定 1s 更可靠
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass  # 超时仍继续截图，大部分资源应已加载
 
             # 计算裁剪高度：扫描多个锚点元素，取最大 bottom 值
             clip_height = await page.evaluate("""() => {
@@ -978,10 +1186,27 @@ class Worker:
             }""")
             clip_height = max(800, min(clip_height, 3000))
 
+            # 截图前检查页面是否有可见内容（防止空白截图）
+            has_content = await page.evaluate("""() => {
+                if (!document.body) return false;
+                // 检查是否有可见的文本或图片
+                const text = document.body.innerText || '';
+                if (text.trim().length > 50) return true;
+                const imgs = document.querySelectorAll('img[src]');
+                if (imgs.length > 0) return true;
+                return false;
+            }""")
+
             screenshot = await page.screenshot(
                 type="png",
                 clip={"x": 0, "y": 0, "width": 1280, "height": clip_height}
             )
+
+            # 空白检测：PNG < 10KB 且页面无可见内容 → 判定为空白截图
+            if len(screenshot) < 10240 and not has_content:
+                logger.warning(f"📸 空白截图已丢弃: {asin} ({len(screenshot)} bytes, 无可见内容)")
+                return None
+
             return screenshot
         except Exception as e:
             err_msg = str(e)
@@ -1019,22 +1244,15 @@ class Worker:
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
         """将截图 POST 到 Server"""
         try:
-            from curl_cffi import CurlMime
             url = f"{self.server_url}/api/tasks/screenshot"
-            mp = CurlMime()
-            mp.addpart(name="batch_name", data=batch_name)
-            mp.addpart(name="asin", data=asin)
-            mp.addpart(
-                name="file",
-                filename=f"{asin}.png",
-                content_type="image/png",
-                data=png_bytes,
-            )
-            resp = curl_requests.post(url, multipart=mp, timeout=15)
+            files = {"file": (f"{asin}.png", png_bytes, "image/png")}
+            data = {"batch_name": batch_name, "asin": asin}
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(url, files=files, data=data)
             if resp.status_code != 200:
-                logger.warning(f"📸 截图上传失败 {asin}: HTTP {resp.status_code}")
+                logger.warning(f"截图上传失败 {asin}: HTTP {resp.status_code}")
         except Exception as e:
-            logger.error(f"📸 截图上传异常 {asin}: {e}")
+            logger.error(f"截图上传异常 {asin}: {e}")
 
     # ═══════════════════════════════════════════════
     # 生命周期

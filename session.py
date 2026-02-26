@@ -254,7 +254,7 @@ class AmazonSession:
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": self._user_agent,
             "Upgrade-Insecure-Requests": "1",
-            "sec-ch-ua": '"Chromium";v="133", "Google Chrome";v="133", "Not_A Brand";v="24"',
+            "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self._platform,
             "Sec-Fetch-Dest": "document",
@@ -345,6 +345,10 @@ class AmazonSession:
         except Exception as e:
             logger.error(f"❌ 请求失败 ASIN={asin}: {e}")
             return None
+
+    def is_ready(self) -> bool:
+        """检查 session 是否已初始化并可用"""
+        return self._initialized and self._session is not None
 
     def is_blocked(self, response: Response) -> bool:
         """
