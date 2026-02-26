@@ -57,9 +57,19 @@
 
 <!-- 底部操作栏 -->
 <div class="d-flex gap-2 mt-2">
-    <a href="/api/worker/download" class="btn btn-outline-accent btn-sm">
-        <i class="bi bi-download"></i> 下载 Worker 安装包
-    </a>
+    <div class="btn-group">
+        <button type="button" class="btn btn-outline-accent btn-sm dropdown-toggle" data-bs-toggle="dropdown">
+            <i class="bi bi-download"></i> 下载 Worker
+        </button>
+        <ul class="dropdown-menu">
+            <li><a class="dropdown-item" href="/api/worker/download?mode=full">
+                <i class="bi bi-box-seam"></i> 完整安装包 <small class="text-secondary">— 首次安装</small>
+            </a></li>
+            <li><a class="dropdown-item" href="/api/worker/download?mode=update">
+                <i class="bi bi-arrow-repeat"></i> 代码更新包 <small class="text-secondary">— 仅 .py 文件</small>
+            </a></li>
+        </ul>
+    </div>
     <button class="btn btn-outline-danger btn-sm" onclick="clearOffline()">
         <i class="bi bi-trash"></i> 清理所有离线 Worker
     </button>

@@ -991,12 +991,37 @@ _WORKER_FILES = [
 
 
 @app.get("/api/worker/download")
-async def download_worker(request: Request):
-    """打包 Worker 所需文件为 ZIP 下载，内含启动脚本（自动连接本服务器）"""
-    # 推断服务器地址（用请求的 Host 头）
+async def download_worker(request: Request, mode: str = "full"):
+    """打包 Worker 所需文件为 ZIP 下载
+
+    mode=full  : 完整安装包（源码 + requirements + 启动脚本），首次安装用
+    mode=update: 仅 Python 源码文件，已安装过的机器用于更新代码
+    """
+    # --- mode=update: 仅打包 .py 源码，直接解压覆盖即可 ---
+    if mode == "update":
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in _WORKER_FILES:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(config.BASE_DIR, fname)
+                if os.path.exists(fpath):
+                    zf.write(fpath, fname)  # 无子目录，直接覆盖
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=worker-update.zip"},
+        )
+
+    # --- mode=full: 完整安装包 ---
     host = request.headers.get("host", f"127.0.0.1:{config.SERVER_PORT}")
     scheme = "https" if request.headers.get("x-forwarded-proto") == "https" else "http"
     server_url = f"{scheme}://{host}"
+
+    # 国内镜像地址
+    pypi_mirror = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+    playwright_mirror = "https://registry.npmmirror.com/-/binary/playwright"
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1019,6 +1044,10 @@ async def download_worker(request: Request):
 set -e
 cd "$(dirname "$0")"
 SERVER="{server_url}"
+
+# 国内镜像加速
+PYPI_MIRROR="{pypi_mirror}"
+export PLAYWRIGHT_DOWNLOAD_HOST="{playwright_mirror}"
 
 # 检测 Python
 if command -v python3 &>/dev/null; then
@@ -1043,10 +1072,11 @@ source .venv/bin/activate
 
 # 安装依赖（首次运行或依赖更新）
 if [ ! -f ".deps_installed" ] || [ "requirements-worker.txt" -nt ".deps_installed" ]; then
-    echo "安装核心依赖..."
-    pip install -q -r requirements-worker.txt
+    echo "安装核心依赖（使用清华镜像加速）..."
+    pip install -q -i "$PYPI_MIRROR" -r requirements-worker.txt
     echo "安装截图组件 (playwright)..."
-    pip install -q -r requirements-screenshot.txt
+    pip install -q -i "$PYPI_MIRROR" -r requirements-screenshot.txt
+    echo "下载 Chromium 浏览器（使用国内镜像加速）..."
     playwright install chromium
     touch .deps_installed
 fi
@@ -1070,6 +1100,10 @@ python worker.py --server "$SERVER" "$@"
             'cd /d "%~dp0"',
             f'set SERVER={server_url}',
             '',
+            'REM Mirror acceleration for China',
+            f'set PYPI_MIRROR={pypi_mirror}',
+            f'set PLAYWRIGHT_DOWNLOAD_HOST={playwright_mirror}',
+            '',
             'REM Check Python installation',
             'python --version >nul 2>&1',
             'if errorlevel 1 (',
@@ -1091,10 +1125,11 @@ python worker.py --server "$SERVER" "$@"
             'call .venv\\Scripts\\activate.bat',
             '',
             'if not exist ".deps_installed" (',
-            '    echo Installing dependencies...',
-            '    pip install -q -r requirements-worker.txt',
-            '    echo Installing screenshot component (playwright)...',
-            '    pip install -q -r requirements-screenshot.txt',
+            '    echo Installing dependencies - using Tsinghua PyPI mirror...',
+            '    pip install -q -i %PYPI_MIRROR% -r requirements-worker.txt',
+            '    echo Installing screenshot component - playwright...',
+            '    pip install -q -i %PYPI_MIRROR% -r requirements-screenshot.txt',
+            '    echo Downloading Chromium browser - using npmmirror...',
             '    playwright install chromium',
             '    echo. > .deps_installed',
             ')',
