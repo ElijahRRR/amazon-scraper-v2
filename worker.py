@@ -369,20 +369,7 @@ class Worker:
                 config.PROXY_MODE = new_mode  # noqa
                 changes.append(f"proxy_mode={new_mode}")
 
-            # 隧道配置（远程 Worker 本地凭证为空，必须从 Server 获取）
-            for cfg_key, cfg_attr in [
-                ("tunnel_host", "TUNNEL_HOST"),
-                ("tunnel_user", "TUNNEL_USER"),
-                ("tunnel_pass", "TUNNEL_PASS"),
-            ]:
-                val = s.get(cfg_key)
-                if val and val != getattr(config, cfg_attr, ""):
-                    setattr(config, cfg_attr, val)
-                    changes.append(cfg_key)
-            tunnel_port = s.get("tunnel_port")
-            if tunnel_port and tunnel_port != config.TUNNEL_PORT:
-                config.TUNNEL_PORT = tunnel_port
-                changes.append(f"tunnel_port={tunnel_port}")
+            # 隧道通道数和轮换周期
             tunnel_channels = s.get("tunnel_channels")
             if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
                 config.TUNNEL_CHANNELS = tunnel_channels
@@ -503,11 +490,19 @@ class Worker:
         self._session_ready.set()
 
     async def _init_session_tunnel(self):
-        """隧道模式：初始化 SessionPool，预热前几个通道"""
-        logger.info(f"🔧 初始化 SessionPool (隧道, {config.TUNNEL_CHANNELS} 通道)...")
+        """隧道模式：先从 API 获取代理地址，再初始化 SessionPool"""
+        logger.info(f"🔧 初始化隧道模式 ({config.TUNNEL_CHANNELS} 通道)...")
+
+        # 1. 从 API 获取 N 个代理地址
+        assigned = await self.proxy_manager.init_tunnel_channels()
+        if assigned == 0:
+            logger.error("❌ 无法获取隧道代理，Worker 将在后续重试")
+            self._session_ready.set()
+            return
+
+        # 2. 初始化 SessionPool，预热前几个通道
         self._session_pool = SessionPool(self.proxy_manager, self.zip_code)
-        # 预热前 2 个通道（至少 2 个才能跑满 5Mbps 总带宽）
-        warmup_count = min(2, config.TUNNEL_CHANNELS)
+        warmup_count = min(2, assigned)
         warmup_ok = 0
         for ch_id in range(1, warmup_count + 1):
             session = await self._session_pool.get_session(ch_id)
@@ -715,20 +710,7 @@ class Worker:
                         config.PROXY_MODE = new_mode  # noqa
                         changes.append(f"proxy_mode={new_mode}")
 
-                    # 隧道配置
-                    for cfg_key, cfg_attr in [
-                        ("tunnel_host", "TUNNEL_HOST"),
-                        ("tunnel_user", "TUNNEL_USER"),
-                        ("tunnel_pass", "TUNNEL_PASS"),
-                    ]:
-                        val = s.get(cfg_key)
-                        if val and val != getattr(config, cfg_attr, ""):
-                            setattr(config, cfg_attr, val)
-                            changes.append(cfg_key)
-                    tunnel_port = s.get("tunnel_port")
-                    if tunnel_port and tunnel_port != config.TUNNEL_PORT:
-                        config.TUNNEL_PORT = tunnel_port
-                        changes.append(f"tunnel_port={tunnel_port}")
+                    # 隧道通道数
                     tunnel_channels = s.get("tunnel_channels")
                     if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
                         config.TUNNEL_CHANNELS = tunnel_channels
@@ -1408,7 +1390,7 @@ class Worker:
         IP 轮换监控协程（仅隧道模式）。
 
         每秒检查是否到达 IP 轮换时间点（60s 周期），
-        轮换后重建所有通道的 Session（关闭旧连接，新建走新 IP 的连接）。
+        轮换后重新从 API 获取代理地址，再重建所有通道的 Session。
         """
         logger.info(f"🔄 IP 轮换监控启动 (周期: {config.TUNNEL_ROTATE_INTERVAL}s)")
         while self._running:
@@ -1419,10 +1401,18 @@ class Worker:
 
                 rotated = await self.proxy_manager.handle_ip_rotation()
                 if rotated:
-                    logger.info("🔄 IP 轮换触发，重建所有通道 Session...")
+                    # 1. 从 API 重新获取代理地址（新 IP）
+                    logger.info("🔄 IP 轮换触发，重新获取代理...")
+                    assigned = await self.proxy_manager.refresh_tunnel_channels()
+                    if assigned == 0:
+                        logger.error("🔄 IP 轮换获取代理失败，保持旧代理继续运行")
+                        continue
+
+                    # 2. 重建所有通道的 Session（使用新代理地址）
                     if self._session_pool:
                         await self._session_pool.rebuild_all()
-                    logger.info(f"🔄 IP 轮换完成，{self._session_pool.ready_count}/{config.TUNNEL_CHANNELS} 通道就绪"
+                    ready = self._session_pool.ready_count if self._session_pool else 0
+                    logger.info(f"🔄 IP 轮换完成，{ready}/{config.TUNNEL_CHANNELS} 通道就绪"
                                 f" | 下次轮换: {self.proxy_manager.time_to_next_rotation():.0f}s")
 
             except asyncio.CancelledError:

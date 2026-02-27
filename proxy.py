@@ -1,11 +1,15 @@
 """
 Amazon 产品采集系统 v2 - 代理管理模块
 
-支持两种模式：
-- TPS 模式：快代理 TPS 隧道，每次请求自动换 IP
-- 隧道模式：快代理隧道代理，8 通道，每 60 秒轮换 IP
+支持两种模式（共用同一个快代理 API）：
+- TPS 模式：每次请求自动换 IP（API 获取 1 个代理，缓存复用）
+- 隧道模式：定时换 IP，多通道并行（API 获取 N 个代理，轮询分发）
+
+两种模式的区别仅在于代理行为（每次换 IP vs 定时换 IP），
+API 地址和凭证完全相同（都走 PROXY_API_URL_AUTH）。
 """
 import asyncio
+import re
 import time
 import logging
 from dataclasses import dataclass, field
@@ -24,18 +28,17 @@ logger = logging.getLogger(__name__)
 class ChannelState:
     """单个隧道通道的运行时状态"""
     channel_id: int                     # 通道编号 1-N
+    proxy_url: str = ""                 # 该通道的代理 URL（从 API 获取）
     blocked: bool = False               # 是否被封
     blocked_at: float = 0               # 封锁时间戳（monotonic）
     request_count: int = 0              # 当前周期内请求计数
-    last_request_at: float = 0          # 上次请求时间（用于每通道限速）
-    manual_change_count: int = 0        # 当前周期内手动换 IP 次数（上限 2）
+    last_request_at: float = 0          # 上次请求时间
 
     def reset_for_rotation(self):
-        """IP 轮换时重置通道状态"""
+        """IP 轮换时重置通道状态（proxy_url 由外部刷新）"""
         self.blocked = False
         self.blocked_at = 0
         self.request_count = 0
-        self.manual_change_count = 0
 
 
 # ==================== 代理管理器 ====================
@@ -44,7 +47,7 @@ class ProxyManager:
     """
     统一代理管理器，通过 config.PROXY_MODE 区分行为：
     - "tps": 原有 TPS 逻辑（单代理、被封换 IP）
-    - "tunnel": 多通道隧道（轮询分发、被封换通道）
+    - "tunnel": 多通道隧道（API 获取 N 个代理、轮询分发、被封换通道）
     """
 
     def __init__(self):
@@ -63,13 +66,14 @@ class ProxyManager:
         self._rotation_at: float = 0        # 下次 IP 轮换时间点
         self._all_blocked_event = asyncio.Event()
         self._all_blocked_event.set()        # 初始不阻塞
-        self._change_ip_lock = asyncio.Lock()
+        self._tunnel_init_lock = asyncio.Lock()
 
         if self.mode == "tunnel":
+            # 先创建空的通道状态，proxy_url 由 init_tunnel_channels() 填充
             for i in range(1, config.TUNNEL_CHANNELS + 1):
                 self._channels[i] = ChannelState(channel_id=i)
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
-            logger.info(f"🔧 隧道模式初始化：{config.TUNNEL_CHANNELS} 通道，"
+            logger.info(f"隧道模式初始化：{config.TUNNEL_CHANNELS} 通道，"
                         f"{config.TUNNEL_ROTATE_INTERVAL}s 轮换周期")
 
         # --- 公共统计 ---
@@ -98,7 +102,7 @@ class ProxyManager:
         报告代理被封锁。
 
         - TPS 模式: 强制刷新代理
-        - 隧道模式: 标记指定通道为被封，尝试手动换 IP
+        - 隧道模式: 标记指定通道为被封
         """
         self._total_blocked += 1
         if self.mode == "tps":
@@ -119,7 +123,8 @@ class ProxyManager:
         """获取一个可用通道（轮询分发），返回 None 表示全部被封"""
         if self.mode != "tunnel":
             return None
-        available = [ch for ch in self._channels.values() if not ch.blocked]
+        available = [ch for ch in self._channels.values()
+                     if not ch.blocked and ch.proxy_url]
         if not available:
             return None
         # round-robin
@@ -132,24 +137,61 @@ class ProxyManager:
             return False
         return all(ch.blocked for ch in self._channels.values())
 
-    def get_channel_proxy_url(self, channel_id: int) -> str:
-        """构造指定通道的代理 URL"""
-        return (f"http://{config.TUNNEL_USER}:{config.TUNNEL_PASS}:{channel_id}"
-                f"@{config.TUNNEL_HOST}:{config.TUNNEL_PORT}")
+    def get_channel_proxy_url(self, channel_id: int) -> Optional[str]:
+        """获取指定通道的代理 URL（从 API 缓存中取）"""
+        ch = self._channels.get(channel_id)
+        if ch and ch.proxy_url:
+            return ch.proxy_url
+        return None
+
+    async def init_tunnel_channels(self):
+        """
+        隧道模式启动初始化：调用 API 获取 N 个代理，填充到各通道。
+        由 Worker 在 _init_session_tunnel() 中调用。
+        """
+        async with self._tunnel_init_lock:
+            num = config.TUNNEL_CHANNELS
+            logger.info(f"🔧 从 API 获取 {num} 个隧道代理...")
+            proxies = await self._fetch_proxies_from_api(num)
+            if not proxies:
+                logger.error("❌ 获取隧道代理失败：API 返回空")
+                return 0
+
+            # 将获取到的代理分配到各通道
+            assigned = 0
+            for i, proxy_url in enumerate(proxies):
+                ch_id = i + 1
+                if ch_id in self._channels:
+                    self._channels[ch_id].proxy_url = proxy_url
+                    self._channels[ch_id].reset_for_rotation()
+                    assigned += 1
+
+            self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
+            self._total_fetched += assigned
+            logger.info(f"✅ 隧道代理就绪：{assigned}/{num} 通道已分配")
+            return assigned
+
+    async def refresh_tunnel_channels(self):
+        """
+        IP 轮换后重新获取代理，替换所有通道的 proxy_url。
+        返回成功分配的通道数。
+        """
+        return await self.init_tunnel_channels()
 
     async def handle_ip_rotation(self):
         """
-        处理 IP 轮换：重置所有通道状态，更新下次轮换时间。
+        处理 IP 轮换：检查是否到达轮换时间点。
         由 worker 的 _ip_rotation_watcher() 协程调用。
+        返回 True 表示需要轮换（调用者需执行 refresh + session rebuild）。
         """
         now = time.monotonic()
         if now < self._rotation_at:
             return False  # 还没到轮换时间
 
-        logger.info("🔄 IP 轮换：重置所有通道状态")
+        logger.info("🔄 IP 轮换时间到达，准备刷新代理...")
+        # 重置通道状态（proxy_url 稍后由 refresh_tunnel_channels 更新）
         for ch in self._channels.values():
             ch.reset_for_rotation()
-        self._rotation_at = now + config.TUNNEL_ROTATE_INTERVAL
         self._all_blocked_event.set()  # 解除全封锁等待
         return True
 
@@ -177,8 +219,8 @@ class ProxyManager:
                 "channels": {
                     ch.channel_id: {
                         "blocked": ch.blocked,
+                        "proxy": ch.proxy_url[:30] + "..." if ch.proxy_url else "",
                         "request_count": ch.request_count,
-                        "manual_changes": ch.manual_change_count,
                     }
                     for ch in self._channels.values()
                 },
@@ -186,6 +228,55 @@ class ProxyManager:
                 "blocked_channels": sum(1 for ch in self._channels.values() if ch.blocked),
             })
         return stats
+
+    # ==================== API 调用（两种模式共用）====================
+
+    def _make_api_url(self, num: int = 1) -> str:
+        """构造 API URL，修改 num 参数为指定值"""
+        url = config.PROXY_API_URL_AUTH
+        # 替换 num=N 参数
+        if "num=" in url:
+            url = re.sub(r'num=\d+', f'num={num}', url)
+        else:
+            url += f"&num={num}"
+        return url
+
+    async def _fetch_proxies_from_api(self, num: int = 1) -> List[str]:
+        """
+        调用快代理 API 获取 N 个代理。
+        返回: 代理 URL 列表，如 ["http://user:pwd@host:port", ...]
+        """
+        self._last_fetch_time = time.monotonic()
+        api_url = self._make_api_url(num)
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(api_url)
+                data = resp.json()
+        except Exception as e:
+            logger.error(f"代理 API 请求异常: {e}")
+            self._total_errors += 1
+            return []
+
+        if data.get("code") != 0:
+            logger.error(f"代理 API 返回错误: {data}")
+            self._total_errors += 1
+            return []
+
+        proxy_list = data.get("data", {}).get("proxy_list", [])
+        results = []
+        for proxy_str in proxy_list:
+            parts = proxy_str.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                results.append(f"http://{user}:{pwd}@{ip}:{port}")
+            elif len(parts) == 2:
+                ip, port = parts
+                results.append(f"http://{ip}:{port}")
+            else:
+                results.append(f"http://{proxy_str}")
+
+        return results
 
     # ==================== TPS 模式内部实现 ====================
 
@@ -209,13 +300,13 @@ class ProxyManager:
 
             for attempt in range(3):
                 try:
-                    proxy = await self._fetch_proxy_from_api()
-                    if proxy:
-                        self._current_proxy = proxy
+                    proxies = await self._fetch_proxies_from_api(num=1)
+                    if proxies:
+                        self._current_proxy = proxies[0]
                         self._proxy_expire_at = time.monotonic() + self._refresh_interval
                         self._total_fetched += 1
-                        logger.info(f"获取代理: {proxy}")
-                        return proxy
+                        logger.info(f"获取代理: {self._current_proxy}")
+                        return self._current_proxy
                     logger.warning(f"代理 API 返回空结果 (尝试 {attempt+1}/3)")
                 except Exception as e:
                     logger.error(f"获取代理失败 (尝试 {attempt+1}/3): {e}")
@@ -232,30 +323,6 @@ class ProxyManager:
         self._current_proxy = None
         return await self._tps_refresh_proxy()
 
-    async def _fetch_proxy_from_api(self) -> Optional[str]:
-        """调用快代理 TPS API 获取隧道代理"""
-        self._last_fetch_time = time.monotonic()
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(config.PROXY_API_URL_AUTH)
-            data = resp.json()
-
-        if data.get("code") == 0:
-            proxy_list = data.get("data", {}).get("proxy_list", [])
-            if proxy_list:
-                proxy_str = proxy_list[0]
-                parts = proxy_str.split(":")
-                if len(parts) == 4:
-                    ip, port, user, pwd = parts
-                    return f"http://{user}:{pwd}@{ip}:{port}"
-                elif len(parts) == 2:
-                    ip, port = parts
-                    return f"http://{ip}:{port}"
-                else:
-                    return f"http://{proxy_str}"
-        else:
-            logger.error(f"代理 API 返回错误: {data}")
-        return None
-
     # ==================== 隧道模式内部实现 ====================
 
     async def _tunnel_get_proxy(self, channel: int = None) -> Tuple[Optional[str], Optional[int]]:
@@ -269,11 +336,10 @@ class ProxyManager:
         ch_state = self._channels[channel]
         ch_state.request_count += 1
         ch_state.last_request_at = time.monotonic()
-        proxy_url = self.get_channel_proxy_url(channel)
-        return proxy_url, channel
+        return ch_state.proxy_url, channel
 
     async def _tunnel_report_blocked(self, channel: int):
-        """隧道: 标记通道被封，尝试手动换 IP"""
+        """隧道: 标记通道被封"""
         if channel is None or channel not in self._channels:
             return
         ch_state = self._channels[channel]
@@ -282,43 +348,10 @@ class ProxyManager:
         blocked_count = sum(1 for ch in self._channels.values() if ch.blocked)
         logger.warning(f"🚫 通道 {channel} 被封（已封 {blocked_count}/{len(self._channels)}）")
 
-        # 尝试手动换 IP
-        if ch_state.manual_change_count < config.TUNNEL_MAX_MANUAL_CHANGE:
-            await self._tunnel_change_ip(channel)
-
         # 检查是否全部通道被封
         if self.all_channels_blocked():
             self._all_blocked_event.clear()
             logger.error("❌ 全部通道被封！等待 IP 轮换...")
-
-    async def _tunnel_change_ip(self, channel: int):
-        """调用快代理 ChangeTpsIp API 手动换 IP"""
-        async with self._change_ip_lock:
-            ch_state = self._channels[channel]
-            if ch_state.manual_change_count >= config.TUNNEL_MAX_MANUAL_CHANGE:
-                return False
-
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(config.TUNNEL_CHANGE_IP_URL)
-                    data = resp.json()
-
-                if data.get("code") == 0:
-                    ch_state.manual_change_count += 1
-                    ch_state.blocked = False
-                    ch_state.blocked_at = 0
-                    logger.info(f"✅ 通道 {channel} 手动换 IP 成功"
-                                f"（本周期第 {ch_state.manual_change_count} 次）")
-                    # 解除全封锁状态
-                    if not self.all_channels_blocked():
-                        self._all_blocked_event.set()
-                    return True
-                else:
-                    logger.warning(f"⚠️ 通道 {channel} 手动换 IP 失败: {data}")
-                    return False
-            except Exception as e:
-                logger.error(f"❌ 通道 {channel} 手动换 IP 异常: {e}")
-                return False
 
 
 # ==================== 全局单例 ====================

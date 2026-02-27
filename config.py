@@ -102,16 +102,12 @@ PROXY_API_URL_AUTH = (
 )
 PROXY_REFRESH_INTERVAL = 30      # 代理刷新间隔（秒）
 
-# --- 隧道模式配置（快代理隧道代理）---
-# 多通道定时换 IP：8 通道，60 秒轮换，单通道 3Mbps，总 5Mbps
-TUNNEL_HOST = os.environ.get("TUNNEL_HOST", "")
-TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "15818"))
-TUNNEL_USER = os.environ.get("TUNNEL_USER", "")
-TUNNEL_PASS = os.environ.get("TUNNEL_PASS", "")
-TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))
-TUNNEL_ROTATE_INTERVAL = 60        # IP 轮换周期（秒）
-TUNNEL_MAX_MANUAL_CHANGE = 2       # 每周期手动换 IP 上限
-TUNNEL_PER_CHANNEL_QPS = 1.0       # 每通道每秒最多请求数（快代理建议）
+# --- 隧道模式配置（快代理定时换 IP）---
+# 隧道模式与 TPS 共用同一个 API (PROXY_API_URL_AUTH)，只是代理行为不同：
+# - TPS: 每次请求自动换 IP
+# - 隧道: 定时换 IP，多通道并行
+TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))  # 同时获取的代理通道数
+TUNNEL_ROTATE_INTERVAL = 60        # IP 轮换周期（秒），到期后重新获取代理
 
 # 隧道 ChangeTpsIp API（手动换 IP）
 TUNNEL_CHANGE_IP_URL = (

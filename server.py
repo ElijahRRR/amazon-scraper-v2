@@ -102,11 +102,7 @@ def _default_settings() -> dict:
         "global_max_qps": config.GLOBAL_MAX_QPS,
         # 代理模式
         "proxy_mode": config.PROXY_MODE,
-        # 隧道代理配置
-        "tunnel_host": config.TUNNEL_HOST,
-        "tunnel_port": config.TUNNEL_PORT,
-        "tunnel_user": config.TUNNEL_USER,
-        "tunnel_pass": config.TUNNEL_PASS,
+        # 隧道代理配置（共用 proxy_api_url，只需通道数和轮换周期）
         "tunnel_channels": config.TUNNEL_CHANNELS,
         "tunnel_rotate_interval": config.TUNNEL_ROTATE_INTERVAL,
     }
@@ -853,11 +849,7 @@ async def update_settings(request: Request):
         "global_max_qps":         (float, 0.5, 100),
         # 代理模式
         "proxy_mode":           (str,   None, None),
-        # 隧道代理配置
-        "tunnel_host":          (str,   None, None),
-        "tunnel_port":          (int,   1,    65535),
-        "tunnel_user":          (str,   None, None),
-        "tunnel_pass":          (str,   None, None),
+        # 隧道代理配置（共用 proxy_api_url）
         "tunnel_channels":      (int,   1,    32),
         "tunnel_rotate_interval": (int, 10,   300),
     }
