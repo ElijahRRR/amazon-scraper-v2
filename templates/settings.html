@@ -37,11 +37,61 @@
                                    value="{{ settings.screenshot_concurrency }}" min="1" max="6">
                             <small class="text-secondary">同时渲染的截图数量（共享浏览器）</small>
                         </div>
-                        <div class="col-12">
+                    </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- 代理设置 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-shield-lock"></i> 代理设置</h6>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label">代理模式</label>
+                            <select class="form-select" name="proxy_mode" id="proxyModeSelect"
+                                    onchange="toggleTunnelConfig()">
+                                <option value="tps" {{ 'selected' if settings.proxy_mode == 'tps' }}>TPS（每次换IP）</option>
+                                <option value="tunnel" {{ 'selected' if settings.proxy_mode == 'tunnel' }}>隧道（定时换IP）</option>
+                            </select>
+                            <small class="text-secondary">切换后 Worker 下次同步时生效</small>
+                        </div>
+                        <div class="col-12" id="tpsConfig" style="{{ 'display:none' if settings.proxy_mode == 'tunnel' else '' }}">
                             <label class="form-label">代理 API 地址</label>
                             <input type="text" class="form-control" name="proxy_api_url"
                                    value="{{ settings.proxy_api_url }}">
-                            <small class="text-secondary">快代理 TPS API 地址</small>
+                            <small class="text-secondary">快代理 TPS API 地址（仅 TPS 模式）</small>
+                        </div>
+                    </div>
+                    <div id="tunnelConfig" class="row g-3 mt-1" style="{{ '' if settings.proxy_mode == 'tunnel' else 'display:none' }}">
+                        <div class="col-md-5">
+                            <label class="form-label">隧道地址</label>
+                            <input type="text" class="form-control" name="tunnel_host"
+                                   value="{{ settings.tunnel_host }}" placeholder="tun.example.com">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">端口</label>
+                            <input type="number" class="form-control" name="tunnel_port"
+                                   value="{{ settings.tunnel_port }}" min="1" max="65535">
+                        </div>
+                        <div class="col-md-5">
+                            <label class="form-label">用户名</label>
+                            <input type="text" class="form-control" name="tunnel_user"
+                                   value="{{ settings.tunnel_user }}">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">密码</label>
+                            <input type="password" class="form-control" name="tunnel_pass"
+                                   value="{{ settings.tunnel_pass }}">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">通道数</label>
+                            <input type="number" class="form-control" name="tunnel_channels"
+                                   value="{{ settings.tunnel_channels }}" min="1" max="32">
+                            <small class="text-secondary">独立通道数量</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">IP 轮换周期</label>
+                            <input type="number" class="form-control" name="tunnel_rotate_interval"
+                                   value="{{ settings.tunnel_rotate_interval }}" min="10" max="300">
+                            <small class="text-secondary">秒</small>
                         </div>
                     </div>
 
@@ -208,7 +258,8 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     // 数值类型转换
     const intFields = ['max_retries', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
-                       'screenshot_concurrency', 'global_max_concurrency'];
+                       'screenshot_concurrency', 'global_max_concurrency',
+                       'tunnel_port', 'tunnel_channels', 'tunnel_rotate_interval'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold',
                          'global_max_qps'];
@@ -236,6 +287,12 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     }
     setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
 });
+
+function toggleTunnelConfig() {
+    const mode = document.getElementById('proxyModeSelect').value;
+    document.getElementById('tunnelConfig').style.display = mode === 'tunnel' ? '' : 'none';
+    document.getElementById('tpsConfig').style.display = mode === 'tps' ? '' : 'none';
+}
 
 async function resetDefaults() {
     if (!confirm('确定要恢复所有设置为默认值吗？')) return;

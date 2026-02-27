@@ -4,9 +4,13 @@ Amazon 产品采集系统 v2 - AIMD 自适应并发控制器
 
 算法：
   - Additive Increase: 一切顺利 → 并发 +1
-  - Multiplicative Decrease: 出问题 → 并发 ÷ 2
+  - Multiplicative Decrease: 出问题 → 并发 ÷ 2（TPS）或 × 0.75（隧道）
   - 带宽感知: 带宽饱和时停止增长
-  - 冷却机制: 被封后 30s 内不加速
+  - 冷却机制: 被封后 30s（TPS）或 60s（隧道）内不加速
+
+双模式差异：
+  - TPS: 被封影响全局（所有 worker 暂停），需要激进减半
+  - 隧道: 被封仅影响 1/8 通道，响应更温和
 """
 import asyncio
 import random
@@ -63,7 +67,17 @@ class AdaptiveController:
         self._min_success = config.MIN_SUCCESS_RATE
         self._block_threshold = config.BLOCK_RATE_THRESHOLD
         self._bw_soft_cap = config.BANDWIDTH_SOFT_CAP
-        self._cooldown_duration = config.COOLDOWN_AFTER_BLOCK_S
+
+        # 代理模式感知的参数
+        self._proxy_mode = config.PROXY_MODE
+        if self._proxy_mode == "tunnel":
+            # 隧道模式：封锁影响范围小（1/8），响应更温和
+            self._cooldown_duration = 60     # 匹配 IP 轮换周期
+            self._block_decrease_factor = 0.75  # ×0.75（减 25%）
+        else:
+            # TPS 模式：封锁影响全局，激进减半
+            self._cooldown_duration = config.COOLDOWN_AFTER_BLOCK_S
+            self._block_decrease_factor = 0.5   # ÷2（减半）
 
         # 恢复抖动系数（由 Worker 从 Server 同步设置，防止多 Worker 同步振荡）
         self._recovery_jitter = 0.5
@@ -140,13 +154,15 @@ class AdaptiveController:
             reason = ""
 
             if snap["block_rate"] > self._block_threshold:
-                new_c = max(self._min, self._concurrency // 2)
+                new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
                 self._cooldown_until = now + self._cooldown_duration
-                reason = f"封锁率 {snap['block_rate']:.0%} > {self._block_threshold:.0%} -> 减半+冷却{self._cooldown_duration}s"
+                action = f"×{self._block_decrease_factor}" if self._block_decrease_factor != 0.5 else "÷2"
+                reason = f"封锁率 {snap['block_rate']:.0%} > {self._block_threshold:.0%} -> {action}+冷却{self._cooldown_duration}s"
 
             elif snap["success_rate"] < self._min_success or snap["latency_p50"] > self._max_latency:
-                new_c = max(self._min, self._concurrency // 2)
-                reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> 减半"
+                new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
+                action = f"×{self._block_decrease_factor}" if self._block_decrease_factor != 0.5 else "÷2"
+                reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> {action}"
 
             elif snap["bandwidth_pct"] > self._bw_soft_cap:
                 new_c = self._concurrency

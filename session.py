@@ -3,13 +3,17 @@ Amazon 产品采集系统 v2 - Session 管理模块
 使用 curl_cffi 模拟浏览器 TLS 指纹
 正确实现邮编设置（POST 到 address-change.html）
 Cookie jar 管理
+
+支持两种工作方式：
+- TPS 模式：单个 AmazonSession，全局共享
+- 隧道模式：SessionPool，每通道独立 Session
 """
 import asyncio
 import random
 import re
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from curl_cffi.requests import AsyncSession, Response
 
@@ -28,9 +32,17 @@ class AmazonSession:
     AMAZON_BASE = "https://www.amazon.com"
     ZIP_CHANGE_URL = "https://www.amazon.com/gp/delivery/ajax/address-change.html"
 
-    def __init__(self, proxy_manager: ProxyManager, zip_code: str = None):
+    def __init__(self, proxy_manager: ProxyManager, zip_code: str = None,
+                 proxy_url: str = None):
+        """
+        Args:
+            proxy_manager: 代理管理器
+            zip_code: 配送邮编
+            proxy_url: 直接指定代理 URL（隧道模式下由 SessionPool 传入）
+        """
         self.proxy_manager = proxy_manager
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
+        self._fixed_proxy_url = proxy_url  # 隧道模式：固定代理 URL
         self._session: Optional[AsyncSession] = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -54,6 +66,10 @@ class AmazonSession:
         3. POST 设置邮编
 
         带锁保护：多个协程同时调用时，只有第一个执行初始化，其余等待并复用结果
+
+        代理获取方式：
+        - TPS 模式: 通过 proxy_manager.get_proxy() 动态获取
+        - 隧道模式: 使用构造时传入的 _fixed_proxy_url（由 SessionPool 指定通道）
         """
         async with self._init_lock:
             # 已初始化 → 直接返回（被其他协程抢先完成了）
@@ -62,7 +78,15 @@ class AmazonSession:
 
             for init_attempt in range(3):
                 try:
-                    proxy = await self.proxy_manager.get_proxy()
+                    # 获取代理
+                    if self._fixed_proxy_url:
+                        # 隧道模式：使用固定通道代理 URL
+                        proxy = self._fixed_proxy_url
+                    else:
+                        # TPS 模式：从代理管理器动态获取
+                        proxy_result = await self.proxy_manager.get_proxy()
+                        # get_proxy() 返回 (proxy_url, channel_id) 元组
+                        proxy = proxy_result[0] if isinstance(proxy_result, tuple) else proxy_result
 
                     # 创建会话（impersonate Chrome, HTTP/2 多路复用）
                     self._session = AsyncSession(
@@ -102,8 +126,9 @@ class AmazonSession:
                         logger.warning(f"⚠️ 邮编设置 3 次全失败，放弃当前代理 (初始化 {init_attempt+1}/3)")
                         await self._session.close()
                         self._session = None
-                        # 强制刷新代理（换一个出口 IP）
-                        await self.proxy_manager.report_blocked()
+                        if not self._fixed_proxy_url:
+                            # TPS 模式：强制刷新代理（换一个出口 IP）
+                            await self.proxy_manager.report_blocked()
                         await asyncio.sleep(2)
                         continue
 
@@ -113,7 +138,8 @@ class AmazonSession:
                         logger.warning(f"⚠️ 邮编验证失败（页面未反映 {self.zip_code}），放弃当前代理 (初始化 {init_attempt+1}/3)")
                         await self._session.close()
                         self._session = None
-                        await self.proxy_manager.report_blocked()
+                        if not self._fixed_proxy_url:
+                            await self.proxy_manager.report_blocked()
                         await asyncio.sleep(2)
                         continue
 
@@ -403,3 +429,144 @@ class AmazonSession:
         }
 
 
+class SessionPool:
+    """
+    隧道模式 Session 池
+
+    每个隧道通道维护一个独立的 AmazonSession，互不干扰。
+    IP 轮换（60s）后需要重建对应通道的 Session，
+    因为旧连接可能仍走旧 IP（keep-alive 问题）。
+
+    使用方式：
+        pool = SessionPool(proxy_manager, zip_code)
+        session = await pool.get_session(channel_id)
+        # ... 用 session 发送请求
+        # IP 轮换后:
+        await pool.rebuild_all()
+    """
+
+    def __init__(self, proxy_manager: ProxyManager, zip_code: str = None):
+        self.proxy_manager = proxy_manager
+        self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
+        self._sessions: Dict[int, AmazonSession] = {}
+        self._init_locks: Dict[int, asyncio.Lock] = {}
+
+        # 为每个通道预创建锁
+        for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
+            self._init_locks[ch_id] = asyncio.Lock()
+
+    async def get_session(self, channel_id: int) -> Optional[AmazonSession]:
+        """
+        获取指定通道的 Session，不存在或未就绪则创建。
+
+        Args:
+            channel_id: 通道编号 (1-N)
+
+        Returns:
+            就绪的 AmazonSession，或初始化失败时返回 None
+        """
+        # 快速路径：已有就绪的 session
+        if channel_id in self._sessions and self._sessions[channel_id].is_ready():
+            return self._sessions[channel_id]
+
+        # 确保锁存在（动态通道数变化时）
+        if channel_id not in self._init_locks:
+            self._init_locks[channel_id] = asyncio.Lock()
+
+        async with self._init_locks[channel_id]:
+            # 双重检查
+            if channel_id in self._sessions and self._sessions[channel_id].is_ready():
+                return self._sessions[channel_id]
+
+            # 关闭旧的（如果存在但不可用）
+            if channel_id in self._sessions:
+                await self._sessions[channel_id].close()
+                del self._sessions[channel_id]
+
+            # 创建新 Session
+            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            session = AmazonSession(
+                self.proxy_manager,
+                zip_code=self.zip_code,
+                proxy_url=proxy_url,
+            )
+            ok = await session.initialize()
+            if ok:
+                self._sessions[channel_id] = session
+                logger.info(f"✅ 通道 {channel_id} Session 就绪")
+                return session
+            else:
+                await session.close()
+                logger.warning(f"⚠️ 通道 {channel_id} Session 初始化失败")
+                return None
+
+    async def rebuild_session(self, channel_id: int) -> bool:
+        """
+        重建指定通道的 Session（IP 轮换后或被封后调用）。
+
+        Returns:
+            是否重建成功
+        """
+        if channel_id not in self._init_locks:
+            self._init_locks[channel_id] = asyncio.Lock()
+
+        async with self._init_locks[channel_id]:
+            # 关闭旧 session
+            if channel_id in self._sessions:
+                await self._sessions[channel_id].close()
+                del self._sessions[channel_id]
+
+            # 创建新 session
+            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            session = AmazonSession(
+                self.proxy_manager,
+                zip_code=self.zip_code,
+                proxy_url=proxy_url,
+            )
+            ok = await session.initialize()
+            if ok:
+                self._sessions[channel_id] = session
+                logger.info(f"🔄 通道 {channel_id} Session 重建成功")
+                return True
+            else:
+                await session.close()
+                logger.warning(f"⚠️ 通道 {channel_id} Session 重建失败")
+                return False
+
+    async def rebuild_all(self):
+        """
+        重建所有通道的 Session（IP 全量轮换后调用）。
+        并发执行所有通道的重建，加速初始化。
+        """
+        logger.info("🔄 重建所有通道 Session...")
+        tasks = []
+        for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
+            tasks.append(self.rebuild_session(ch_id))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success = sum(1 for r in results if r is True)
+        logger.info(f"🔄 Session 重建完成: {success}/{config.TUNNEL_CHANNELS} 通道就绪")
+
+    async def close_all(self):
+        """关闭所有 Session"""
+        for session in self._sessions.values():
+            await session.close()
+        self._sessions.clear()
+        logger.info("🔒 所有通道 Session 已关闭")
+
+    @property
+    def ready_count(self) -> int:
+        """就绪的通道数"""
+        return sum(1 for s in self._sessions.values() if s.is_ready())
+
+    @property
+    def stats(self) -> Dict:
+        """获取所有通道的统计信息"""
+        return {
+            "total_channels": config.TUNNEL_CHANNELS,
+            "ready": self.ready_count,
+            "channels": {
+                ch_id: session.stats
+                for ch_id, session in self._sessions.items()
+            },
+        }

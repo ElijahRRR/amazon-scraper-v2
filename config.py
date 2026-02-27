@@ -77,9 +77,14 @@ TASK_QUEUE_SIZE = 100            # 任务缓冲队列大小
 TASK_PREFETCH_THRESHOLD = 0.5    # 队列低于 50% 时触发预取
 
 # ============================================================
-# 代理配置（快代理 TPS）
-# 凭证通过环境变量注入：KDL_SECRET_ID / KDL_SIGNATURE
+# 代理配置
 # ============================================================
+
+# 代理模式: "tps" = 每次请求换IP, "tunnel" = 多通道定时换IP
+PROXY_MODE = os.environ.get("PROXY_MODE", "tps")
+
+# --- TPS 模式配置（快代理 TPS）---
+# 凭证通过环境变量注入：KDL_SECRET_ID / KDL_SIGNATURE
 _KDL_SECRET_ID = os.environ.get("KDL_SECRET_ID", "")
 _KDL_SIGNATURE = os.environ.get("KDL_SIGNATURE", "")
 
@@ -96,6 +101,24 @@ PROXY_API_URL_AUTH = (
     f"&num=1&format=json&sep=1&generateType=1"
 )
 PROXY_REFRESH_INTERVAL = 30      # 代理刷新间隔（秒）
+
+# --- 隧道模式配置（快代理隧道代理）---
+# 多通道定时换 IP：8 通道，60 秒轮换，单通道 3Mbps，总 5Mbps
+TUNNEL_HOST = os.environ.get("TUNNEL_HOST", "")
+TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "15818"))
+TUNNEL_USER = os.environ.get("TUNNEL_USER", "")
+TUNNEL_PASS = os.environ.get("TUNNEL_PASS", "")
+TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))
+TUNNEL_ROTATE_INTERVAL = 60        # IP 轮换周期（秒）
+TUNNEL_MAX_MANUAL_CHANGE = 2       # 每周期手动换 IP 上限
+TUNNEL_PER_CHANNEL_QPS = 1.0       # 每通道每秒最多请求数（快代理建议）
+
+# 隧道 ChangeTpsIp API（手动换 IP）
+TUNNEL_CHANGE_IP_URL = (
+    f"https://tps.kdlapi.com/api/changetpsip/"
+    f"?secret_id={_KDL_SECRET_ID}"
+    f"&signature={_KDL_SIGNATURE}"
+)
 
 # ============================================================
 # 反爬策略

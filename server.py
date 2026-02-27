@@ -100,6 +100,15 @@ def _default_settings() -> dict:
         "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
         "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
         "global_max_qps": config.GLOBAL_MAX_QPS,
+        # 代理模式
+        "proxy_mode": config.PROXY_MODE,
+        # 隧道代理配置
+        "tunnel_host": config.TUNNEL_HOST,
+        "tunnel_port": config.TUNNEL_PORT,
+        "tunnel_user": config.TUNNEL_USER,
+        "tunnel_pass": config.TUNNEL_PASS,
+        "tunnel_channels": config.TUNNEL_CHANNELS,
+        "tunnel_rotate_interval": config.TUNNEL_ROTATE_INTERVAL,
     }
 
 _SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
@@ -842,6 +851,15 @@ async def update_settings(request: Request):
         "cooldown_after_block": (int,   5,    120),
         "global_max_concurrency": (int,  2,    500),
         "global_max_qps":         (float, 0.5, 100),
+        # 代理模式
+        "proxy_mode":           (str,   None, None),
+        # 隧道代理配置
+        "tunnel_host":          (str,   None, None),
+        "tunnel_port":          (int,   1,    65535),
+        "tunnel_user":          (str,   None, None),
+        "tunnel_pass":          (str,   None, None),
+        "tunnel_channels":      (int,   1,    32),
+        "tunnel_rotate_interval": (int, 10,   300),
     }
 
     changed = False
@@ -887,6 +905,17 @@ async def update_settings(request: Request):
         return JSONResponse(
             status_code=422,
             content={"status": "error", "errors": errors,
+                     "settings": _runtime_settings, "_version": _settings_version}
+        )
+
+    # proxy_mode 枚举校验
+    if "proxy_mode" in data and _runtime_settings.get("proxy_mode") not in ("tps", "tunnel"):
+        for k, v in old_values.items():
+            _runtime_settings[k] = v
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error",
+                     "errors": [f"proxy_mode 必须为 'tps' 或 'tunnel'，收到 '{_runtime_settings.get('proxy_mode')}'"],
                      "settings": _runtime_settings, "_version": _settings_version}
         )
 
