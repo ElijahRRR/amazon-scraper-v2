@@ -82,7 +82,7 @@
       "解决成功则继续使用同一 session，失败才走原封锁逻辑",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 8,

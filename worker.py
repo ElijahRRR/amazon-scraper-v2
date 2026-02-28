@@ -1080,6 +1080,14 @@ class Worker:
 
                 # 真正被封（403/503/验证码）
                 if session.is_blocked(resp):
+                    # CAPTCHA 自动解决：如果是验证码页面，先尝试 OCR 解决
+                    if session.is_captcha(resp):
+                        captcha_solved = await session.solve_captcha(resp)
+                        if captcha_solved:
+                            logger.info(f"ASIN {asin}{ch_tag} CAPTCHA 已自动解决，重新请求")
+                            # 解决成功，不计为 blocked，直接重试（不增加 attempt）
+                            continue
+
                     self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                     attempt += 1
                     self._stats["blocked"] += 1
@@ -1121,6 +1129,13 @@ class Worker:
                 # 检查是否是拦截或空页面
                 title = result_data.get("title", "")
                 if title == "[验证码拦截]":
+                    # CAPTCHA 自动解决：尝试 OCR 识别并提交
+                    if session.is_captcha(resp):
+                        captcha_solved = await session.solve_captcha(resp)
+                        if captcha_solved:
+                            logger.info(f"ASIN {asin}{ch_tag} 解析层 CAPTCHA 已自动解决，重新请求")
+                            continue  # 不增加 attempt，直接重试
+
                     self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                     attempt += 1
                     self._stats["blocked"] += 1

@@ -25,6 +25,13 @@ from curl_cffi.requests import AsyncSession, Response
 import config
 from proxy import ProxyManager
 
+# CAPTCHA 自动识别（可选依赖）
+try:
+    from amazoncaptcha import AmazonCaptcha
+    _CAPTCHA_AVAILABLE = True
+except ImportError:
+    _CAPTCHA_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -344,6 +351,17 @@ class AmazonSession:
         """检查 session 是否已初始化并可用"""
         return self._initialized and self._session is not None
 
+    def is_captcha(self, response: Response) -> bool:
+        """检测响应是否为 CAPTCHA 验证码页面"""
+        if response is None:
+            return False
+        text = response.text
+        if "captcha" in response.url.lower():
+            return True
+        if "validateCaptcha" in text or "Robot Check" in text:
+            return True
+        return False
+
     def is_blocked(self, response: Response) -> bool:
         """检测是否被 Amazon 封锁"""
         if response is None:
@@ -355,16 +373,94 @@ class AmazonSession:
         if response.status_code in (403, 503):
             return True
 
-        text = response.text
-        if "captcha" in response.url.lower():
-            return True
-        if "validateCaptcha" in text or "Robot Check" in text:
+        if self.is_captcha(response):
             return True
 
+        text = response.text
         if "api-services-support@amazon.com" in text and len(text) < 20000:
             return True
 
         return False
+
+    async def solve_captcha(self, response: Response) -> bool:
+        """
+        尝试自动解决 CAPTCHA 验证码。
+
+        流程：
+        1. 从 CAPTCHA 页面 HTML 提取图片 URL 和表单字段
+        2. 使用 amazoncaptcha 库本地 OCR 识别
+        3. 提交解决方案到 Amazon 验证端点
+        4. 验证是否成功（返回非验证码页面）
+
+        Returns:
+            True: 验证码解决成功，session 可继续使用
+            False: 解决失败（库不可用 / 提取失败 / 识别失败 / 验证失败）
+        """
+        if not _CAPTCHA_AVAILABLE:
+            return False
+
+        if response is None or self._session is None:
+            return False
+
+        try:
+            text = response.text
+
+            # 提取 CAPTCHA 图片 URL
+            img_match = re.search(
+                r'<img[^>]+src=["\']([^"\']*captcha[^"\']*)["\']',
+                text, re.IGNORECASE
+            )
+            if not img_match:
+                logger.debug("CAPTCHA: 未找到验证码图片 URL")
+                return False
+
+            img_url = img_match.group(1)
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+
+            # 提取表单隐藏字段 (amzn, amzn-r)
+            amzn_match = re.search(r'name=["\']amzn["\'][^>]+value=["\']([^"\']*)["\']', text)
+            amzn_r_match = re.search(r'name=["\']amzn-r["\'][^>]+value=["\']([^"\']*)["\']', text)
+
+            amzn_val = amzn_match.group(1) if amzn_match else ""
+            amzn_r_val = amzn_r_match.group(1) if amzn_r_match else ""
+
+            # 使用 amazoncaptcha 本地 OCR 解决
+            captcha = AmazonCaptcha.fromlink(img_url)
+            solution = captcha.solve()
+
+            if solution == "Not solved" or not solution:
+                logger.warning(f"CAPTCHA: OCR 识别失败 (img: {img_url[:80]})")
+                return False
+
+            logger.info(f"CAPTCHA: OCR 识别结果 = '{solution}'")
+
+            # 提交验证码解决方案
+            validate_url = f"{self.AMAZON_BASE}/errors/validateCaptcha"
+            params = {
+                "amzn": amzn_val,
+                "amzn-r": amzn_r_val,
+                "field-keywords": solution,
+            }
+
+            headers = self._build_headers(referer=response.url)
+            verify_resp = await self._session.get(
+                validate_url,
+                params=params,
+                headers=headers,
+            )
+
+            # 验证是否成功：返回页面不再包含 CAPTCHA
+            if verify_resp.status_code == 200 and not self.is_captcha(verify_resp):
+                logger.info("CAPTCHA: 验证码解决成功，session 可继续使用")
+                return True
+            else:
+                logger.warning(f"CAPTCHA: 验证提交后仍被拦截 (HTTP {verify_resp.status_code})")
+                return False
+
+        except Exception as e:
+            logger.warning(f"CAPTCHA: 解决过程异常: {e}")
+            return False
 
     def is_404(self, response: Response) -> bool:
         """检测商品是否不存在"""
