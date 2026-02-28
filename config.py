@@ -55,8 +55,15 @@ PER_CHANNEL_QPS = 3.0            # DPS 隧道模式每 channel QPS（总 QPS = c
 INITIAL_CONCURRENCY = 8          # 冷启动并发（避免启动封锁风暴，10s 内爬升到甜区）
 MIN_CONCURRENCY = 4              # 并发下限
 MAX_CONCURRENCY = 16             # TPS 模式并发上限（实测：超过 16 延迟升高但带宽不增）
-TUNNEL_MAX_CONCURRENCY = 48      # DPS 隧道模式并发上限（8通道 × 6 并发/通道）
-TUNNEL_INITIAL_CONCURRENCY = 16  # DPS 隧道模式冷启动并发
+TUNNEL_MAX_CONCURRENCY = 48      # DPS 隧道模式总并发上限（所有通道合计）
+TUNNEL_INITIAL_CONCURRENCY = 8   # DPS 隧道模式冷启动并发（保守起步，AIMD 探索上升）
+
+# Per-channel 并发控制（DPS 模式下每个 channel 的 AIMD 范围）
+# 关键参数：代理带宽有限（通常 5-10Mbps），Amazon 页面 ~1.8MB
+# 每通道最多 4 并发，8 通道总计 32，由 AIMD 自适应收敛到最优
+PER_CHANNEL_INITIAL_CONCURRENCY = 2  # 每通道初始并发
+PER_CHANNEL_MIN_CONCURRENCY = 1      # 每通道最小并发
+PER_CHANNEL_MAX_CONCURRENCY = 4      # 每通道最大并发
 
 # 代理硬约束
 PROXY_BANDWIDTH_MBPS = 5         # 代理带宽上限（Mbps），用于 AIMD 带宽感知

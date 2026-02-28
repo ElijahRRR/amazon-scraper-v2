@@ -35,11 +35,15 @@ class ChannelController:
     1 个 channel 被封只影响该 channel 的并发，不波及其他。
     """
 
-    def __init__(self, channel_id: int, initial: int = 6, min_c: int = 2, max_c: int = 8):
+    def __init__(self, channel_id: int, initial: int = None, min_c: int = None, max_c: int = None):
+        # 从 config 读取 per-channel 并发参数（可通过 Settings 页面配置）
+        _initial = initial if initial is not None else getattr(config, "PER_CHANNEL_INITIAL_CONCURRENCY", 2)
+        _min = min_c if min_c is not None else getattr(config, "PER_CHANNEL_MIN_CONCURRENCY", 1)
+        _max = max_c if max_c is not None else getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 4)
         self.channel_id = channel_id
-        self._concurrency = max(min_c, min(max_c, initial))
-        self._min = min_c
-        self._max = max_c
+        self._concurrency = max(_min, min(_max, _initial))
+        self._min = _min
+        self._max = _max
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._drain_task: Optional[asyncio.Task] = None
         self.metrics = MetricsCollector(window_seconds=20.0)

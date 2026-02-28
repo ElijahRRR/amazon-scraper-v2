@@ -272,7 +272,17 @@ class ProxyManager:
             await asyncio.sleep(1.0 - elapsed)
 
         try:
+            # 从当前 proxy_api_url 动态派生 ChangeTpsIp URL（支持运行时切换凭证）
             api_url = config.TUNNEL_CHANGE_IP_URL
+            proxy_api = getattr(config, "PROXY_API_URL_AUTH", "")
+            if proxy_api and "secret_id=" in proxy_api and "signature=" in proxy_api:
+                import urllib.parse
+                parsed = urllib.parse.urlparse(proxy_api)
+                params = urllib.parse.parse_qs(parsed.query)
+                sid = params.get("secret_id", [""])[0]
+                sig = params.get("signature", [""])[0]
+                if sid and sig:
+                    api_url = f"https://tps.kdlapi.com/api/changetpsip/?secret_id={sid}&signature={sig}"
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(api_url)
                 data = resp.json()
