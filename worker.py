@@ -63,11 +63,16 @@ class Worker:
             self._rate_limiter = TokenBucket()
             self._channel_rate_limiter = None
 
-        # 自适应并发控制
+        # 自适应并发控制（tunnel 模式使用更高的并发上限）
         self._metrics = MetricsCollector()
-        max_c = concurrency or config.MAX_CONCURRENCY
+        if self._proxy_mode == "tunnel":
+            max_c = concurrency or getattr(config, "TUNNEL_MAX_CONCURRENCY", 48)
+            initial_c = getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16)
+        else:
+            max_c = concurrency or config.MAX_CONCURRENCY
+            initial_c = config.INITIAL_CONCURRENCY
         self._controller = AdaptiveController(
-            initial=config.INITIAL_CONCURRENCY,
+            initial=initial_c,
             min_c=config.MIN_CONCURRENCY,
             max_c=max_c,
             metrics=self._metrics,

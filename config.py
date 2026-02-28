@@ -54,7 +54,9 @@ PER_CHANNEL_QPS = 3.0            # DPS 隧道模式每 channel QPS（总 QPS = c
 # ============================================================
 INITIAL_CONCURRENCY = 8          # 冷启动并发（避免启动封锁风暴，10s 内爬升到甜区）
 MIN_CONCURRENCY = 4              # 并发下限
-MAX_CONCURRENCY = 16             # 并发上限（实测：超过 16 延迟升高但带宽不增）
+MAX_CONCURRENCY = 16             # TPS 模式并发上限（实测：超过 16 延迟升高但带宽不增）
+TUNNEL_MAX_CONCURRENCY = 48      # DPS 隧道模式并发上限（8通道 × 6 并发/通道）
+TUNNEL_INITIAL_CONCURRENCY = 16  # DPS 隧道模式冷启动并发
 
 # 代理硬约束
 PROXY_BANDWIDTH_MBPS = 5         # 代理带宽上限（Mbps），用于 AIMD 带宽感知
@@ -70,8 +72,8 @@ BANDWIDTH_SOFT_CAP = 0.80        # 带宽软上限
 COOLDOWN_AFTER_BLOCK_S = 15      # 被封后冷却时间（TPS 模式轮换快，不需要 30s）
 
 # 全局并发协调（多 Worker 场景）
-GLOBAL_MAX_CONCURRENCY = 16      # 匹配 MAX_CONCURRENCY
-GLOBAL_MAX_QPS = 5.0             # 匹配 TOKEN_BUCKET_RATE
+GLOBAL_MAX_CONCURRENCY = 48      # 匹配 TUNNEL_MAX_CONCURRENCY（单 Worker 场景取更高值）
+GLOBAL_MAX_QPS = 24.0            # DPS: 8 channels × 3 QPS（TPS 模式由 Server 下发配额覆盖）
 
 # 任务预取
 TASK_QUEUE_SIZE = 100            # 任务缓冲队列大小
@@ -215,7 +217,10 @@ EXPORT_COLUMN_ORDER = [
 # 启动校验
 # ============================================================
 assert MIN_CONCURRENCY <= INITIAL_CONCURRENCY <= MAX_CONCURRENCY, (
-    f"并发参数不合法: MIN={MIN_CONCURRENCY} INITIAL={INITIAL_CONCURRENCY} MAX={MAX_CONCURRENCY}"
+    f"TPS 并发参数不合法: MIN={MIN_CONCURRENCY} INITIAL={INITIAL_CONCURRENCY} MAX={MAX_CONCURRENCY}"
+)
+assert MIN_CONCURRENCY <= TUNNEL_INITIAL_CONCURRENCY <= TUNNEL_MAX_CONCURRENCY, (
+    f"Tunnel 并发参数不合法: MIN={MIN_CONCURRENCY} INITIAL={TUNNEL_INITIAL_CONCURRENCY} MAX={TUNNEL_MAX_CONCURRENCY}"
 )
 assert TARGET_LATENCY_S < MAX_LATENCY_S, (
     f"TARGET_LATENCY_S({TARGET_LATENCY_S}) 必须小于 MAX_LATENCY_S({MAX_LATENCY_S})"
