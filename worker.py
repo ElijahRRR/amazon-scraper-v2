@@ -156,9 +156,9 @@ class Worker:
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
 
-        # DPS 模式注意：控制器在 __init__ 时以 TPS 模式创建（全局信号量），
-        # 切换到 tunnel 后保留全局信号量 —— 这是正确行为：
-        # 全局 AIMD 聚合所有通道的样本，决策更可靠，per-channel AIMD 样本太少会过度振荡
+        # DPS 模式注意：控制器在 __init__ 时以 config.PROXY_MODE 模式创建，
+        # 若初始同步切换了模式，_sync_controller_mode_profile 会重建控制器
+        # tunnel 模式使用 per-channel AIMD（每通道独立信号量+metrics）
 
         # 初始化 session（此时 proxy_api_url 已从 Server 同步）
         await self._init_session()
@@ -373,18 +373,41 @@ class Worker:
                 logger.error(f"Worker-{worker_idx} 异常: {e}")
                 await asyncio.sleep(1)
 
-    def _sync_controller_mode_profile(self, mode: str):
-        """代理模式切换时，同步自适应控制器和速率限流器的模式参数。"""
-        self._controller._proxy_mode = mode
+    async def _sync_controller_mode_profile(self, mode: str):
+        """代理模式切换时，重建自适应控制器和速率限流器。
+
+        AdaptiveController 在 __init__ 时根据 config.PROXY_MODE 决定是否创建
+        per-channel 控制器。模式切换后必须重建控制器，否则 TPS→tunnel 切换后
+        仍使用全局单信号量而非 per-channel AIMD。
+        """
+        # 停止旧控制器（热切换时有正在运行的后台任务）
+        old_controller = self._controller
+        await old_controller.stop()
+
+        # 重建 AdaptiveController（config.PROXY_MODE 已在调用前设置）
         if mode == "tunnel":
-            self._controller._block_decrease_factor = 0.75
-            self._controller._cooldown_duration = 8  # DPS 多通道恢复快，冷却 8s 即可
+            max_c = getattr(config, "TUNNEL_MAX_CONCURRENCY", 48)
+            initial_c = getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16)
+        else:
+            max_c = config.MAX_CONCURRENCY
+            initial_c = config.INITIAL_CONCURRENCY
+
+        self._controller = AdaptiveController(
+            initial=initial_c,
+            min_c=config.MIN_CONCURRENCY,
+            max_c=max_c,
+            metrics=self._metrics,
+        )
+
+        # 热切换时需要立即启动新控制器的后台评估
+        if self._running:
+            await self._controller.start()
+
+        if mode == "tunnel":
             # 切换到 per-channel 限流
             self._rate_limiter = None
             self._channel_rate_limiter = ChannelRateLimiter()
         else:
-            self._controller._block_decrease_factor = 0.7
-            self._controller._cooldown_duration = config.COOLDOWN_AFTER_BLOCK_S
             # 切换到全局限流
             self._rate_limiter = TokenBucket()
             self._channel_rate_limiter = None
@@ -427,7 +450,7 @@ class Worker:
                 self._proxy_mode = new_mode
                 config.PROXY_MODE = new_mode  # noqa
                 self.proxy_manager.switch_mode(new_mode)
-                self._sync_controller_mode_profile(new_mode)
+                await self._sync_controller_mode_profile(new_mode)
                 changes.append(f"proxy_mode={new_mode}")
 
             # 若当前是隧道模式，配置变化需立即重配运行时通道集合
@@ -944,7 +967,7 @@ class Worker:
                         self._proxy_mode = new_mode
                         config.PROXY_MODE = new_mode  # noqa
                         self.proxy_manager.switch_mode(new_mode)
-                        self._sync_controller_mode_profile(new_mode)
+                        await self._sync_controller_mode_profile(new_mode)
                         changes.append(f"proxy_mode={new_mode}")
 
                         # 热切换时同步会话容器，避免 _session / _session_pool 与模式不匹配
