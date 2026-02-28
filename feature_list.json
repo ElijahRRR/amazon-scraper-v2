@@ -106,7 +106,7 @@
       "UA 与 sec-ch-ua 版本号一致",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 10,

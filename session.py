@@ -60,8 +60,11 @@ class AmazonSession:
         self._init_lock = asyncio.Lock()
         self._request_count = 0
         self._last_url: Optional[str] = None
-        # 随机选择 User-Agent
-        self._user_agent = random.choice(config.USER_AGENTS)
+        # 智能指纹轮换：随机选择浏览器 profile（UA + impersonate + sec-ch-ua 三者匹配）
+        profile = random.choice(config.BROWSER_PROFILES)
+        self._impersonate = profile["impersonate"]
+        self._sec_ch_ua = profile["sec_ch_ua"]
+        self._user_agent = random.choice(profile["user_agents"])
         # 根据 UA 选择平台
         if "Windows" in self._user_agent:
             self._platform = '"Windows"'
@@ -96,7 +99,7 @@ class AmazonSession:
                         proxy = proxy_result[0] if isinstance(proxy_result, tuple) else proxy_result
 
                     self._session = AsyncSession(
-                        impersonate=config.IMPERSONATE_BROWSER,
+                        impersonate=self._impersonate,
                         timeout=config.REQUEST_TIMEOUT,
                         proxy=proxy,
                         max_clients=config.MAX_CLIENTS,
@@ -265,7 +268,7 @@ class AmazonSession:
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": self._user_agent,
             "Upgrade-Insecure-Requests": "1",
-            "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua": self._sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self._platform,
             "Sec-Fetch-Dest": "document",
