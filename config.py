@@ -55,7 +55,7 @@ PER_CHANNEL_QPS = 3.0            # DPS 隧道模式每 channel QPS（总 QPS = c
 INITIAL_CONCURRENCY = 8          # 冷启动并发（避免启动封锁风暴，10s 内爬升到甜区）
 MIN_CONCURRENCY = 4              # 并发下限
 MAX_CONCURRENCY = 16             # TPS 模式并发上限（实测：超过 16 延迟升高但带宽不增）
-TUNNEL_MAX_CONCURRENCY = 48      # DPS 隧道模式总并发上限（所有通道合计）
+TUNNEL_MAX_CONCURRENCY = 20      # DPS 隧道模式总并发上限（实测 12-16 最优，留余量给 AIMD 探索）
 TUNNEL_INITIAL_CONCURRENCY = 8   # DPS 隧道模式冷启动并发（AIMD 从 8→15 探索最优点）
 
 # Per-channel 并发控制（DPS 模式下每个 channel 的 AIMD 范围）
