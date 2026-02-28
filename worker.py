@@ -378,7 +378,7 @@ class Worker:
         self._controller._proxy_mode = mode
         if mode == "tunnel":
             self._controller._block_decrease_factor = 0.75
-            self._controller._cooldown_duration = 60
+            self._controller._cooldown_duration = config.COOLDOWN_AFTER_BLOCK_S
             # 切换到 per-channel 限流
             self._rate_limiter = None
             self._channel_rate_limiter = ChannelRateLimiter()

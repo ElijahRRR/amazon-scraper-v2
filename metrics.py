@@ -137,8 +137,11 @@ class MetricsCollector:
         time_span = max(time_span, 1.0)
         bandwidth_bps = total_bytes / time_span
 
+        # 带宽使用率：resp_bytes 是解压后大小，估算压缩后实际传输量
+        # HTML gzip 压缩比约 6:1，取保守值 5:1
+        compressed_bps = bandwidth_bps / 5.0
         bandwidth_limit = config.PROXY_BANDWIDTH_MBPS * 1_000_000 / 8  # Mbps → Bytes/s
-        bandwidth_pct = (bandwidth_bps / bandwidth_limit) if bandwidth_limit > 0 else 0.0
+        bandwidth_pct = (compressed_bps / bandwidth_limit) if bandwidth_limit > 0 else 0.0
 
         # Gradient2: RTT gradient = long / short（>1 表示延迟上升）
         if self._ewma_initialized and self._ewma_short > 0:

@@ -14,20 +14,30 @@
 - Block Rate: 0%
 - Gradient2 RTT tracking: working (g=1.32, stable)
 
-## DPS Performance Test Results
+## DPS Performance Test Results (v2 - 带宽感知优化)
+- Batch: dps_bw_v2 (200 ASINs, 全部真实商品)
+- Success Rate: 100% (200/200)
+- Steady-state Throughput: 87 ASINs/min
+- Overall Throughput: 71 ASINs/min (含预热期)
+- p50 Latency: 6-7s (steady state)
+- p95 Latency: 10-15s
+- Block Rate: 0%
+- AIMD 振荡区间: 11-15 concurrent
+- 带宽利用率: 77-91% of 5 Mbps
+
+### DPS v1 Results (无带宽感知)
 - Batch: dps_500_test (500 ASINs)
-- Success Rate: 100%
-- Throughput: 57-79 ASINs/min (bandwidth-limited)
-- p50 Latency: 6-11s (varies with concurrency)
-- Block Rate: 0% steady state
-- Optimal concurrency: 12-16 (AIMD auto-discovers)
-- Proxy bandwidth: ~3.0 MB/s
+- Throughput: 57-79 ASINs/min
+- Optimal concurrency: 12-16
 
 ### Key DPS Optimization Findings
 1. Global AIMD > per-channel AIMD (per-channel has too few samples)
 2. TUNNEL_MAX_CONCURRENCY reduced from 48 → 20 (prevents over-expansion)
 3. AIMD expansion gradient threshold narrowed 0.95 → 0.90 (faster convergence)
-4. DPS theoretical max: ~93 ASINs/min (bandwidth ceiling), achieved 80-85% efficiency
+4. 带宽感知修复: resp_bytes 需除以压缩比(5:1)才能与网络带宽对比
+5. Gradient reduction 需带宽守护: 带宽<50%时不降速(延迟来自远端非过载)
+6. Gradient reduction 不低于初始并发(预防性降速不应过度收缩)
+7. DPS理论上限: 5Mbps / 300KB/page × 60 = 125 ASINs/min，实测达到 69.6% 效率
 
 ## Session Log
 ### Session 1 - 2026-02-28 DPS+TPS 优化方案实施
@@ -46,6 +56,13 @@
 - AIMD dead zone fix: expansion threshold 0.95 → 0.90
 - Capped TUNNEL_MAX_CONCURRENCY: 48 → 20
 - 500 ASIN stress test: 100% success, 0 failures
+
+### Session 4 - 2026-02-28 DPS 带宽感知优化
+- 修复 metrics.py 带宽计算: resp_bytes 需除以压缩比(5:1)
+- 修复 runtime_settings.json: proxy_bandwidth_mbps 从 0→5, request_timeout 30→15
+- 修复 AIMD gradient reduction: 带宽<50%时不降速, 不低于初始并发
+- 修复 _sync_controller_mode_profile: cooldown 从硬编码60→config值15
+- 200 ASIN 测试: 100% success, 87 ASINs/min steady-state, 带宽利用率 77-91%
 
 ## Feature Summary
 | # | Description | Status |

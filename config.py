@@ -59,8 +59,8 @@ TUNNEL_MAX_CONCURRENCY = 20      # DPS 隧道模式总并发上限（实测 12-1
 TUNNEL_INITIAL_CONCURRENCY = 8   # DPS 隧道模式冷启动并发（AIMD 从 8→15 探索最优点）
 
 # Per-channel 并发控制（DPS 模式下每个 channel 的 AIMD 范围）
-# 关键参数：代理带宽有限（通常 5-10Mbps），Amazon 页面 ~1.8MB
-# 每通道最多 4 并发，8 通道总计 32，由 AIMD 自适应收敛到最优
+# 带宽约束：总带宽 5Mbps，每通道上限 3Mbps
+# 压缩后每页 ~300KB，饱和 5Mbps 需要 ~13 并发连接
 PER_CHANNEL_INITIAL_CONCURRENCY = 2  # 每通道初始并发（2×8=16 起步，AIMD 收敛到最优）
 PER_CHANNEL_MIN_CONCURRENCY = 1      # 每通道最小并发
 PER_CHANNEL_MAX_CONCURRENCY = 4      # 每通道最大并发（4×8=32 上限，带宽敏感）

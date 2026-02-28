@@ -98,10 +98,11 @@ class ChannelController:
             reason = f"ch{self.channel_id} 成功率={snap['success_rate']:.0%}"
 
         # --- Gradient2 预防性降速（RTT 上升趋势）---
-        elif snap["rtt_gradient"] < 0.85:
-            # gradient = long/short < 0.85 → short RTT 比 long 高 >17% → 延迟上升
-            new_c = max(self._min, self._concurrency - 1)
-            reason = (f"ch{self.channel_id} RTT↑ gradient={snap['rtt_gradient']:.2f} "
+        # 仅在带宽饱和时才降速，且不低于初始值
+        elif snap["rtt_gradient"] < 0.85 and snap["bandwidth_pct"] > 0.50:
+            initial_c = getattr(config, "PER_CHANNEL_INITIAL_CONCURRENCY", 2)
+            new_c = max(initial_c, self._concurrency - 1)
+            reason = (f"ch{self.channel_id} RTT↑ gradient={snap['rtt_gradient']:.2f} bw={snap['bandwidth_pct']:.0%} "
                       f"(short={snap['ewma_short']:.2f}s long={snap['ewma_long']:.2f}s)")
 
         # --- 加性恢复 ---
@@ -365,9 +366,13 @@ class AdaptiveController:
                 reason = f"延迟 p50={snap['latency_p50']:.2f}s > {self._max_latency:.0f}s -> 减速"
 
             # Gradient2 预防性降速：RTT 上升趋势（short > long × 1.15）
-            elif snap["rtt_gradient"] < 0.85 and snap["ewma_short"] > 0:
-                new_c = max(self._min, self._concurrency - 1)
-                reason = (f"RTT↑ gradient={snap['rtt_gradient']:.2f} "
+            # 仅在带宽饱和（>50%）时才降速：带宽不饱和说明延迟来自远端，不是我们的过载
+            # 且不低于初始并发（gradient 是预防性的，不应过度收缩）
+            elif (snap["rtt_gradient"] < 0.85 and snap["ewma_short"] > 0
+                  and snap["bandwidth_pct"] > 0.50):
+                initial_c = config.TUNNEL_INITIAL_CONCURRENCY if self._proxy_mode == "tunnel" else config.INITIAL_CONCURRENCY
+                new_c = max(initial_c, self._concurrency - 1)
+                reason = (f"RTT↑ gradient={snap['rtt_gradient']:.2f} bw={snap['bandwidth_pct']:.0%} "
                           f"(short={snap['ewma_short']:.2f}s > long={snap['ewma_long']:.2f}s)")
 
             elif snap["bandwidth_pct"] > self._bw_soft_cap:
