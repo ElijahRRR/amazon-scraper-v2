@@ -462,6 +462,19 @@ class Worker:
                     self._channel_rate_limiter.per_channel_rate = new_ch_rate
                     changes.append(f"per_ch_QPS={new_ch_rate}")
 
+            # DPS 优化参数（初始同步）
+            new_tmc = s.get("tunnel_max_concurrency")
+            if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
+                config.TUNNEL_MAX_CONCURRENCY = new_tmc
+                if self._proxy_mode == "tunnel":
+                    self._controller._max = new_tmc
+                changes.append(f"max_c={new_tmc}")
+
+            new_tic = s.get("tunnel_initial_concurrency")
+            if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
+                config.TUNNEL_INITIAL_CONCURRENCY = new_tic
+                changes.append(f"tunnel_init_c={new_tic}")
+
             # 并发控制：min / max / initial（顺序：先设范围，再设初始值）
             new_min = s.get("min_concurrency")
             if new_min and new_min != self._controller._min:

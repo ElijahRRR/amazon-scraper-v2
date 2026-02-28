@@ -468,14 +468,21 @@ class TokenBucket:
         self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
 
     @property
+    def burst(self) -> int:
+        return self._burst
+
+    @burst.setter
+    def burst(self, value: int):
+        self._burst = max(1, value)
+
+    @property
     def rate(self) -> float:
         return self._rate
 
     @rate.setter
     def rate(self, value: float):
-        """动态调整速率"""
+        """动态调整速率（不改变 burst，burst 由调用方单独设置）"""
         self._rate = max(0.1, value)
-        self._burst = max(1, int(self._rate))
 
 
 class ChannelRateLimiter:
@@ -496,7 +503,7 @@ class ChannelRateLimiter:
         for ch_id in range(1, self._channels + 1):
             self._buckets[ch_id] = TokenBucket(
                 rate=self._per_channel_rate,
-                burst=max(4, int(self._per_channel_rate * 2)),
+                burst=self._calc_burst(self._per_channel_rate),
             )
         logger.info(
             f"Per-channel 限流器初始化: {self._channels} channels × "
@@ -509,13 +516,16 @@ class ChannelRateLimiter:
             return
         await self._buckets[channel_id].acquire()
 
+    def _calc_burst(self, rate: float) -> int:
+        return max(4, int(rate * 2))
+
     def resize(self, channels: int):
         """运行时调整 channel 数量"""
         for ch_id in range(1, channels + 1):
             if ch_id not in self._buckets:
                 self._buckets[ch_id] = TokenBucket(
                     rate=self._per_channel_rate,
-                    burst=max(2, int(self._per_channel_rate)),
+                    burst=self._calc_burst(self._per_channel_rate),
                 )
         to_remove = [k for k in self._buckets if k > channels]
         for k in to_remove:
@@ -528,7 +538,9 @@ class ChannelRateLimiter:
 
     @per_channel_rate.setter
     def per_channel_rate(self, value: float):
-        """动态调整每 channel 的 QPS"""
+        """动态调整每 channel 的 QPS 和 burst"""
         self._per_channel_rate = max(0.5, value)
+        new_burst = self._calc_burst(self._per_channel_rate)
         for bucket in self._buckets.values():
             bucket.rate = self._per_channel_rate
+            bucket.burst = new_burst
