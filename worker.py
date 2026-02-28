@@ -156,6 +156,10 @@ class Worker:
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
 
+        # DPS 模式注意：控制器在 __init__ 时以 TPS 模式创建（全局信号量），
+        # 切换到 tunnel 后保留全局信号量 —— 这是正确行为：
+        # 全局 AIMD 聚合所有通道的样本，决策更可靠，per-channel AIMD 样本太少会过度振荡
+
         # 初始化 session（此时 proxy_api_url 已从 Server 同步）
         await self._init_session()
 

@@ -105,7 +105,7 @@ class ChannelController:
                       f"(short={snap['ewma_short']:.2f}s long={snap['ewma_long']:.2f}s)")
 
         # --- 加性恢复 ---
-        elif snap["success_rate"] >= config.TARGET_SUCCESS_RATE and snap["rtt_gradient"] >= 0.95:
+        elif snap["success_rate"] >= config.TARGET_SUCCESS_RATE and snap["rtt_gradient"] >= 0.90:
             new_c = min(self._max, self._concurrency + 1)
             reason = f"ch{self.channel_id} OK gradient={snap['rtt_gradient']:.2f} +1"
         else:
@@ -376,8 +376,8 @@ class AdaptiveController:
 
             elif (snap["success_rate"] >= self._target_success
                   and snap["latency_p50"] < self._target_latency
-                  and snap["rtt_gradient"] >= 0.95):
-                # 只在 RTT gradient 稳定时才扩容
+                  and snap["rtt_gradient"] >= 0.90):
+                # gradient ≥ 0.90 即可扩容（缩小死区 [0.85, 0.90)，加速收敛）
                 if random.random() < (0.3 + 0.7 * self._recovery_jitter):
                     increment = 2
                     new_c = min(self._max, self._concurrency + increment)
