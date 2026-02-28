@@ -182,14 +182,11 @@ class AdaptiveController:
         self._channel_controllers: Dict[int, ChannelController] = {}
         if self._proxy_mode == "tunnel":
             num_ch = config.TUNNEL_CHANNELS
-            per_ch_max = max(2, self._max // num_ch)
-            per_ch_init = max(2, (initial or self._max) // num_ch)
             for ch_id in range(1, num_ch + 1):
                 self._channel_controllers[ch_id] = ChannelController(
                     channel_id=ch_id,
-                    initial=per_ch_init,
-                    min_c=2,
-                    max_c=per_ch_max,
+                    # 不传参数，让 ChannelController 自己从 config 读取
+                    # PER_CHANNEL_INITIAL_CONCURRENCY / MIN / MAX
                 )
             # 全局 concurrency = 所有 channel 之和
             self._concurrency = sum(
@@ -499,7 +496,7 @@ class ChannelRateLimiter:
         for ch_id in range(1, self._channels + 1):
             self._buckets[ch_id] = TokenBucket(
                 rate=self._per_channel_rate,
-                burst=max(2, int(self._per_channel_rate)),
+                burst=max(4, int(self._per_channel_rate * 2)),
             )
         logger.info(
             f"Per-channel 限流器初始化: {self._channels} channels × "
