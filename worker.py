@@ -78,8 +78,9 @@ class Worker:
             metrics=self._metrics,
         )
 
-        # 任务队列（流水线核心）
-        self._task_queue: asyncio.Queue = None
+        # 任务队列（优先级队列：首次请求 priority=0 优先处理，重试请求 priority=1 低优先级）
+        self._task_queue: asyncio.PriorityQueue = None
+        self._task_seq = 0  # 单调递增序号，同优先级内 FIFO
         self._queue_size = getattr(config, "TASK_QUEUE_SIZE", 100)
         self._prefetch_threshold = getattr(config, "TASK_PREFETCH_THRESHOLD", 0.5)
 
@@ -148,7 +149,7 @@ class Worker:
         self._stats["start_time"] = time.time()
 
         # 初始化队列
-        self._task_queue = asyncio.Queue(maxsize=self._queue_size)
+        self._task_queue = asyncio.PriorityQueue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
         self._screenshot_queue = asyncio.Queue(maxsize=200)  # 有界队列，防止内存无限增长
 
@@ -188,9 +189,11 @@ class Worker:
         """停止 Worker"""
         self._running = False
         # 向任务队列放入 None 哨兵，唤醒所有等待的 worker
+        # 哨兵用 priority=-1 确保最先被取出
         for _ in range(self._controller._max):
             try:
-                self._task_queue.put_nowait(None)
+                self._task_seq += 1
+                self._task_queue.put_nowait((-1, self._task_seq, None))
             except (asyncio.QueueFull, AttributeError):
                 break
 
@@ -243,7 +246,9 @@ class Worker:
                             dropped_ids = []
                             while not self._task_queue.empty():
                                 try:
-                                    old_task = self._task_queue.get_nowait()
+                                    item = self._task_queue.get_nowait()
+                                    # 从优先级元组中提取 task dict
+                                    old_task = item[2] if isinstance(item, tuple) else item
                                     if old_task and isinstance(old_task, dict):
                                         dropped_ids.append(old_task["id"])
                                 except asyncio.QueueEmpty:
@@ -254,7 +259,10 @@ class Worker:
                                 asyncio.create_task(self._release_tasks(dropped_ids))
 
                         for task in tasks:
-                            await self._task_queue.put(task)
+                            # 首次请求 priority=0（优先处理），重试请求 priority=1（低优先级）
+                            prio = 0 if task.get("retry_count", 0) == 0 else 1
+                            self._task_seq += 1
+                            await self._task_queue.put((prio, self._task_seq, task))
                         logger.debug(f"📡 补给 {len(tasks)} 个任务 (队列: {self._task_queue.qsize()})")
                     else:
                         # 真正没有待处理任务 → 温和退避（上限 5s，避免长时间空闲）
@@ -335,15 +343,18 @@ class Worker:
 
         while self._running:
             try:
-                # 1. 从队列取任务（最多等 5 秒，不占信号量）
+                # 1. 从优先级队列取任务（最多等 5 秒，不占信号量）
                 try:
-                    task = await asyncio.wait_for(
+                    item = await asyncio.wait_for(
                         self._task_queue.get(), timeout=5.0
                     )
                 except asyncio.TimeoutError:
                     continue
 
-                # 2. 哨兵值 → 退出
+                # 2. 从优先级元组中提取 task dict: (priority, seq, task)
+                task = item[2] if isinstance(item, tuple) else item
+
+                # 3. 哨兵值 → 退出
                 if task is None:
                     break
 
