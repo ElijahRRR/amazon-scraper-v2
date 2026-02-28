@@ -3,10 +3,13 @@ Amazon 产品采集系统 v2 - 代理管理模块
 
 支持两种模式（共用同一个快代理 API）：
 - TPS 模式：每次请求自动换 IP（API 获取 1 个代理，缓存复用）
-- 隧道模式：定时换 IP，多通道并行（API 获取 N 个代理，轮询分发）
+- 隧道模式：固定隧道地址，所有请求共享同一出口 IP，定时自动换 IP
 
-两种模式的区别仅在于代理行为（每次换 IP vs 定时换 IP），
-API 地址和凭证完全相同（都走 PROXY_API_URL_AUTH）。
+隧道模式核心规则（快代理 TPS 隧道）：
+1. 隧道代理地址固定，启动时获取一次即可
+2. 所有请求走同一出口 IP（不是每通道不同 IP）
+3. 每个换 IP 周期（如 60s）自动切换出口 IP
+4. 每个周期内可调 ChangeTpsIp API 手动换 IP（最多 2 次）
 """
 import asyncio
 import re
@@ -22,20 +25,26 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# ==================== 通道状态（隧道模式专用）====================
+# ==================== 会话槽位状态（隧道模式专用）====================
 
 @dataclass
 class ChannelState:
-    """单个隧道通道的运行时状态"""
-    channel_id: int                     # 通道编号 1-N
-    proxy_url: str = ""                 # 该通道的代理 URL（从 API 获取）
-    blocked: bool = False               # 是否被封
+    """
+    单个会话槽位的运行时状态。
+
+    注意：在隧道模式下，"通道" 实际上是 Session 槽位，
+    所有槽位共享同一个隧道代理地址和出口 IP，
+    但每个槽位有独立的 Cookie / 指纹，用于分散 Amazon 反爬风险。
+    """
+    channel_id: int                     # 槽位编号 1-N
+    proxy_url: str = ""                 # 隧道代理地址（所有槽位相同）
+    blocked: bool = False               # 该 Session 是否被封（Cookie 级别）
     blocked_at: float = 0               # 封锁时间戳（monotonic）
     request_count: int = 0              # 当前周期内请求计数
     last_request_at: float = 0          # 上次请求时间
 
     def reset_for_rotation(self):
-        """IP 轮换时重置通道状态（proxy_url 由外部刷新）"""
+        """IP 轮换时重置槽位状态"""
         self.blocked = False
         self.blocked_at = 0
         self.request_count = 0
@@ -46,8 +55,8 @@ class ChannelState:
 class ProxyManager:
     """
     统一代理管理器，通过 config.PROXY_MODE 区分行为：
-    - "tps": 原有 TPS 逻辑（单代理、被封换 IP）
-    - "tunnel": 多通道隧道（API 获取 N 个代理、轮询分发、被封换通道）
+    - "tps": 原有 TPS 逻辑（每次请求换 IP，单代理缓存）
+    - "tunnel": 隧道模式（固定隧道地址，定时换 IP，多 Session 槽位）
     """
 
     def __init__(self):
@@ -61,25 +70,84 @@ class ProxyManager:
         self._fetch_lock = asyncio.Lock()
 
         # --- 隧道模式状态 ---
+        self._tunnel_proxy_url: str = ""     # 固定隧道地址（所有请求共享）
         self._channels: Dict[int, ChannelState] = {}
-        self._round_robin_index = 0         # 轮询计数器
-        self._rotation_at: float = 0        # 下次 IP 轮换时间点
+        self._round_robin_index = 0          # 轮询计数器
+        self._rotation_at: float = 0         # 下次 IP 轮换时间点
         self._all_blocked_event = asyncio.Event()
-        self._all_blocked_event.set()        # 初始不阻塞
+        self._all_blocked_event.set()         # 初始不阻塞
         self._tunnel_init_lock = asyncio.Lock()
+        self._change_ip_count = 0            # 当前周期内 ChangeTpsIp 调用次数
+        self._last_change_ip_at: float = 0   # 上次 ChangeTpsIp 时间
 
         if self.mode == "tunnel":
-            # 先创建空的通道状态，proxy_url 由 init_tunnel_channels() 填充
             for i in range(1, config.TUNNEL_CHANNELS + 1):
                 self._channels[i] = ChannelState(channel_id=i)
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
-            logger.info(f"隧道模式初始化：{config.TUNNEL_CHANNELS} 通道，"
+            logger.info(f"隧道模式初始化：{config.TUNNEL_CHANNELS} 会话槽位，"
                         f"{config.TUNNEL_ROTATE_INTERVAL}s 轮换周期")
 
         # --- 公共统计 ---
         self._total_fetched = 0
         self._total_errors = 0
         self._total_blocked = 0
+
+    def switch_mode(self, new_mode: str):
+        """运行时切换代理模式（settings sync 检测到 proxy_mode 变化时调用）"""
+        if new_mode == self.mode:
+            return
+        old_mode = self.mode
+        self.mode = new_mode
+        if new_mode == "tunnel":
+            self._channels.clear()
+            self._tunnel_proxy_url = ""
+            for i in range(1, config.TUNNEL_CHANNELS + 1):
+                self._channels[i] = ChannelState(channel_id=i)
+            self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
+            self._all_blocked_event.set()
+            self._change_ip_count = 0
+            logger.info(f"代理模式切换: {old_mode} → {new_mode} "
+                        f"({config.TUNNEL_CHANNELS} 会话槽位)")
+        else:
+            self._channels.clear()
+            self._tunnel_proxy_url = ""
+            self._current_proxy = None
+            self._proxy_expire_at = 0
+            logger.info(f"代理模式切换: {old_mode} → {new_mode}")
+
+    def reconfigure_tunnel(self, channels: int, rotate_interval: int):
+        """
+        运行时重配隧道参数（仅 tunnel 模式）：
+        - 调整会话槽位数量
+        - 重置下一次轮换计时
+        """
+        if self.mode != "tunnel":
+            return
+
+        channels = max(1, int(channels))
+        rotate_interval = max(10, int(rotate_interval))
+
+        old_channels = self._channels
+        new_channels: Dict[int, ChannelState] = {}
+        for ch_id in range(1, channels + 1):
+            if ch_id in old_channels:
+                ch = old_channels[ch_id]
+                ch.proxy_url = self._tunnel_proxy_url
+                new_channels[ch_id] = ch
+            else:
+                new_channels[ch_id] = ChannelState(
+                    channel_id=ch_id,
+                    proxy_url=self._tunnel_proxy_url,
+                )
+
+        self._channels = new_channels
+        self._round_robin_index = 0
+        self._rotation_at = time.monotonic() + rotate_interval
+
+        if all(not ch.blocked for ch in self._channels.values()):
+            self._all_blocked_event.set()
+
+        logger.info(f"隧道参数重配：channels={channels}, rotate={rotate_interval}s")
 
     # ==================== 公共接口 ====================
 
@@ -89,7 +157,7 @@ class ProxyManager:
 
         返回: (proxy_url, channel_id)
         - TPS 模式: channel_id 固定为 None
-        - 隧道模式: channel_id 为分配的通道编号
+        - 隧道模式: channel_id 为分配的槽位编号，proxy_url 为统一隧道地址
         """
         if self.mode == "tps":
             proxy = await self._tps_get_proxy()
@@ -99,10 +167,10 @@ class ProxyManager:
 
     async def report_blocked(self, channel: int = None):
         """
-        报告代理被封锁。
+        报告被封锁。
 
         - TPS 模式: 强制刷新代理
-        - 隧道模式: 标记指定通道为被封
+        - 隧道模式: 标记该 Session 槽位为被封（Cookie 级别）
         """
         self._total_blocked += 1
         if self.mode == "tps":
@@ -111,88 +179,142 @@ class ProxyManager:
             return await self._tunnel_report_blocked(channel)
 
     async def wait_for_rotation(self):
-        """等待 IP 轮换（仅隧道模式，全部通道被封时调用）"""
+        """等待 IP 轮换（仅隧道模式，全部槽位被封时调用）"""
         if self.mode != "tunnel":
             return
+        # 全部被封 → 尝试手动换 IP
+        changed = await self.change_ip()
+        if changed:
+            return  # 换 IP 成功，立即返回
+        # 手动换 IP 失败（次数用尽等），等待自动轮换
         remaining = max(0, self._rotation_at - time.monotonic())
         if remaining > 0:
-            logger.info(f"⏳ 全部通道被封，等待 IP 轮换（{remaining:.0f}s）...")
+            logger.info(f"⏳ 全部槽位被封且手动换 IP 不可用，"
+                        f"等待自动轮换（{remaining:.0f}s）...")
             await asyncio.sleep(remaining)
 
     def get_available_channel(self) -> Optional[int]:
-        """获取一个可用通道（轮询分发），返回 None 表示全部被封"""
+        """获取一个可用槽位（轮询分发），返回 None 表示全部被封"""
         if self.mode != "tunnel":
             return None
         available = [ch for ch in self._channels.values()
                      if not ch.blocked and ch.proxy_url]
         if not available:
             return None
-        # round-robin
         self._round_robin_index = (self._round_robin_index + 1) % len(available)
         return available[self._round_robin_index].channel_id
 
     def all_channels_blocked(self) -> bool:
-        """是否全部通道都被封（仅隧道模式）"""
+        """是否全部槽位都被封（仅隧道模式）"""
         if self.mode != "tunnel":
             return False
         return all(ch.blocked for ch in self._channels.values())
 
     def get_channel_proxy_url(self, channel_id: int) -> Optional[str]:
-        """获取指定通道的代理 URL（从 API 缓存中取）"""
+        """获取指定槽位的代理 URL"""
         ch = self._channels.get(channel_id)
         if ch and ch.proxy_url:
             return ch.proxy_url
         return None
 
-    async def init_tunnel_channels(self):
+    def get_tunnel_proxy_url(self) -> str:
+        """获取统一隧道代理地址"""
+        return self._tunnel_proxy_url
+
+    async def init_tunnel(self):
         """
-        隧道模式启动初始化：调用 API 获取 N 个代理，填充到各通道。
-        由 Worker 在 _init_session_tunnel() 中调用。
+        隧道模式启动初始化：
+        1. 调 API 获取隧道代理地址（只需 1 个，所有请求共享）
+        2. 将同一地址分配给所有会话槽位
         """
         async with self._tunnel_init_lock:
-            num = config.TUNNEL_CHANNELS
-            logger.info(f"🔧 从 API 获取 {num} 个隧道代理...")
-            proxies = await self._fetch_proxies_from_api(num)
+            logger.info("🔧 获取隧道代理地址...")
+            proxies = await self._fetch_proxies_from_api(num=1)
             if not proxies:
                 logger.error("❌ 获取隧道代理失败：API 返回空")
                 return 0
 
-            # 将获取到的代理分配到各通道
-            assigned = 0
-            for i, proxy_url in enumerate(proxies):
-                ch_id = i + 1
-                if ch_id in self._channels:
-                    self._channels[ch_id].proxy_url = proxy_url
-                    self._channels[ch_id].reset_for_rotation()
-                    assigned += 1
+            self._tunnel_proxy_url = proxies[0]
+            # 所有槽位使用同一个隧道地址
+            for ch in self._channels.values():
+                ch.proxy_url = self._tunnel_proxy_url
+                ch.reset_for_rotation()
 
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
-            self._total_fetched += assigned
-            logger.info(f"✅ 隧道代理就绪：{assigned}/{num} 通道已分配")
-            return assigned
+            self._change_ip_count = 0
+            self._total_fetched += 1
+            logger.info(f"✅ 隧道代理就绪：{self._tunnel_proxy_url} "
+                        f"→ {len(self._channels)} 个会话槽位")
+            return len(self._channels)
+
+    # 向后兼容
+    async def init_tunnel_channels(self):
+        return await self.init_tunnel()
 
     async def refresh_tunnel_channels(self):
+        return await self.init_tunnel()
+
+    async def change_ip(self) -> bool:
         """
-        IP 轮换后重新获取代理，替换所有通道的 proxy_url。
-        返回成功分配的通道数。
+        调用 ChangeTpsIp API 手动换 IP。
+        规则：每个轮换周期内最多调用 2 次，最快 1 秒 1 次。
+        返回 True 表示换 IP 成功。
         """
-        return await self.init_tunnel_channels()
+        # 检查周期内调用次数
+        if self._change_ip_count >= 2:
+            logger.warning("⚠️ ChangeTpsIp 本周期已调用 2 次，跳过")
+            return False
+
+        # 最快 1 秒 1 次
+        now = time.monotonic()
+        elapsed = now - self._last_change_ip_at
+        if elapsed < 1.0:
+            await asyncio.sleep(1.0 - elapsed)
+
+        try:
+            api_url = config.TUNNEL_CHANGE_IP_URL
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(api_url)
+                data = resp.json()
+
+            if data.get("code") == 0:
+                new_ip = data.get("data", {}).get("new_ip", "unknown")
+                self._change_ip_count += 1
+                self._last_change_ip_at = time.monotonic()
+                # 重置所有槽位的封锁状态（新 IP 可能绕过封锁）
+                for ch in self._channels.values():
+                    ch.reset_for_rotation()
+                self._all_blocked_event.set()
+                logger.info(f"🔄 ChangeTpsIp 成功: 新 IP={new_ip} "
+                            f"(本周期第 {self._change_ip_count} 次)")
+                return True
+            else:
+                msg = data.get("msg", str(data))
+                logger.warning(f"⚠️ ChangeTpsIp 失败: {msg}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ ChangeTpsIp 异常: {e}")
+            return False
 
     async def handle_ip_rotation(self):
         """
         处理 IP 轮换：检查是否到达轮换时间点。
-        由 worker 的 _ip_rotation_watcher() 协程调用。
-        返回 True 表示需要轮换（调用者需执行 refresh + session rebuild）。
+        隧道代理地址不变，出口 IP 由代理服务自动切换。
+        返回 True 表示 IP 已轮换（调用者需 rebuild sessions）。
         """
         now = time.monotonic()
         if now < self._rotation_at:
-            return False  # 还没到轮换时间
+            return False
 
-        logger.info("🔄 IP 轮换时间到达，准备刷新代理...")
-        # 重置通道状态（proxy_url 稍后由 refresh_tunnel_channels 更新）
+        logger.info("🔄 IP 轮换时间到达，出口 IP 已自动切换")
+        # 重置所有槽位状态
         for ch in self._channels.values():
             ch.reset_for_rotation()
-        self._all_blocked_event.set()  # 解除全封锁等待
+        self._all_blocked_event.set()
+        # 重置周期计数器
+        self._change_ip_count = 0
+        self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
         return True
 
     def time_to_next_rotation(self) -> float:
@@ -216,16 +338,17 @@ class ProxyManager:
             })
         else:
             stats.update({
+                "tunnel_proxy": self._tunnel_proxy_url[:30] + "..." if self._tunnel_proxy_url else "",
                 "channels": {
                     ch.channel_id: {
                         "blocked": ch.blocked,
-                        "proxy": ch.proxy_url[:30] + "..." if ch.proxy_url else "",
                         "request_count": ch.request_count,
                     }
                     for ch in self._channels.values()
                 },
                 "next_rotation_in": int(self.time_to_next_rotation()),
                 "blocked_channels": sum(1 for ch in self._channels.values() if ch.blocked),
+                "change_ip_remaining": max(0, 2 - self._change_ip_count),
             })
         return stats
 
@@ -234,7 +357,6 @@ class ProxyManager:
     def _make_api_url(self, num: int = 1) -> str:
         """构造 API URL，修改 num 参数为指定值"""
         url = config.PROXY_API_URL_AUTH
-        # 替换 num=N 参数
         if "num=" in url:
             url = re.sub(r'num=\d+', f'num={num}', url)
         else:
@@ -243,7 +365,7 @@ class ProxyManager:
 
     async def _fetch_proxies_from_api(self, num: int = 1) -> List[str]:
         """
-        调用快代理 API 获取 N 个代理。
+        调用快代理 API 获取代理地址。
         返回: 代理 URL 列表，如 ["http://user:pwd@host:port", ...]
         """
         self._last_fetch_time = time.monotonic()
@@ -326,11 +448,10 @@ class ProxyManager:
     # ==================== 隧道模式内部实现 ====================
 
     async def _tunnel_get_proxy(self, channel: int = None) -> Tuple[Optional[str], Optional[int]]:
-        """隧道: 获取指定通道（或自动分配通道）的代理 URL"""
+        """隧道: 获取指定槽位（或自动分配）的代理 URL"""
         if channel is None:
             channel = self.get_available_channel()
         if channel is None:
-            # 全部通道被封
             return None, None
 
         ch_state = self._channels[channel]
@@ -339,19 +460,19 @@ class ProxyManager:
         return ch_state.proxy_url, channel
 
     async def _tunnel_report_blocked(self, channel: int):
-        """隧道: 标记通道被封"""
+        """隧道: 标记 Session 槽位被封（Cookie 级别封锁）"""
         if channel is None or channel not in self._channels:
             return
         ch_state = self._channels[channel]
         ch_state.blocked = True
         ch_state.blocked_at = time.monotonic()
         blocked_count = sum(1 for ch in self._channels.values() if ch.blocked)
-        logger.warning(f"🚫 通道 {channel} 被封（已封 {blocked_count}/{len(self._channels)}）")
+        logger.warning(f"🚫 槽位 {channel} Session 被封"
+                       f"（已封 {blocked_count}/{len(self._channels)}）")
 
-        # 检查是否全部通道被封
         if self.all_channels_blocked():
             self._all_blocked_event.clear()
-            logger.error("❌ 全部通道被封！等待 IP 轮换...")
+            logger.error("❌ 全部 Session 被封！尝试 ChangeTpsIp...")
 
 
 # ==================== 全局单例 ====================

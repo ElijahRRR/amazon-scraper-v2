@@ -26,6 +26,12 @@
                                    value="{{ settings.max_retries }}" min="1" max="10">
                         </div>
                         <div class="col-md-4">
+                            <label class="form-label">请求超时 (秒)</label>
+                            <input type="number" class="form-control" name="request_timeout"
+                                   value="{{ settings.request_timeout }}" min="5" max="60">
+                            <small class="text-secondary">隧道模式建议 25s，TPS 模式 15s</small>
+                        </div>
+                        <div class="col-md-4">
                             <label class="form-label">Session 轮换频率</label>
                             <input type="number" class="form-control" name="session_rotate_every"
                                    value="{{ settings.session_rotate_every }}" min="50" max="10000">
@@ -51,7 +57,7 @@
                                 <option value="tps" {{ 'selected' if settings.proxy_mode == 'tps' }}>TPS（每次换IP）</option>
                                 <option value="tunnel" {{ 'selected' if settings.proxy_mode == 'tunnel' }}>隧道（定时换IP）</option>
                             </select>
-                            <small class="text-secondary">切换后 Worker 下次同步时生效</small>
+                            <small class="text-secondary">切换模式将联动调整 QPS/并发/带宽等参数</small>
                         </div>
                         <div class="col-8">
                             <label class="form-label">代理 API 地址</label>
@@ -150,6 +156,12 @@
                                    value="{{ settings.cooldown_after_block }}" min="5" max="120">
                             <small class="text-secondary">秒，被封后暂停加速</small>
                         </div>
+                        <div class="col-md-3">
+                            <label class="form-label">带宽上限 (Mbps)</label>
+                            <input type="number" class="form-control" name="proxy_bandwidth_mbps"
+                                   value="{{ settings.proxy_bandwidth_mbps }}" min="0" max="100">
+                            <small class="text-secondary">0=不限，用于 AIMD 带宽感知</small>
+                        </div>
                         <div class="col-md-4">
                             <label class="form-label">目标成功率</label>
                             <input type="number" class="form-control" name="target_success_rate"
@@ -236,9 +248,9 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     const formData = new FormData(e.target);
     const data = Object.fromEntries(formData);
     // 数值类型转换
-    const intFields = ['max_retries', 'session_rotate_every', 'initial_concurrency',
+    const intFields = ['max_retries', 'request_timeout', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
-                       'screenshot_concurrency', 'global_max_concurrency',
+                       'proxy_bandwidth_mbps', 'screenshot_concurrency', 'global_max_concurrency',
                        'tunnel_channels', 'tunnel_rotate_interval'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold',
@@ -257,20 +269,72 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
         if (resp.ok) {
             resultDiv.style.display = 'block';
             resultDiv.innerHTML = `<div class="alert alert-success">设置已保存，Worker 将在 30 秒内自动同步</div>`;
+            // 保存成功后更新初始模式基线 & 移除高亮
+            _initialMode = document.getElementById('proxyModeSelect').value;
+            for (const k of Object.keys(_modePresets.tps)) {
+                const el = document.querySelector(`[name="${k}"]`);
+                if (el) el.style.border = '';
+            }
+            // 用服务器返回的最新值刷新表单
+            const s = result.settings;
+            if (s) for (const [k,v] of Object.entries(s)) {
+                const el = document.querySelector(`[name="${k}"]`);
+                if (el) el.value = v;
+            }
         } else {
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-danger">保存失败</div>';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-danger';
+            alertDiv.append('保存失败：');
+            const errs = Array.isArray(result.errors) && result.errors.length > 0
+                ? result.errors
+                : ['未知错误'];
+            errs.forEach((msg, idx) => {
+                if (idx > 0) alertDiv.appendChild(document.createElement('br'));
+                alertDiv.append(document.createTextNode(String(msg)));
+            });
+            resultDiv.innerHTML = '';
+            resultDiv.appendChild(alertDiv);
         }
     } catch(err) {
         resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<div class="alert alert-danger">网络错误: ${err.message}</div>`;
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = `网络错误: ${err.message}`;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
     }
     setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
 });
 
+const _modePresets = {
+    tps:    { token_bucket_rate: 5, initial_concurrency: 8, min_concurrency: 4,
+              cooldown_after_block: 15, proxy_bandwidth_mbps: 0, global_max_qps: 5,
+              request_timeout: 15 },
+    tunnel: { token_bucket_rate: 15, initial_concurrency: 28, min_concurrency: 12,
+              max_concurrency: 80, cooldown_after_block: 60, proxy_bandwidth_mbps: 0,
+              global_max_qps: 15, request_timeout: 45, target_latency: 25,
+              max_latency: 35, min_success_rate: 0.75 }
+};
+let _initialMode = '{{ settings.proxy_mode }}';
+
 function toggleTunnelConfig() {
     const mode = document.getElementById('proxyModeSelect').value;
     document.getElementById('tunnelConfig').style.display = mode === 'tunnel' ? '' : 'none';
+    // 模式切换时自动填充预设值并高亮
+    if (mode !== _initialMode) {
+        const preset = _modePresets[mode] || {};
+        for (const [k, v] of Object.entries(preset)) {
+            const el = document.querySelector(`[name="${k}"]`);
+            if (el) { el.value = v; el.style.border = '2px solid #f59e0b'; }
+        }
+    } else {
+        // 切回原模式，移除高亮
+        for (const k of Object.keys(_modePresets.tps)) {
+            const el = document.querySelector(`[name="${k}"]`);
+            if (el) el.style.border = '';
+        }
+    }
 }
 
 async function resetDefaults() {
@@ -289,7 +353,11 @@ async function resetDefaults() {
         }
     } catch(err) {
         resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<div class="alert alert-danger">网络错误: ${err.message}</div>`;
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = `网络错误: ${err.message}`;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
     }
 }
 </script>

@@ -6,7 +6,12 @@ Cookie jar 管理
 
 支持两种工作方式：
 - TPS 模式：单个 AmazonSession，全局共享
-- 隧道模式：SessionPool，每通道独立 Session
+- 隧道模式：SessionPool，多 Session 槽位（共享同一隧道代理地址）
+
+隧道模式关键设计：
+- 所有 Session 使用同一个隧道代理地址（出口 IP 相同）
+- 每个 Session 有独立的 Cookie / 指纹，分散 Amazon 反爬风险
+- IP 轮换后滚动重建：逐个替换 Session，不中断服务
 """
 import asyncio
 import random
@@ -38,7 +43,7 @@ class AmazonSession:
         Args:
             proxy_manager: 代理管理器
             zip_code: 配送邮编
-            proxy_url: 直接指定代理 URL（隧道模式下由 SessionPool 传入）
+            proxy_url: 直接指定代理 URL（隧道模式由 SessionPool 传入）
         """
         self.proxy_manager = proxy_manager
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
@@ -69,26 +74,20 @@ class AmazonSession:
 
         代理获取方式：
         - TPS 模式: 通过 proxy_manager.get_proxy() 动态获取
-        - 隧道模式: 使用构造时传入的 _fixed_proxy_url（由 SessionPool 指定通道）
+        - 隧道模式: 使用构造时传入的 _fixed_proxy_url（统一隧道地址）
         """
         async with self._init_lock:
-            # 已初始化 → 直接返回（被其他协程抢先完成了）
             if self._initialized:
                 return True
 
             for init_attempt in range(3):
                 try:
-                    # 获取代理
                     if self._fixed_proxy_url:
-                        # 隧道模式：使用固定通道代理 URL
                         proxy = self._fixed_proxy_url
                     else:
-                        # TPS 模式：从代理管理器动态获取
                         proxy_result = await self.proxy_manager.get_proxy()
-                        # get_proxy() 返回 (proxy_url, channel_id) 元组
                         proxy = proxy_result[0] if isinstance(proxy_result, tuple) else proxy_result
 
-                    # 创建会话（impersonate Chrome, HTTP/2 多路复用）
                     self._session = AsyncSession(
                         impersonate=config.IMPERSONATE_BROWSER,
                         timeout=config.REQUEST_TIMEOUT,
@@ -104,7 +103,6 @@ class AmazonSession:
                         headers=headers,
                     )
 
-                    # 接受所有 2xx 响应（200/202 等都有效）
                     if resp.status_code >= 300:
                         logger.warning(f"首页返回 {resp.status_code}，重试 ({init_attempt+1}/3)")
                         await self._session.close()
@@ -122,17 +120,15 @@ class AmazonSession:
                         await asyncio.sleep(1)
 
                     if not zip_ok:
-                        # 邮编设置 3 次全失败 → 放弃该 session，换代理重试
                         logger.warning(f"⚠️ 邮编设置 3 次全失败，放弃当前代理 (初始化 {init_attempt+1}/3)")
                         await self._session.close()
                         self._session = None
                         if not self._fixed_proxy_url:
-                            # TPS 模式：强制刷新代理（换一个出口 IP）
                             await self.proxy_manager.report_blocked()
                         await asyncio.sleep(2)
                         continue
 
-                    # 3. 验证邮编是否生效（重新访问首页检查 location widget）
+                    # 3. 验证邮编是否生效
                     verified = await self._verify_zip_code()
                     if not verified:
                         logger.warning(f"⚠️ 邮编验证失败（页面未反映 {self.zip_code}），放弃当前代理 (初始化 {init_attempt+1}/3)")
@@ -160,14 +156,10 @@ class AmazonSession:
             return False
 
     async def _set_zip_code(self) -> bool:
-        """
-        通过 POST 请求设置配送邮编
-        这是正确的邮编设置方式（而非伪造 cookie）
-        """
+        """通过 POST 请求设置配送邮编"""
         try:
             if self._session is None:
                 return False
-            # 从首页 cookie 中提取 csrf token
             cookies = self._session.cookies
             session_id = None
             for cookie in cookies.jar:
@@ -175,7 +167,6 @@ class AmazonSession:
                     session_id = cookie.value
                     break
 
-            # 构建邮编设置请求
             headers = self._build_headers()
             headers.update({
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
@@ -206,7 +197,6 @@ class AmazonSession:
             if resp.status_code == 200:
                 try:
                     result = resp.json()
-                    # Amazon 返回 {"isValidAddress": 1} 表示成功
                     if result.get("isValidAddress") == 1:
                         logger.info(f"📍 邮编设置成功: {self.zip_code}")
                         return True
@@ -214,7 +204,6 @@ class AmazonSession:
                         logger.warning(f"📍 邮编设置响应: {result}")
                         return False
                 except Exception:
-                    # 即使解析失败，200 状态码也算部分成功
                     logger.info(f"📍 邮编设置请求已发送 (200)")
                     return True
             else:
@@ -226,11 +215,7 @@ class AmazonSession:
             return False
 
     async def _verify_zip_code(self) -> bool:
-        """
-        验证邮编是否实际生效
-        重新访问首页，检查 location widget 是否显示了正确的邮编
-        防止代理 IP 导致 Amazon 忽略邮编设置
-        """
+        """验证邮编是否实际生效"""
         try:
             headers = self._build_headers(referer="https://www.amazon.com/")
             resp = await self._session.get(
@@ -241,7 +226,6 @@ class AmazonSession:
                 return False
 
             text = resp.text
-            # 检查 location widget 中的邮编（glow-ingress-line2 显示当前配送地址）
             import re
             zip_match = re.search(r'id="glow-ingress-line2"[^>]*>\s*([^<]+)', text)
             if zip_match:
@@ -253,15 +237,12 @@ class AmazonSession:
                     logger.warning(f"📍 邮编验证不匹配: 期望 {self.zip_code}, 页面显示 '{location_text}'")
                     return False
 
-            # 备选：检查是否有非美国货币标识（CNY/¥/€/£）
-            # 如果出现这些标识说明 session 没被定位到美国
             non_us_indicators = ['CNY', '¥', '€', '£', 'JP¥']
             for indicator in non_us_indicators:
-                if indicator in text[:50000]:  # 只检查前半部分避免误匹配
+                if indicator in text[:50000]:
                     logger.warning(f"📍 邮编验证失败: 页面包含非美国货币标识 '{indicator}'")
                     return False
 
-            # 如果 widget 不存在但也没有非美国标识，放行
             logger.info(f"📍 邮编验证: 未找到 location widget，但无异常货币标识")
             return True
 
@@ -270,10 +251,7 @@ class AmazonSession:
             return False
 
     def _build_headers(self, referer: str = None) -> Dict[str, str]:
-        """
-        构建反指纹请求头
-        按照真实浏览器的请求头顺序排列
-        """
+        """构建反指纹请求头"""
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
@@ -288,8 +266,7 @@ class AmazonSession:
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
         }
-        
-        # Referer 链：第一次请求不带 referer，后续带上一个请求的 URL
+
         if referer:
             headers["Referer"] = referer
             headers["Sec-Fetch-Site"] = "same-origin"
@@ -300,11 +277,7 @@ class AmazonSession:
         return headers
 
     async def fetch_aod_page(self, asin: str) -> Optional[Response]:
-        """
-        采集 AOD (All Offers Display) AJAX 页面
-        响应体比产品页小 5-10 倍，包含卖家价格、运费、FBA状态
-        返回: Response 对象 或 None
-        """
+        """采集 AOD (All Offers Display) AJAX 页面"""
         if not self._initialized:
             await self.initialize()
 
@@ -315,7 +288,6 @@ class AmazonSession:
         url = f"{self.AMAZON_BASE}/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=true"
         referer = f"{self.AMAZON_BASE}/dp/{asin}"
         headers = self._build_headers(referer=referer)
-        # AOD 是 AJAX 请求，需要额外的头
         headers.update({
             "X-Requested-With": "XMLHttpRequest",
             "Sec-Fetch-Dest": "empty",
@@ -329,7 +301,7 @@ class AmazonSession:
                 headers=headers,
             )
 
-            self._last_url = referer  # referer 保持为产品页
+            self._last_url = referer
             self._request_count += 1
 
             return resp
@@ -338,10 +310,7 @@ class AmazonSession:
             return None
 
     async def fetch_product_page(self, asin: str) -> Optional[Response]:
-        """
-        采集 Amazon 商品页面
-        返回: Response 对象 或 None
-        """
+        """采集 Amazon 商品页面"""
         if not self._initialized:
             await self.initialize()
 
@@ -362,7 +331,6 @@ class AmazonSession:
             self._last_url = url
             self._request_count += 1
 
-            # 检测空响应或过短响应（正常产品页至少 50KB）
             if resp.status_code == 200 and len(resp.content) < 1000:
                 logger.warning(f"⚠️ ASIN={asin} 响应体过短 ({len(resp.content)} bytes)，视为空页面")
                 return None
@@ -377,31 +345,22 @@ class AmazonSession:
         return self._initialized and self._session is not None
 
     def is_blocked(self, response: Response) -> bool:
-        """
-        检测是否被 Amazon 封锁
-        注意：response 为 None（超时）时由调用方单独处理，这里只检查实际响应
-        注意：404 不算封锁（Amazon 标准 404 页面包含 api-services-support 注释）
-        """
+        """检测是否被 Amazon 封锁"""
         if response is None:
             return False
 
-        # 404 是正常的商品不存在，不是封锁
         if response.status_code == 404:
             return False
 
-        # HTTP 状态码检测
         if response.status_code in (403, 503):
             return True
 
-        # 验证码检测
         text = response.text
         if "captcha" in response.url.lower():
             return True
         if "validateCaptcha" in text or "Robot Check" in text:
             return True
 
-        # api-services-support 检测：只在短页面（非正常产品页）中检查
-        # 正常产品页 > 50KB，被封的错误页面通常 < 10KB
         if "api-services-support@amazon.com" in text and len(text) < 20000:
             return True
 
@@ -433,16 +392,14 @@ class SessionPool:
     """
     隧道模式 Session 池
 
-    每个隧道通道维护一个独立的 AmazonSession，互不干扰。
-    IP 轮换（60s）后需要重建对应通道的 Session，
-    因为旧连接可能仍走旧 IP（keep-alive 问题）。
+    所有 Session 共享同一个隧道代理地址（同一出口 IP），
+    但各自维护独立的 Cookie / 指纹，用于分散 Amazon 反爬风险。
 
-    使用方式：
-        pool = SessionPool(proxy_manager, zip_code)
-        session = await pool.get_session(channel_id)
-        # ... 用 session 发送请求
-        # IP 轮换后:
-        await pool.rebuild_all()
+    IP 轮换后滚动重建 Session：
+    - 逐个创建新 Session（后台并行，最多 3 个同时初始化）
+    - 新 Session 就绪后原子替换旧的
+    - 旧 Session 在替换后延迟关闭（等待进行中的请求完成）
+    - 整个过程不中断服务
     """
 
     def __init__(self, proxy_manager: ProxyManager, zip_code: str = None):
@@ -451,40 +408,28 @@ class SessionPool:
         self._sessions: Dict[int, AmazonSession] = {}
         self._init_locks: Dict[int, asyncio.Lock] = {}
 
-        # 为每个通道预创建锁
         for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
             self._init_locks[ch_id] = asyncio.Lock()
 
     async def get_session(self, channel_id: int) -> Optional[AmazonSession]:
         """
-        获取指定通道的 Session，不存在或未就绪则创建。
-
-        Args:
-            channel_id: 通道编号 (1-N)
-
-        Returns:
-            就绪的 AmazonSession，或初始化失败时返回 None
+        获取指定槽位的 Session，不存在或未就绪则创建。
         """
-        # 快速路径：已有就绪的 session
         if channel_id in self._sessions and self._sessions[channel_id].is_ready():
             return self._sessions[channel_id]
 
-        # 确保锁存在（动态通道数变化时）
         if channel_id not in self._init_locks:
             self._init_locks[channel_id] = asyncio.Lock()
 
         async with self._init_locks[channel_id]:
-            # 双重检查
             if channel_id in self._sessions and self._sessions[channel_id].is_ready():
                 return self._sessions[channel_id]
 
-            # 关闭旧的（如果存在但不可用）
             if channel_id in self._sessions:
                 await self._sessions[channel_id].close()
                 del self._sessions[channel_id]
 
-            # 创建新 Session
-            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
             session = AmazonSession(
                 self.proxy_manager,
                 zip_code=self.zip_code,
@@ -493,31 +438,26 @@ class SessionPool:
             ok = await session.initialize()
             if ok:
                 self._sessions[channel_id] = session
-                logger.info(f"✅ 通道 {channel_id} Session 就绪")
+                logger.info(f"✅ 槽位 {channel_id} Session 就绪")
                 return session
             else:
                 await session.close()
-                logger.warning(f"⚠️ 通道 {channel_id} Session 初始化失败")
+                logger.warning(f"⚠️ 槽位 {channel_id} Session 初始化失败")
                 return None
 
     async def rebuild_session(self, channel_id: int) -> bool:
         """
-        重建指定通道的 Session（IP 轮换后或被封后调用）。
-
-        Returns:
-            是否重建成功
+        重建指定槽位的 Session（IP 轮换后或被封后调用）。
         """
         if channel_id not in self._init_locks:
             self._init_locks[channel_id] = asyncio.Lock()
 
         async with self._init_locks[channel_id]:
-            # 关闭旧 session
             if channel_id in self._sessions:
                 await self._sessions[channel_id].close()
                 del self._sessions[channel_id]
 
-            # 创建新 session
-            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
             session = AmazonSession(
                 self.proxy_manager,
                 zip_code=self.zip_code,
@@ -526,42 +466,114 @@ class SessionPool:
             ok = await session.initialize()
             if ok:
                 self._sessions[channel_id] = session
-                logger.info(f"🔄 通道 {channel_id} Session 重建成功")
+                logger.info(f"🔄 槽位 {channel_id} Session 重建成功")
                 return True
             else:
                 await session.close()
-                logger.warning(f"⚠️ 通道 {channel_id} Session 重建失败")
+                logger.warning(f"⚠️ 槽位 {channel_id} Session 重建失败")
                 return False
 
-    async def rebuild_all(self):
+    async def rolling_rebuild(self, concurrency: int = 5,
+                              per_session_timeout: float = 30.0):
         """
-        重建所有通道的 Session（IP 全量轮换后调用）。
-        并发执行所有通道的重建，加速初始化。
-        """
-        logger.info("🔄 重建所有通道 Session...")
-        tasks = []
-        for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
-            tasks.append(self.rebuild_session(ch_id))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        滚动重建所有 Session（IP 轮换后调用）。
 
-        success = sum(1 for r in results if r is True)
-        logger.info(f"🔄 Session 重建完成: {success}/{config.TUNNEL_CHANNELS} 通道就绪")
+        核心设计：新 Session 在后台构建，就绪后替换旧的，不中断服务。
+        - concurrency: 同时构建新 Session 的并发数（避免带宽争抢）
+        - per_session_timeout: 单个 Session 初始化超时
+        """
+        proxy_url = self.proxy_manager.get_tunnel_proxy_url()
+        if not proxy_url:
+            logger.warning("🔄 隧道代理地址为空，跳过滚动重建")
+            return
+
+        channels = list(range(1, config.TUNNEL_CHANNELS + 1))
+        sem = asyncio.Semaphore(concurrency)
+        success_count = 0
+        total = len(channels)
+
+        logger.info(f"🔄 滚动重建 {total} 个 Session（并发={concurrency}）...")
+
+        async def _rebuild_one(ch_id: int):
+            nonlocal success_count
+            async with sem:
+                try:
+                    # 1. 后台构建新 Session
+                    new_session = AmazonSession(
+                        self.proxy_manager,
+                        zip_code=self.zip_code,
+                        proxy_url=proxy_url,
+                    )
+                    ok = await asyncio.wait_for(
+                        new_session.initialize(),
+                        timeout=per_session_timeout,
+                    )
+
+                    if ok:
+                        # 2. 原子替换：旧 Session 仍可能被正在进行的请求使用
+                        old_session = self._sessions.get(ch_id)
+                        self._sessions[ch_id] = new_session
+                        success_count += 1
+
+                        # 3. 延迟关闭旧 Session（给进行中的请求 2s 完成）
+                        if old_session:
+                            await asyncio.sleep(2)
+                            try:
+                                await old_session.close()
+                            except Exception:
+                                pass
+                    else:
+                        await new_session.close()
+                        logger.warning(f"⚠️ 槽位 {ch_id} 滚动重建失败")
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ 槽位 {ch_id} 重建超时 ({per_session_timeout}s)")
+                except Exception as e:
+                    logger.error(f"❌ 槽位 {ch_id} 重建异常: {e}")
+
+        tasks = [_rebuild_one(ch_id) for ch_id in channels]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info(f"🔄 滚动重建完成: {success_count}/{total} 个 Session 就绪")
+
+    async def rebuild_all(self, timeout: float = 15.0):
+        """
+        向后兼容：调用 rolling_rebuild。
+        """
+        await self.rolling_rebuild(per_session_timeout=timeout)
 
     async def close_all(self):
         """关闭所有 Session"""
         for session in self._sessions.values():
             await session.close()
         self._sessions.clear()
-        logger.info("🔒 所有通道 Session 已关闭")
+        logger.info("🔒 所有 Session 已关闭")
+
+    async def resize(self, target_channels: int):
+        """运行时调整 Session 槽位数量（缩容时关闭多余槽位）。"""
+        target = max(1, int(target_channels))
+
+        # 缩容：关闭并删除超出目标编号的会话
+        to_remove = [ch_id for ch_id in self._sessions if ch_id > target]
+        for ch_id in to_remove:
+            try:
+                await self._sessions[ch_id].close()
+            finally:
+                self._sessions.pop(ch_id, None)
+
+        # 同步 lock 集合
+        self._init_locks = {ch_id: lock for ch_id, lock in self._init_locks.items() if ch_id <= target}
+        for ch_id in range(1, target + 1):
+            self._init_locks.setdefault(ch_id, asyncio.Lock())
 
     @property
     def ready_count(self) -> int:
-        """就绪的通道数"""
+        """就绪的槽位数"""
         return sum(1 for s in self._sessions.values() if s.is_ready())
 
     @property
     def stats(self) -> Dict:
-        """获取所有通道的统计信息"""
+        """获取所有槽位的统计信息"""
         return {
             "total_channels": config.TUNNEL_CHANNELS,
             "ready": self.ready_count,

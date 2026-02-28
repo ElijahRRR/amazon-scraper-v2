@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import worker as worker_module
+import proxy as proxy_module
 
 
 class _BrokenSession:
@@ -23,6 +24,28 @@ class _FailingAmazonSession:
 
     async def close(self):
         self._session = None
+
+
+class _BlockedResponse:
+    def __init__(self):
+        self.status_code = 503
+        self.text = "blocked"
+        self.content = b"x" * 2048
+        self.url = "https://www.amazon.com/dp/B000BLOCKED"
+
+
+class _BlockedSession:
+    def is_ready(self) -> bool:
+        return True
+
+    async def fetch_product_page(self, asin):
+        return _BlockedResponse()
+
+    def is_blocked(self, response) -> bool:
+        return True
+
+    def is_404(self, response) -> bool:
+        return False
 
 
 class WorkerSessionReadyRegressionTest(unittest.IsolatedAsyncioTestCase):
@@ -89,3 +112,86 @@ class WorkerSessionReadyRegressionTest(unittest.IsolatedAsyncioTestCase):
         # 只提交了一次失败，证明 _max_retries=1 生效
         self.assertEqual(len(submit_calls), 1)
         self.assertFalse(submit_calls[0][1])
+
+    async def test_tps_blocked_path_submits_failure_result(self):
+        """TPS 模式被封后应立即提交失败结果，避免任务卡在 processing。"""
+        worker = worker_module.Worker(server_url="http://127.0.0.1:8899")
+        worker._proxy_mode = "tps"
+        worker._session = _BlockedSession()
+        worker._session_ready.set()
+
+        submit_calls = []
+
+        async def fake_submit(task_id, data, success, error_type=None, error_detail=None):
+            submit_calls.append({
+                "task_id": task_id,
+                "success": success,
+                "error_type": error_type,
+                "error_detail": error_detail,
+            })
+
+        async def fake_rotate(*_args, **_kwargs):
+            return None
+
+        worker._submit_result = fake_submit
+        worker._rotate_session = fake_rotate
+        task = {"asin": "B000BLOCKED", "id": 99, "batch_name": "batch-x", "zip_code": "10001"}
+
+        result = await worker._process_task(task)
+
+        self.assertEqual(result[0], False)
+        self.assertEqual(result[1], True)
+        self.assertEqual(len(submit_calls), 1)
+        self.assertEqual(submit_calls[0]["task_id"], 99)
+        self.assertFalse(submit_calls[0]["success"])
+        self.assertEqual(submit_calls[0]["error_type"], "blocked")
+        self.assertIn("HTTP 503", submit_calls[0]["error_detail"])
+
+    async def test_pull_initial_settings_syncs_mode_profile_and_tunnel_channels(self):
+        """初始设置同步时，proxy_mode 与 tunnel_channels 应同步到运行时组件。"""
+        old_mode = worker_module.config.PROXY_MODE
+        old_channels = worker_module.config.TUNNEL_CHANNELS
+        old_rotate = worker_module.config.TUNNEL_ROTATE_INTERVAL
+        old_manager = proxy_module._proxy_manager
+
+        worker_module.config.PROXY_MODE = "tps"
+        worker_module.config.TUNNEL_CHANNELS = 8
+        worker_module.config.TUNNEL_ROTATE_INTERVAL = 60
+        proxy_module._proxy_manager = None
+        worker = worker_module.Worker(server_url="http://127.0.0.1:8899")
+
+        payload = {
+            "proxy_mode": "tunnel",
+            "tunnel_channels": 16,
+            "tunnel_rotate_interval": 90,
+        }
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return payload
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+            async def get(self, url):
+                return _Resp()
+
+        try:
+            with patch("worker.httpx.AsyncClient", _Client):
+                await worker._pull_initial_settings()
+
+            self.assertEqual(worker._proxy_mode, "tunnel")
+            self.assertEqual(worker._controller._proxy_mode, "tunnel")
+            self.assertEqual(worker_module.config.TUNNEL_CHANNELS, 16)
+            self.assertEqual(worker_module.config.TUNNEL_ROTATE_INTERVAL, 90)
+            self.assertEqual(len(worker.proxy_manager._channels), 16)
+        finally:
+            worker_module.config.PROXY_MODE = old_mode
+            worker_module.config.TUNNEL_CHANNELS = old_channels
+            worker_module.config.TUNNEL_ROTATE_INTERVAL = old_rotate
+            proxy_module._proxy_manager = old_manager

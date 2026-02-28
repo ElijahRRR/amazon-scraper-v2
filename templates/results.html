@@ -362,6 +362,10 @@ async function clearDatabase() {
 // 截图预览
 function showScreenshot(btn) {
     const path = btn.dataset.path;
+    if (!path || !path.startsWith('/static/screenshots/')) {
+        alert('截图路径非法，已拒绝加载');
+        return;
+    }
     const asin = btn.dataset.asin;
     document.getElementById('screenshotModalTitle').textContent = `截图预览 - ${asin}`;
     document.getElementById('screenshotImg').src = path;

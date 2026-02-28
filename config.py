@@ -45,32 +45,33 @@ MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
 SESSION_ROTATE_EVERY = 1000      # 每 N 次成功请求主动轮换 session
 
-# 全局令牌桶限流
-TOKEN_BUCKET_RATE = 4.5          # 目标 QPS，留 10% buffer
+# 令牌桶限流
+TOKEN_BUCKET_RATE = 5.0          # TPS 模式全局 QPS 上限
+PER_CHANNEL_QPS = 3.0            # DPS 隧道模式每 channel QPS（总 QPS = channels × 此值）
 
 # ============================================================
 # 自适应并发控制（流水线模式）
 # ============================================================
-INITIAL_CONCURRENCY = 8          # 冷启动并发数
-MIN_CONCURRENCY = 2              # 并发下限
-MAX_CONCURRENCY = 50             # 并发上限
+INITIAL_CONCURRENCY = 8          # 冷启动并发（避免启动封锁风暴，10s 内爬升到甜区）
+MIN_CONCURRENCY = 4              # 并发下限
+MAX_CONCURRENCY = 16             # 并发上限（实测：超过 16 延迟升高但带宽不增）
 
 # 代理硬约束
-PROXY_BANDWIDTH_MBPS = 0         # 0=不限带宽（禁用带宽感知）
+PROXY_BANDWIDTH_MBPS = 5         # 代理带宽上限（Mbps），用于 AIMD 带宽感知
 
 # 自适应调节参数
 ADJUST_INTERVAL_S = 10           # 评估间隔（秒）
-TARGET_LATENCY_S = 6.0           # 目标 p50 延迟
-MAX_LATENCY_S = 10.0             # 延迟上限
+TARGET_LATENCY_S = 8.0           # p50 目标（甜区 4-6s，允许到 8s）
+MAX_LATENCY_S = 15.0             # p50 上限（超过说明代理拥塞严重）
 TARGET_SUCCESS_RATE = 0.95       # 成功率目标
 MIN_SUCCESS_RATE = 0.85          # 成功率下限
 BLOCK_RATE_THRESHOLD = 0.05      # 封锁率阈值
 BANDWIDTH_SOFT_CAP = 0.80        # 带宽软上限
-COOLDOWN_AFTER_BLOCK_S = 30      # 被封后冷却时间（秒）
+COOLDOWN_AFTER_BLOCK_S = 15      # 被封后冷却时间（TPS 模式轮换快，不需要 30s）
 
 # 全局并发协调（多 Worker 场景）
-GLOBAL_MAX_CONCURRENCY = 50      # 所有 Worker 总并发上限
-GLOBAL_MAX_QPS = 4.5             # 所有 Worker 总 QPS 上限
+GLOBAL_MAX_CONCURRENCY = 16      # 匹配 MAX_CONCURRENCY
+GLOBAL_MAX_QPS = 5.0             # 匹配 TOKEN_BUCKET_RATE
 
 # 任务预取
 TASK_QUEUE_SIZE = 100            # 任务缓冲队列大小

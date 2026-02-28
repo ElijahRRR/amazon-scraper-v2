@@ -84,6 +84,7 @@ def _default_settings() -> dict:
     return {
         "zip_code": config.DEFAULT_ZIP_CODE,
         "max_retries": config.MAX_RETRIES,
+        "request_timeout": config.REQUEST_TIMEOUT,
         "proxy_api_url": config.PROXY_API_URL_AUTH,
         "token_bucket_rate": config.TOKEN_BUCKET_RATE,
         "initial_concurrency": config.INITIAL_CONCURRENCY,
@@ -98,6 +99,7 @@ def _default_settings() -> dict:
         "min_success_rate": config.MIN_SUCCESS_RATE,
         "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
         "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
+        "proxy_bandwidth_mbps": config.PROXY_BANDWIDTH_MBPS,
         "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
         "global_max_qps": config.GLOBAL_MAX_QPS,
         # 代理模式
@@ -454,57 +456,26 @@ async def submit_result(request: Request):
 # --- Worker 批量提交结果 ---
 @app.post("/api/tasks/result/batch")
 async def submit_result_batch(request: Request):
-    """Worker 批量提交采集结果（统一提交，减少磁盘 IO）"""
+    """Worker 批量提交采集结果（统一提交，减少磁盘 IO）
+
+    修复：通过 db.batch_submit_results() 使用写锁序列化，
+    防止与 pull_tasks 并发时出现 "cannot start a transaction within a transaction" 错误
+    """
     db = await get_db()
     data = await request.json()
     results_list = data.get("results", [])
 
-    try:
-        for item in results_list:
-            task_id = item.get("task_id")
-            worker_id = item.get("worker_id", "unknown")
-            success = item.get("success", False)
-            result_data = item.get("result")
+    # 更新 worker 注册信息（内存操作，不需要锁）
+    for item in results_list:
+        worker_id = item.get("worker_id", "unknown")
+        _register_worker(worker_id)
+        if worker_id in _worker_registry:
+            _worker_registry[worker_id]["results_submitted"] += 1
 
-            _register_worker(worker_id)
-            if worker_id in _worker_registry:
-                _worker_registry[worker_id]["results_submitted"] += 1
+    # 数据库操作委托给 Database 方法（内部使用写锁序列化）
+    count = await db.batch_submit_results(results_list, RESULT_FIELDS)
 
-            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            if success and result_data:
-                # 保存结果（不单独 commit）
-                fields = ["batch_name", "asin"] + [f for f in RESULT_FIELDS if f != "asin"]
-                values = [result_data.get(f, "") for f in fields]
-                placeholders = ",".join(["?"] * len(fields))
-                field_names = ",".join(fields)
-                await db._db.execute(
-                    f"INSERT OR REPLACE INTO results ({field_names}) VALUES ({placeholders})",
-                    values
-                )
-                # 标记任务完成
-                await db._db.execute(
-                    "UPDATE tasks SET status = 'done', worker_id = ?, updated_at = ? WHERE id = ?",
-                    (worker_id, now, task_id)
-                )
-            else:
-                # 标记任务失败（含错误分类）
-                error_type = item.get("error_type")
-                error_detail = item.get("error_detail")
-                await db._db.execute(
-                    """UPDATE tasks
-                       SET status = 'failed', worker_id = ?, retry_count = retry_count + 1,
-                           error_type = ?, error_detail = ?, updated_at = ?
-                       WHERE id = ?""",
-                    (worker_id, error_type, error_detail, now, task_id)
-                )
-
-        # 整批统一 commit
-        await db._db.commit()
-    except Exception:
-        await db._db.rollback()
-        raise
-
-    return {"status": "ok", "count": len(results_list)}
+    return {"status": "ok", "count": count}
 
 
 # --- 进度查询 ---
@@ -814,6 +785,59 @@ async def get_coordinator_state():
     }
 
 
+# --- 诊断端点 ---
+_server_start_time = time.time()
+
+@app.get("/api/diagnostic")
+async def diagnostic():
+    """
+    系统诊断端点：用于远程检查 server/worker 运行状态、配置参数、代码版本
+
+    用途：
+    - 确认 DMIT 是否部署了最新代码（通过 code_version 中的关键参数判断）
+    - 监控 worker 活跃度和任务吞吐量
+    - 检测数据库健康状态
+    """
+    db = await get_db()
+    progress = await db.get_progress()
+
+    # Worker 活跃度
+    now = time.time()
+    active_workers = []
+    for wid, info in _worker_registry.items():
+        age = now - info["last_seen"]
+        active_workers.append({
+            "worker_id": wid,
+            "alive": age < 60,
+            "last_seen_ago_s": round(age, 1),
+            "tasks_pulled": info["tasks_pulled"],
+            "results_submitted": info["results_submitted"],
+        })
+
+    # 数据库写锁状态
+    db_lock_status = "locked" if db._write_lock.locked() else "free"
+
+    return {
+        "server_uptime_s": round(now - _server_start_time, 1),
+        "server_uptime_h": round((now - _server_start_time) / 3600, 2),
+        "task_progress": progress,
+        "workers": active_workers,
+        "db_write_lock": db_lock_status,
+        "code_version": {
+            # 这些关键参数可以判断是否部署了最新优化代码
+            "token_bucket_rate": config.TOKEN_BUCKET_RATE,
+            "initial_concurrency": config.INITIAL_CONCURRENCY,
+            "max_concurrency": config.MAX_CONCURRENCY,
+            "target_latency_s": config.TARGET_LATENCY_S,
+            "max_latency_s": config.MAX_LATENCY_S,
+            "cooldown_after_block_s": config.COOLDOWN_AFTER_BLOCK_S,
+            "proxy_mode": config.PROXY_MODE,
+            "has_write_lock": hasattr(db, '_write_lock'),  # True = 新版代码
+        },
+        "runtime_settings_version": _settings_version,
+    }
+
+
 # --- 设置管理 ---
 @app.get("/api/settings")
 async def get_settings():
@@ -831,11 +855,12 @@ async def update_settings(request: Request):
     _validators = {
         "zip_code":             (str,   None, None),
         "max_retries":          (int,   1,    10),
+        "request_timeout":      (int,   5,    60),
         "proxy_api_url":        (str,   None, None),
         "token_bucket_rate":    (float, 0.5,  50),
         "initial_concurrency":  (int,   1,    50),
         "min_concurrency":      (int,   1,    20),
-        "max_concurrency":      (int,   2,    100),
+        "max_concurrency":      (int,   2,    500),
         "session_rotate_every": (int,   50,   10000),
         "screenshot_concurrency": (int, 1,    6),
         "adjust_interval":      (int,   3,    60),
@@ -845,6 +870,7 @@ async def update_settings(request: Request):
         "min_success_rate":     (float, 0.3,  1),
         "block_rate_threshold": (float, 0.01, 0.5),
         "cooldown_after_block": (int,   5,    120),
+        "proxy_bandwidth_mbps": (int,   0,    100),
         "global_max_concurrency": (int,  2,    500),
         "global_max_qps":         (float, 0.5, 100),
         # 代理模式
@@ -910,6 +936,46 @@ async def update_settings(request: Request):
                      "errors": [f"proxy_mode 必须为 'tps' 或 'tunnel'，收到 '{_runtime_settings.get('proxy_mode')}'"],
                      "settings": _runtime_settings, "_version": _settings_version}
         )
+
+    # 代理模式切换联动：自动应用预设参数（仅用户未显式指定的字段）
+    _MODE_PRESETS = {
+        "tps": {
+            "token_bucket_rate":    5.0,
+            "initial_concurrency":  8,
+            "min_concurrency":      4,
+            "cooldown_after_block": 15,
+            "proxy_bandwidth_mbps": 0,
+            "global_max_qps":       5.0,
+            "request_timeout":      15,
+        },
+        "tunnel": {
+            "token_bucket_rate":    15.0,
+            "initial_concurrency":  28,
+            "min_concurrency":      12,
+            "max_concurrency":      80,     # 允许系统探索更高并发来填满带宽管道
+            "cooldown_after_block": 60,
+            "proxy_bandwidth_mbps": 0,      # 禁用带宽限制（解压后字节率 ≠ 线路带宽）
+            "global_max_qps":       15.0,
+            "request_timeout":      45,     # 大页面(1.85MB)在高并发下下载慢，给够时间
+            "target_latency":       25.0,   # 高并发共享带宽 → 延迟=C×pageSize/BW，允许到25s再停止增速
+            "max_latency":          35.0,   # 仅在接近超时(45s)时才减速，避免误判带宽延迟
+            "min_success_rate":     0.75,   # IP 轮换时成功率暂降，容忍到 75%
+        },
+    }
+    if "proxy_mode" in old_values:
+        # proxy_mode 确实发生了变化，应用预设
+        new_mode = _runtime_settings["proxy_mode"]
+        preset = _MODE_PRESETS.get(new_mode, {})
+        linked = []
+        for pk, pv in preset.items():
+            # 只覆盖用户本次请求中没有显式提交的字段
+            if pk not in data:
+                old_values.setdefault(pk, _runtime_settings[pk])
+                _runtime_settings[pk] = pv
+                linked.append(f"{pk}={pv}")
+                changed = True
+        if linked:
+            logger.info(f"⚙️ 模式切换联动 ({new_mode}): {', '.join(linked)}")
 
     # 交叉约束校验（所有单字段校验通过后）
     cross_errors = []
