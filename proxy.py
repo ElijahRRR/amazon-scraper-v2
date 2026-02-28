@@ -3,13 +3,14 @@ Amazon 产品采集系统 v2 - 代理管理模块
 
 支持两种模式（共用同一个快代理 API）：
 - TPS 模式：每次请求自动换 IP（API 获取 1 个代理，缓存复用）
-- 隧道模式：固定隧道地址，所有请求共享同一出口 IP，定时自动换 IP
+- 隧道模式：固定隧道地址，多通道独立出口 IP，定时自动换 IP
 
-隧道模式核心规则（快代理 TPS 隧道）：
+隧道模式核心规则（快代理 TPS 隧道 + 多通道）：
 1. 隧道代理地址固定，启动时获取一次即可
-2. 所有请求走同一出口 IP（不是每通道不同 IP）
+2. 每个 channel 通过 password:channel_id 指定独立通道 → 独立出口 IP
 3. 每个换 IP 周期（如 60s）自动切换出口 IP
 4. 每个周期内可调 ChangeTpsIp API 手动换 IP（最多 2 次）
+5. 每通道 3Mbps，总带宽 5Mbps（相比单通道提升 67%）
 """
 import asyncio
 import re
@@ -17,6 +18,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -32,9 +34,8 @@ class ChannelState:
     """
     单个会话槽位的运行时状态。
 
-    注意：在隧道模式下，"通道" 实际上是 Session 槽位，
-    所有槽位共享同一个隧道代理地址和出口 IP，
-    但每个槽位有独立的 Cookie / 指纹，用于分散 Amazon 反爬风险。
+    每个 channel 通过 password:channel_id 指定独立通道，
+    拥有独立出口 IP + 独立 Cookie / 指纹，最大化反爬效果。
     """
     channel_id: int                     # 槽位编号 1-N
     proxy_url: str = ""                 # 隧道代理地址（所有槽位相同）
@@ -129,15 +130,30 @@ class ProxyManager:
 
         old_channels = self._channels
         new_channels: Dict[int, ChannelState] = {}
+
+        # 为新通道生成带通道号的 proxy URL
+        if self._tunnel_proxy_url:
+            parsed = urlparse(self._tunnel_proxy_url)
+        else:
+            parsed = None
+
         for ch_id in range(1, channels + 1):
+            if parsed:
+                channel_url = (
+                    f"http://{parsed.username}:{parsed.password}:{ch_id}"
+                    f"@{parsed.hostname}:{parsed.port}"
+                )
+            else:
+                channel_url = ""
+
             if ch_id in old_channels:
                 ch = old_channels[ch_id]
-                ch.proxy_url = self._tunnel_proxy_url
+                ch.proxy_url = channel_url
                 new_channels[ch_id] = ch
             else:
                 new_channels[ch_id] = ChannelState(
                     channel_id=ch_id,
-                    proxy_url=self._tunnel_proxy_url,
+                    proxy_url=channel_url,
                 )
 
         self._channels = new_channels
@@ -224,8 +240,9 @@ class ProxyManager:
     async def init_tunnel(self):
         """
         隧道模式启动初始化：
-        1. 调 API 获取隧道代理地址（只需 1 个，所有请求共享）
-        2. 将同一地址分配给所有会话槽位
+        1. 调 API 获取隧道代理地址（只需 1 个）
+        2. 为每个 channel 生成带通道号的 URL（password:channel_id）
+           → 每个通道有独立出口 IP，带宽从 3Mbps → 5Mbps
         """
         async with self._tunnel_init_lock:
             logger.info("🔧 获取隧道代理地址...")
@@ -234,17 +251,27 @@ class ProxyManager:
                 logger.error("❌ 获取隧道代理失败：API 返回空")
                 return 0
 
-            self._tunnel_proxy_url = proxies[0]
-            # 所有槽位使用同一个隧道地址
+            base_url = proxies[0]
+            self._tunnel_proxy_url = base_url  # 保留 base URL（向后兼容）
+
+            # 解析 base URL，为每个 channel 生成带通道号的 URL
+            # 格式：http://user:pwd:channel_id@host:port
+            parsed = urlparse(base_url)
             for ch in self._channels.values():
-                ch.proxy_url = self._tunnel_proxy_url
+                channel_url = (
+                    f"http://{parsed.username}:{parsed.password}:{ch.channel_id}"
+                    f"@{parsed.hostname}:{parsed.port}"
+                )
+                ch.proxy_url = channel_url
                 ch.reset_for_rotation()
 
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
             self._change_ip_count = 0
             self._total_fetched += 1
-            logger.info(f"✅ 隧道代理就绪：{self._tunnel_proxy_url} "
-                        f"→ {len(self._channels)} 个会话槽位")
+            logger.info(f"✅ 隧道代理就绪：{base_url} → {len(self._channels)} 个独立通道")
+            for ch in self._channels.values():
+                # 只显示通道号后缀，不暴露完整凭证
+                logger.info(f"  通道 {ch.channel_id}: ...:{ch.channel_id}@{parsed.hostname}:{parsed.port}")
             return len(self._channels)
 
     # 向后兼容

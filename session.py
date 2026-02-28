@@ -6,11 +6,11 @@ Cookie jar 管理
 
 支持两种工作方式：
 - TPS 模式：单个 AmazonSession，全局共享
-- 隧道模式：SessionPool，多 Session 槽位（共享同一隧道代理地址）
+- 隧道模式：SessionPool，多 Session 槽位（每个通道独立出口 IP）
 
 隧道模式关键设计：
-- 所有 Session 使用同一个隧道代理地址（出口 IP 相同）
-- 每个 Session 有独立的 Cookie / 指纹，分散 Amazon 反爬风险
+- 每个 Session 通过 password:channel_id 指定独立通道 → 独立出口 IP
+- 每个 Session 有独立的 Cookie / 指纹，最大化反爬效果
 - IP 轮换后滚动重建：逐个替换 Session，不中断服务
 """
 import asyncio
@@ -491,8 +491,9 @@ class SessionPool:
     """
     隧道模式 Session 池
 
-    所有 Session 共享同一个隧道代理地址（同一出口 IP），
-    但各自维护独立的 Cookie / 指纹，用于分散 Amazon 反爬风险。
+    每个 Session 通过 password:channel_id 指定独立代理通道，
+    拥有独立出口 IP + 独立 Cookie / 指纹，最大化反爬效果。
+    带宽从单通道 3Mbps 提升至多通道 5Mbps。
 
     IP 轮换后滚动重建 Session：
     - 逐个创建新 Session（后台并行，最多 3 个同时初始化）
@@ -528,7 +529,9 @@ class SessionPool:
                 await self._sessions[channel_id].close()
                 del self._sessions[channel_id]
 
-            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
+            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            if not proxy_url:
+                proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
             session = AmazonSession(
                 self.proxy_manager,
                 zip_code=self.zip_code,
@@ -556,7 +559,9 @@ class SessionPool:
                 await self._sessions[channel_id].close()
                 del self._sessions[channel_id]
 
-            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
+            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+            if not proxy_url:
+                proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
             session = AmazonSession(
                 self.proxy_manager,
                 zip_code=self.zip_code,
@@ -583,8 +588,7 @@ class SessionPool:
         - 每批之间间隔 1s，错开 HTTP 初始化请求，减少代理带宽争抢
         - 整个过程不中断服务：未重建的 Session 继续正常工作
         """
-        proxy_url = self.proxy_manager.get_tunnel_proxy_url()
-        if not proxy_url:
+        if not self.proxy_manager.get_tunnel_proxy_url():
             logger.warning("🔄 隧道代理地址为空，跳过滚动重建")
             return
 
@@ -596,6 +600,11 @@ class SessionPool:
 
         async def _rebuild_one(ch_id: int):
             try:
+                proxy_url = self.proxy_manager.get_channel_proxy_url(ch_id)
+                if not proxy_url:
+                    proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
+                if not proxy_url:
+                    return False
                 new_session = AmazonSession(
                     self.proxy_manager,
                     zip_code=self.zip_code,
