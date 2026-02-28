@@ -58,7 +58,7 @@
       "重建期间服务不中断",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 6,

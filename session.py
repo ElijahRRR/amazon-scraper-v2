@@ -473,14 +473,16 @@ class SessionPool:
                 logger.warning(f"⚠️ 槽位 {channel_id} Session 重建失败")
                 return False
 
-    async def rolling_rebuild(self, concurrency: int = 5,
+    async def rolling_rebuild(self, batch_size: int = 2,
                               per_session_timeout: float = 30.0):
         """
-        滚动重建所有 Session（IP 轮换后调用）。
+        分批滚动重建所有 Session（IP 轮换后调用）。
 
-        核心设计：新 Session 在后台构建，就绪后替换旧的，不中断服务。
-        - concurrency: 同时构建新 Session 的并发数（避免带宽争抢）
-        - per_session_timeout: 单个 Session 初始化超时
+        优化设计：
+        - 每批只重建 batch_size 个 Session（默认 2），不同时重建所有
+        - 旧 Session 在新 Session 就绪后才替换（原子替换 + 延迟关闭）
+        - 每批之间间隔 1s，错开 HTTP 初始化请求，减少代理带宽争抢
+        - 整个过程不中断服务：未重建的 Session 继续正常工作
         """
         proxy_url = self.proxy_manager.get_tunnel_proxy_url()
         if not proxy_url:
@@ -488,51 +490,57 @@ class SessionPool:
             return
 
         channels = list(range(1, config.TUNNEL_CHANNELS + 1))
-        sem = asyncio.Semaphore(concurrency)
         success_count = 0
         total = len(channels)
 
-        logger.info(f"🔄 滚动重建 {total} 个 Session（并发={concurrency}）...")
+        logger.info(f"🔄 分批滚动重建 {total} 个 Session（每批 {batch_size} 个）...")
 
         async def _rebuild_one(ch_id: int):
-            nonlocal success_count
-            async with sem:
-                try:
-                    # 1. 后台构建新 Session
-                    new_session = AmazonSession(
-                        self.proxy_manager,
-                        zip_code=self.zip_code,
-                        proxy_url=proxy_url,
-                    )
-                    ok = await asyncio.wait_for(
-                        new_session.initialize(),
-                        timeout=per_session_timeout,
-                    )
+            try:
+                new_session = AmazonSession(
+                    self.proxy_manager,
+                    zip_code=self.zip_code,
+                    proxy_url=proxy_url,
+                )
+                ok = await asyncio.wait_for(
+                    new_session.initialize(),
+                    timeout=per_session_timeout,
+                )
+                if ok:
+                    old_session = self._sessions.get(ch_id)
+                    self._sessions[ch_id] = new_session
+                    # 延迟关闭旧 Session（给进行中的请求 2s 完成）
+                    if old_session:
+                        await asyncio.sleep(2)
+                        try:
+                            await old_session.close()
+                        except Exception:
+                            pass
+                    return True
+                else:
+                    await new_session.close()
+                    logger.warning(f"⚠️ 槽位 {ch_id} 重建失败")
+                    return False
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ 槽位 {ch_id} 重建超时 ({per_session_timeout}s)")
+                return False
+            except Exception as e:
+                logger.error(f"❌ 槽位 {ch_id} 重建异常: {e}")
+                return False
 
-                    if ok:
-                        # 2. 原子替换：旧 Session 仍可能被正在进行的请求使用
-                        old_session = self._sessions.get(ch_id)
-                        self._sessions[ch_id] = new_session
-                        success_count += 1
-
-                        # 3. 延迟关闭旧 Session（给进行中的请求 2s 完成）
-                        if old_session:
-                            await asyncio.sleep(2)
-                            try:
-                                await old_session.close()
-                            except Exception:
-                                pass
-                    else:
-                        await new_session.close()
-                        logger.warning(f"⚠️ 槽位 {ch_id} 滚动重建失败")
-
-                except asyncio.TimeoutError:
-                    logger.warning(f"⚠️ 槽位 {ch_id} 重建超时 ({per_session_timeout}s)")
-                except Exception as e:
-                    logger.error(f"❌ 槽位 {ch_id} 重建异常: {e}")
-
-        tasks = [_rebuild_one(ch_id) for ch_id in channels]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # 分批执行：每批 batch_size 个，批间间隔 1s
+        for i in range(0, total, batch_size):
+            batch = channels[i:i + batch_size]
+            results = await asyncio.gather(
+                *[_rebuild_one(ch_id) for ch_id in batch],
+                return_exceptions=True,
+            )
+            for r in results:
+                if r is True:
+                    success_count += 1
+            # 批间间隔（最后一批不等）
+            if i + batch_size < total:
+                await asyncio.sleep(1)
 
         logger.info(f"🔄 滚动重建完成: {success_count}/{total} 个 Session 就绪")
 
