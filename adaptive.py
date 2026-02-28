@@ -63,7 +63,16 @@ class ChannelController:
         self.metrics.record(latency_s, success, blocked, resp_bytes)
 
     async def evaluate(self):
-        """AIMD 评估（单 channel 版本，逻辑精简）"""
+        """
+        Gradient2-AIMD 混合评估（单 channel 版本）。
+
+        优先级：
+        1. 冷却期 → 不动
+        2. 封锁率高 → AIMD 乘性降低 + 冷却
+        3. 成功率低 → AIMD 乘性降低 + 短冷却
+        4. RTT gradient 上升 → 预防性 -1（不需要冷却，持续跟踪）
+        5. 一切正常 → +1
+        """
         snap = self.metrics.snapshot()
         if snap["total"] < 3:
             return
@@ -74,6 +83,7 @@ class ChannelController:
         if now < self._cooldown_until:
             return  # 冷却中
 
+        # --- AIMD 硬惩罚（封锁/失败）---
         if snap["block_rate"] > config.BLOCK_RATE_THRESHOLD:
             new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
             self._cooldown_until = now + self._cooldown_duration
@@ -82,9 +92,18 @@ class ChannelController:
             new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
             self._cooldown_until = now + max(5, self._cooldown_duration // 2)
             reason = f"ch{self.channel_id} 成功率={snap['success_rate']:.0%}"
-        elif snap["success_rate"] >= config.TARGET_SUCCESS_RATE:
+
+        # --- Gradient2 预防性降速（RTT 上升趋势）---
+        elif snap["rtt_gradient"] < 0.85:
+            # gradient = long/short < 0.85 → short RTT 比 long 高 >17% → 延迟上升
+            new_c = max(self._min, self._concurrency - 1)
+            reason = (f"ch{self.channel_id} RTT↑ gradient={snap['rtt_gradient']:.2f} "
+                      f"(short={snap['ewma_short']:.2f}s long={snap['ewma_long']:.2f}s)")
+
+        # --- 加性恢复 ---
+        elif snap["success_rate"] >= config.TARGET_SUCCESS_RATE and snap["rtt_gradient"] >= 0.95:
             new_c = min(self._max, self._concurrency + 1)
-            reason = f"ch{self.channel_id} 成功率={snap['success_rate']:.0%} +1"
+            reason = f"ch{self.channel_id} OK gradient={snap['rtt_gradient']:.2f} +1"
         else:
             return  # 稳态
 
@@ -295,16 +314,17 @@ class AdaptiveController:
 
     async def _evaluate(self):
         """
-        TPS 模式评估逻辑 — AIMD + 带宽感知
+        TPS 模式评估逻辑 — Gradient2-AIMD 混合
 
         优先级：
         1. 冷却期 → 不动
-        2. 被封率高 → 减速 + 冷却
-        3. 成功率低 → 减速 + 冷却
-        4. 延迟高 → 减速
-        5. 带宽饱和 → 不动
-        6. 一切正常 → +2
-        7. 其他 → 不动
+        2. 被封率高 → AIMD 乘性降低 + 冷却
+        3. 成功率低 → AIMD 乘性降低 + 短冷却
+        4. 延迟高（p50 超标）→ 减速
+        5. RTT gradient 上升 → 预防性 -1（Gradient2，不需要冷却）
+        6. 带宽饱和 → 不动
+        7. 一切正常且 gradient 稳定 → +2
+        8. 其他 → 不动
         """
         snap = self.metrics.snapshot()
 
@@ -326,37 +346,45 @@ class AdaptiveController:
             elif snap["block_rate"] > self._block_threshold:
                 new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
                 self._cooldown_until = now + self._cooldown_duration
-                reason = f"封锁率 {snap['block_rate']:.0%} > {self._block_threshold:.0%} -> ×{self._block_decrease_factor}+冷却{self._cooldown_duration}s"
+                reason = f"封锁率 {snap['block_rate']:.0%} -> ×{self._block_decrease_factor}+冷却{self._cooldown_duration}s"
 
             elif snap["success_rate"] < self._min_success:
                 new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
                 soft_cooldown = max(15, self._cooldown_duration // 2)
                 self._cooldown_until = now + soft_cooldown
-                reason = f"成功率={snap['success_rate']:.0%} < {self._min_success:.0%} -> ×{self._block_decrease_factor}+冷却{soft_cooldown}s"
+                reason = f"成功率={snap['success_rate']:.0%} -> ×{self._block_decrease_factor}+冷却{soft_cooldown}s"
 
             elif snap["latency_p50"] > self._max_latency:
                 new_c = max(self._min, int(self._concurrency * self._block_decrease_factor))
                 soft_cooldown = max(15, self._cooldown_duration // 2)
                 self._cooldown_until = now + soft_cooldown
-                reason = f"延迟 p50={snap['latency_p50']:.2f}s > {self._max_latency:.0f}s -> ×{self._block_decrease_factor}+冷却{soft_cooldown}s"
+                reason = f"延迟 p50={snap['latency_p50']:.2f}s > {self._max_latency:.0f}s -> 减速"
+
+            # Gradient2 预防性降速：RTT 上升趋势（short > long × 1.15）
+            elif snap["rtt_gradient"] < 0.85 and snap["ewma_short"] > 0:
+                new_c = max(self._min, self._concurrency - 1)
+                reason = (f"RTT↑ gradient={snap['rtt_gradient']:.2f} "
+                          f"(short={snap['ewma_short']:.2f}s > long={snap['ewma_long']:.2f}s)")
 
             elif snap["bandwidth_pct"] > self._bw_soft_cap:
                 new_c = self._concurrency
                 reason = f"带宽 {snap['bandwidth_pct']:.0%} > {self._bw_soft_cap:.0%} -> 维持"
 
             elif (snap["success_rate"] >= self._target_success
-                  and snap["latency_p50"] < self._target_latency):
+                  and snap["latency_p50"] < self._target_latency
+                  and snap["rtt_gradient"] >= 0.95):
+                # 只在 RTT gradient 稳定时才扩容
                 if random.random() < (0.3 + 0.7 * self._recovery_jitter):
                     increment = 2
                     new_c = min(self._max, self._concurrency + increment)
-                    reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> +{increment}"
+                    reason = f"OK gradient={snap['rtt_gradient']:.2f} p50={snap['latency_p50']:.2f}s -> +{increment}"
                 else:
                     new_c = self._concurrency
-                    reason = f"成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s -> 维持(抖动跳过)"
+                    reason = f"OK gradient={snap['rtt_gradient']:.2f} -> 维持(抖动跳过)"
 
             else:
                 new_c = self._concurrency
-                reason = f"稳态 | 成功率={snap['success_rate']:.0%} p50={snap['latency_p50']:.2f}s"
+                reason = f"稳态 | gradient={snap['rtt_gradient']:.2f} p50={snap['latency_p50']:.2f}s"
 
             if new_c != old_c:
                 await self._resize_semaphore(old_c, new_c)

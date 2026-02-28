@@ -23,7 +23,7 @@ class RequestRecord:
 
 class MetricsCollector:
     """
-    滑动窗口指标采集器
+    滑动窗口指标采集器 + EWMA RTT 追踪（Gradient2 风格）
 
     保留最近 window_seconds 秒内的请求记录，实时计算：
     - 请求延迟 p50 / p95
@@ -31,6 +31,7 @@ class MetricsCollector:
     - 被封率 (blocked / total)
     - 带宽使用率 (bytes/s vs 上限)
     - 当前在飞请求数
+    - EWMA RTT 短窗口 / 长窗口（用于 Gradient2 预防性降速）
     """
 
     def __init__(self, window_seconds: float = 30.0):
@@ -38,6 +39,12 @@ class MetricsCollector:
         self._records: deque[RequestRecord] = deque()
         self._lock = asyncio.Lock()
         self._inflight = 0
+
+        # EWMA RTT 追踪（Gradient2 风格双窗口）
+        # 短窗口反映近期趋势，长窗口作为基线
+        self._ewma_short: float = 0.0   # 短期 EMA（alpha=0.3，~3 样本半衰期）
+        self._ewma_long: float = 0.0    # 长期 EMA（alpha=0.05，~20 样本半衰期）
+        self._ewma_initialized = False
 
     def record(self, latency_s: float, success: bool, blocked: bool, resp_bytes: int = 0):
         """记录一次请求完成（同步，可在协程外调用）"""
@@ -48,9 +55,18 @@ class MetricsCollector:
             blocked=blocked,
             resp_bytes=resp_bytes,
         )
-        # deque 操作在 CPython 中是线程安全的，直接 append 即可
         self._records.append(rec)
         self._prune_sync()
+
+        # 更新 EWMA RTT（仅对成功请求，避免超时/封锁噪声污染基线）
+        if success and latency_s > 0:
+            if not self._ewma_initialized:
+                self._ewma_short = latency_s
+                self._ewma_long = latency_s
+                self._ewma_initialized = True
+            else:
+                self._ewma_short = 0.3 * latency_s + 0.7 * self._ewma_short
+                self._ewma_long = 0.05 * latency_s + 0.95 * self._ewma_long
 
     def request_start(self):
         """标记一个请求开始（在飞 +1）"""
@@ -102,6 +118,9 @@ class MetricsCollector:
                 "bandwidth_pct": 0.0,
                 "inflight": self._inflight,
                 "window_seconds": self._window,
+                "ewma_short": 0.0,
+                "ewma_long": 0.0,
+                "rtt_gradient": 1.0,
             }
 
         successes = sum(1 for r in records if r.success)
@@ -121,6 +140,12 @@ class MetricsCollector:
         bandwidth_limit = config.PROXY_BANDWIDTH_MBPS * 1_000_000 / 8  # Mbps → Bytes/s
         bandwidth_pct = (bandwidth_bps / bandwidth_limit) if bandwidth_limit > 0 else 0.0
 
+        # Gradient2: RTT gradient = long / short（>1 表示延迟上升）
+        if self._ewma_initialized and self._ewma_short > 0:
+            rtt_gradient = self._ewma_long / self._ewma_short
+        else:
+            rtt_gradient = 1.0  # 无数据时视为稳定
+
         return {
             "total": total,
             "success_rate": success_rate,
@@ -131,6 +156,9 @@ class MetricsCollector:
             "bandwidth_pct": bandwidth_pct,
             "inflight": self._inflight,
             "window_seconds": self._window,
+            "ewma_short": self._ewma_short,
+            "ewma_long": self._ewma_long,
+            "rtt_gradient": rtt_gradient,
         }
 
     @staticmethod
@@ -157,5 +185,6 @@ class MetricsCollector:
             f"成功率:{s['success_rate']:.0%} | "
             f"封锁率:{s['block_rate']:.0%} | "
             f"p50:{s['latency_p50']:.2f}s p95:{s['latency_p95']:.2f}s | "
+            f"RTT:{s['ewma_short']:.2f}/{s['ewma_long']:.2f}s g={s['rtt_gradient']:.2f} | "
             f"带宽:{bw_display:.0f}KB/s ({s['bandwidth_pct']:.0%})"
         )

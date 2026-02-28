@@ -46,7 +46,7 @@
       "DPS cooldown 缩短至 5-10s",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 5,
