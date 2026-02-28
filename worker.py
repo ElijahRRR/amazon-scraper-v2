@@ -1038,15 +1038,15 @@ class Worker:
 
                 # 快速模式: 先用 AOD 获取价格数据（信号量仅包裹 HTTP 请求）
                 if self.fast_mode and attempt == 0:
-                    await self._controller.acquire()
+                    await self._controller.acquire(channel)
                     aod_start = time.time()
                     try:
                         aod_result = await self._try_aod_fast(asin, zip_code, task, session)
                     finally:
                         aod_elapsed = time.time() - aod_start
-                        self._controller.release()
+                        self._controller.release(channel)
                     if aod_result is not None:
-                        self._controller.record_result(aod_elapsed, True, False, 0)
+                        self._controller.record_result(aod_elapsed, True, False, 0, channel_id=channel)
                         await self._submit_result(task_id, aod_result, success=True)
                         self._stats["success"] += 1
                         self._stats["total"] += 1
@@ -1060,7 +1060,7 @@ class Worker:
 
                 # 发起请求（信号量仅包裹 HTTP 请求，响应处理不占槽位）
                 t_sem_start = time.time()
-                await self._controller.acquire()
+                await self._controller.acquire(channel)
                 t_sem_wait = time.time() - t_sem_start
                 req_start = time.time()
                 try:
@@ -1068,11 +1068,11 @@ class Worker:
                     resp_bytes = len(resp.content) if resp and hasattr(resp, 'content') else 0
                 finally:
                     req_elapsed = time.time() - req_start
-                    self._controller.release()
+                    self._controller.release(channel)
 
                 # 请求失败（超时/网络异常）→ 不换 IP，等待后重试
                 if resp is None:
-                    self._controller.record_result(req_elapsed, False, False, 0)
+                    self._controller.record_result(req_elapsed, False, False, 0, channel_id=channel)
                     attempt += 1
                     logger.warning(f"ASIN {asin}{ch_tag} 请求超时 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
@@ -1080,7 +1080,7 @@ class Worker:
 
                 # 真正被封（403/503/验证码）
                 if session.is_blocked(resp):
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
@@ -1102,7 +1102,7 @@ class Worker:
 
                 # 404 处理
                 if session.is_404(resp):
-                    self._controller.record_result(req_elapsed, True, False, resp_bytes)
+                    self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
                     logger.info(f"ASIN {asin}{ch_tag} 商品不存在 (404)")
                     result_data = self.parser._default_result(asin, zip_code)
                     result_data["title"] = "[商品不存在]"
@@ -1121,7 +1121,7 @@ class Worker:
                 # 检查是否是拦截或空页面
                 title = result_data.get("title", "")
                 if title == "[验证码拦截]":
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "captcha"
@@ -1134,7 +1134,7 @@ class Worker:
                     continue
 
                 if title == "[API封锁]":
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
@@ -1147,7 +1147,7 @@ class Worker:
                     continue
 
                 if title in ["[页面为空]", "[HTML解析失败]"]:
-                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
                     attempt += 1
                     last_error_type = "parse_error"
                     last_error_detail = title
@@ -1157,7 +1157,7 @@ class Worker:
 
                 # 标题为空视为软拦截，重试
                 if not title or title == "N/A":
-                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
                     attempt += 1
                     last_error_type = "parse_error"
                     last_error_detail = "标题为空"
@@ -1170,7 +1170,7 @@ class Worker:
                 if price and price not in ["N/A", "不可售", "See price in cart"]:
                     # 价格应包含 $ 符号；出现 CNY/¥/€/£ 说明邮编没生效
                     if any(c in price for c in ["¥", "€", "£", "CNY"]) or "$" not in price:
-                        self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                        self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                         attempt += 1
                         last_error_type = "parse_error"
                         last_error_detail = f"非美国价格: {price}"
@@ -1182,7 +1182,7 @@ class Worker:
                         continue
 
                 # 成功
-                self._controller.record_result(req_elapsed, True, False, resp_bytes)
+                self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
                 await self._submit_result(task_id, result_data, success=True)
                 self._stats["success"] += 1
                 self._stats["total"] += 1

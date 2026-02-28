@@ -33,7 +33,7 @@
       "TPS 模式行为不变",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 4,
