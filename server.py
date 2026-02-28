@@ -107,6 +107,10 @@ def _default_settings() -> dict:
         # 隧道代理配置（共用 proxy_api_url，只需通道数和轮换周期）
         "tunnel_channels": config.TUNNEL_CHANNELS,
         "tunnel_rotate_interval": config.TUNNEL_ROTATE_INTERVAL,
+        # DPS 优化参数
+        "tunnel_max_concurrency": getattr(config, "TUNNEL_MAX_CONCURRENCY", 48),
+        "tunnel_initial_concurrency": getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16),
+        "per_channel_qps": getattr(config, "PER_CHANNEL_QPS", 3.0),
     }
 
 _SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
@@ -878,6 +882,10 @@ async def update_settings(request: Request):
         # 隧道代理配置（共用 proxy_api_url）
         "tunnel_channels":      (int,   1,    32),
         "tunnel_rotate_interval": (int, 10,   300),
+        # DPS 优化参数
+        "tunnel_max_concurrency":     (int,   8,    200),
+        "tunnel_initial_concurrency": (int,   2,    100),
+        "per_channel_qps":            (float, 0.5,  20),
     }
 
     changed = False

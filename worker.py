@@ -878,6 +878,27 @@ class Worker:
                         rotate_changed = True
                         changes.append(f"tunnel_rotate={tunnel_rotate}")
 
+                    # DPS 优化参数
+                    new_tmc = s.get("tunnel_max_concurrency")
+                    if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
+                        config.TUNNEL_MAX_CONCURRENCY = new_tmc
+                        # 隧道模式下同步到控制器上限
+                        if self._proxy_mode == "tunnel":
+                            self._controller._max = new_tmc
+                        changes.append(f"tunnel_max_c={new_tmc}")
+
+                    new_tic = s.get("tunnel_initial_concurrency")
+                    if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
+                        config.TUNNEL_INITIAL_CONCURRENCY = new_tic
+                        changes.append(f"tunnel_init_c={new_tic}")
+
+                    new_pcq = s.get("per_channel_qps")
+                    if new_pcq and new_pcq != getattr(config, "PER_CHANNEL_QPS", 3.0):
+                        config.PER_CHANNEL_QPS = new_pcq
+                        if self._channel_rate_limiter:
+                            self._channel_rate_limiter.per_channel_rate = new_pcq
+                        changes.append(f"per_ch_qps={new_pcq}")
+
                     # 代理模式（热切换：TPS ↔ 隧道）
                     mode_changed = False
                     new_mode = s.get("proxy_mode")

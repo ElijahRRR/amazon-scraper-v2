@@ -118,7 +118,7 @@
       "Worker 端正确接收和应用新参数",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 11,

@@ -79,6 +79,24 @@
                                    value="{{ settings.tunnel_rotate_interval }}" min="10" max="300">
                             <small class="text-secondary">秒，到期后重新获取代理</small>
                         </div>
+                        <div class="col-md-4">
+                            <label class="form-label">DPS 最大并发</label>
+                            <input type="number" class="form-control" name="tunnel_max_concurrency"
+                                   value="{{ settings.tunnel_max_concurrency }}" min="8" max="200">
+                            <small class="text-secondary">隧道模式并发上限（所有通道合计）</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">DPS 初始并发</label>
+                            <input type="number" class="form-control" name="tunnel_initial_concurrency"
+                                   value="{{ settings.tunnel_initial_concurrency }}" min="2" max="100">
+                            <small class="text-secondary">隧道模式冷启动并发数</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Per-Channel QPS</label>
+                            <input type="number" class="form-control" name="per_channel_qps"
+                                   value="{{ settings.per_channel_qps }}" step="0.5" min="0.5" max="20">
+                            <small class="text-secondary">每通道独立限流速率</small>
+                        </div>
                     </div>
 
                     <hr class="my-4" style="border-color:var(--border);">
@@ -251,10 +269,11 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     const intFields = ['max_retries', 'request_timeout', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
                        'proxy_bandwidth_mbps', 'screenshot_concurrency', 'global_max_concurrency',
-                       'tunnel_channels', 'tunnel_rotate_interval'];
+                       'tunnel_channels', 'tunnel_rotate_interval',
+                       'tunnel_max_concurrency', 'tunnel_initial_concurrency'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold',
-                         'global_max_qps'];
+                         'global_max_qps', 'per_channel_qps'];
     intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
     floatFields.forEach(f => { if (data[f] !== undefined) data[f] = parseFloat(data[f]); });
 
