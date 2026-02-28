@@ -54,7 +54,7 @@
     <div class="card-body">
         <div class="d-flex justify-content-between mb-2">
             <span>整体进度</span>
-            <span id="progress-pct">{{ progress.success_rate }}%</span>
+            <span id="progress-pct">{{ progress.completion_rate }}%</span>
         </div>
         <div class="progress" style="height: 12px;">
             <div class="progress-bar bg-success" id="progress-bar-done"
@@ -64,10 +64,10 @@
         </div>
         <div class="d-flex justify-content-between mt-2">
             <small class="text-secondary">
-                <i class="bi bi-pc-display-horizontal"></i> 在线 Worker: <strong>{{ active_workers }}</strong>
+                <i class="bi bi-pc-display-horizontal"></i> 在线 Worker: <strong id="stat-workers">{{ active_workers }}</strong>
             </small>
             <small class="text-secondary">
-                成功率: <strong>{{ progress.success_rate }}%</strong>
+                成功率: <strong id="stat-success-rate">{{ progress.success_rate }}%</strong>
             </small>
         </div>
     </div>
@@ -80,7 +80,7 @@
         <a href="/tasks" class="btn btn-sm btn-outline-accent">查看全部</a>
     </div>
     <div class="card-body p-0">
-        <table class="table table-hover mb-0">
+        <table class="table table-hover mb-0" id="batchTable">
             <thead>
                 <tr>
                     <th>批次名称</th>
@@ -118,49 +118,105 @@
 
 {% block extra_js %}
 <script>
-// 速度计算：追踪 done 变化量
+// HTML 转义
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// 速度计算：EWMA 平滑
 let prevDone = {{ progress.done }};
 let prevTime = Date.now();
+let ewmaSpeed = null;
+const EWMA_ALPHA = 0.3;
 
-// 每 10 秒刷新进度和计算速度
+// 每 3 秒刷新全部数据
 setInterval(async () => {
     try {
-        const resp = await fetch('/api/progress');
-        const data = await resp.json();
+        // 并行拉取 progress, batches, workers
+        const [progResp, batchResp, workerResp] = await Promise.all([
+            fetch('/api/progress'),
+            fetch('/api/batches'),
+            fetch('/api/workers'),
+        ]);
+        const data = await progResp.json();
+        const batchData = await batchResp.json();
+        const batches = batchData.batches || [];
+        const workerData = await workerResp.json();
+        const workers = workerData.workers || [];
 
+        // 更新统计卡片
         document.getElementById('stat-total').textContent = data.total;
         document.getElementById('stat-done').textContent = data.done;
         document.getElementById('stat-processing').textContent = data.processing;
         document.getElementById('stat-failed').textContent = data.failed;
-        document.getElementById('progress-pct').textContent = data.success_rate + '%';
+
+        // 进度条用 completion_rate，成功率单独显示
+        document.getElementById('progress-pct').textContent = data.completion_rate + '%';
+        document.getElementById('stat-success-rate').textContent = data.success_rate + '%';
 
         if (data.total > 0) {
             document.getElementById('progress-bar-done').style.width = (data.done / data.total * 100) + '%';
             document.getElementById('progress-bar-failed').style.width = (data.failed / data.total * 100) + '%';
         }
 
-        // 计算速度
+        // Worker 数（API 返回 status: "online"/"offline"）
+        const activeCount = workers.filter(w => w.status === 'online').length;
+        document.getElementById('stat-workers').textContent = activeCount;
+
+        // EWMA 速度计算
         const now = Date.now();
         const deltaDone = data.done - prevDone;
         const deltaSec = (now - prevTime) / 1000;
 
         if (deltaSec > 0 && deltaDone >= 0) {
-            const speed = deltaDone / deltaSec * 60;
+            const instantSpeed = deltaDone / deltaSec * 60;
             const el = document.getElementById('stat-speed');
+
             if (deltaDone === 0 && data.processing === 0) {
+                ewmaSpeed = 0;
                 el.textContent = '0';
                 el.style.color = 'var(--text-secondary)';
             } else if (deltaDone === 0) {
-                // 有任务在处理但还没出结果，保持上次的值不变
+                // 有任务在处理但还没出结果，EWMA 衰减
+                if (ewmaSpeed !== null) {
+                    ewmaSpeed = ewmaSpeed * (1 - EWMA_ALPHA);
+                    el.textContent = ewmaSpeed.toFixed(1);
+                }
             } else {
-                el.textContent = speed.toFixed(1);
+                ewmaSpeed = ewmaSpeed === null
+                    ? instantSpeed
+                    : EWMA_ALPHA * instantSpeed + (1 - EWMA_ALPHA) * ewmaSpeed;
+                el.textContent = ewmaSpeed.toFixed(1);
                 el.style.color = 'var(--accent)';
             }
         }
 
         prevDone = data.done;
         prevTime = now;
+
+        // 刷新批次表格
+        const tbody = document.querySelector('#batchTable tbody');
+        if (tbody) {
+            if (!batches || batches.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">暂无批次</td></tr>';
+            } else {
+                tbody.innerHTML = batches.map(b => `<tr>
+                    <td><a href="/results?batch_name=${encodeURIComponent(b.batch_name)}" class="text-decoration-none" style="color:var(--accent)">${esc(b.batch_name)}</a></td>
+                    <td>${b.total}</td>
+                    <td><span class="text-success">${b.done}</span></td>
+                    <td><span class="text-danger">${b.failed}</span></td>
+                    <td>
+                        <div class="progress" style="width:120px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:${b.progress}%"></div>
+                        </div>
+                        <small class="text-secondary">${b.progress}% <span class="text-success">(${b.success_rate}%)</span></small>
+                    </td>
+                    <td><small class="text-secondary">${esc(b.created_at)}</small></td>
+                </tr>`).join('');
+            }
+        }
     } catch(e) {}
-}, 10000);
+}, 3000);
 </script>
 {% endblock %}

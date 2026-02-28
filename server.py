@@ -111,6 +111,7 @@ def _default_settings() -> dict:
         "tunnel_max_concurrency": getattr(config, "TUNNEL_MAX_CONCURRENCY", 48),
         "tunnel_initial_concurrency": getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16),
         "per_channel_qps": getattr(config, "PER_CHANNEL_QPS", 3.0),
+        "per_channel_max_concurrency": getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 12),
     }
 
 _SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
@@ -886,6 +887,7 @@ async def update_settings(request: Request):
         "tunnel_max_concurrency":     (int,   8,    200),
         "tunnel_initial_concurrency": (int,   2,    100),
         "per_channel_qps":            (float, 0.5,  20),
+        "per_channel_max_concurrency": (int,   1,    30),
     }
 
     changed = False

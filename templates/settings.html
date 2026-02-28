@@ -97,13 +97,20 @@
                                    value="{{ settings.per_channel_qps }}" step="0.5" min="0.5" max="20">
                             <small class="text-secondary">每通道独立限流速率</small>
                         </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Per-Channel 最大并发</label>
+                            <input type="number" class="form-control" name="per_channel_max_concurrency"
+                                   value="{{ settings.per_channel_max_concurrency }}" min="1" max="30">
+                            <small class="text-secondary">每通道 AIMD 并发上限</small>
+                        </div>
                     </div>
 
                     <hr class="my-4" style="border-color:var(--border);">
 
                     <!-- 速率与并发 -->
                     <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-speedometer2"></i> 速率与并发</h6>
-                    <div class="row g-3">
+                    <!-- TPS 专属字段 -->
+                    <div id="tpsConfig" class="row g-3" style="{{ '' if settings.proxy_mode == 'tps' else 'display:none' }}">
                         <div class="col-md-3">
                             <label class="form-label">全局总并发上限</label>
                             <input type="number" class="form-control" name="global_max_concurrency"
@@ -129,16 +136,19 @@
                             <small class="text-secondary">Worker 冷启动并发数</small>
                         </div>
                         <div class="col-md-3">
-                            <label class="form-label">最小并发</label>
-                            <input type="number" class="form-control" name="min_concurrency"
-                                   value="{{ settings.min_concurrency }}" min="1" max="20">
-                            <small class="text-secondary">AIMD 下限</small>
-                        </div>
-                        <div class="col-md-3">
                             <label class="form-label">最大并发</label>
                             <input type="number" class="form-control" name="max_concurrency"
                                    value="{{ settings.max_concurrency }}" min="2" max="100">
                             <small class="text-secondary">单 Worker AIMD 上限</small>
+                        </div>
+                    </div>
+                    <!-- 通用字段 -->
+                    <div class="row g-3 mt-1">
+                        <div class="col-md-3">
+                            <label class="form-label">最小并发</label>
+                            <input type="number" class="form-control" name="min_concurrency"
+                                   value="{{ settings.min_concurrency }}" min="1" max="20">
+                            <small class="text-secondary">AIMD 下限</small>
                         </div>
                     </div>
 
@@ -270,7 +280,8 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
                        'proxy_bandwidth_mbps', 'screenshot_concurrency', 'global_max_concurrency',
                        'tunnel_channels', 'tunnel_rotate_interval',
-                       'tunnel_max_concurrency', 'tunnel_initial_concurrency'];
+                       'tunnel_max_concurrency', 'tunnel_initial_concurrency',
+                       'per_channel_max_concurrency'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold',
                          'global_max_qps', 'per_channel_qps'];
@@ -340,6 +351,7 @@ let _initialMode = '{{ settings.proxy_mode }}';
 function toggleTunnelConfig() {
     const mode = document.getElementById('proxyModeSelect').value;
     document.getElementById('tunnelConfig').style.display = mode === 'tunnel' ? '' : 'none';
+    document.getElementById('tpsConfig').style.display = mode === 'tps' ? '' : 'none';
     // 模式切换时自动填充预设值并高亮
     if (mode !== _initialMode) {
         const preset = _modePresets[mode] || {};
@@ -349,7 +361,7 @@ function toggleTunnelConfig() {
         }
     } else {
         // 切回原模式，移除高亮
-        for (const k of Object.keys(_modePresets.tps)) {
+        for (const k of Object.keys(_modePresets.tps).concat(Object.keys(_modePresets.tunnel))) {
             const el = document.querySelector(`[name="${k}"]`);
             if (el) el.style.border = '';
         }

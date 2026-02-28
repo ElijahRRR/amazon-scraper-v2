@@ -59,11 +59,11 @@ TUNNEL_MAX_CONCURRENCY = 20      # DPS 隧道模式总并发上限（实测 12-1
 TUNNEL_INITIAL_CONCURRENCY = 8   # DPS 隧道模式冷启动并发（AIMD 从 8→15 探索最优点）
 
 # Per-channel 并发控制（DPS 模式下每个 channel 的 AIMD 范围）
-# 带宽约束：总带宽 5Mbps，每通道上限 3Mbps
-# 压缩后每页 ~300KB，饱和 5Mbps 需要 ~13 并发连接
-PER_CHANNEL_INITIAL_CONCURRENCY = 2  # 每通道初始并发（2×8=16 起步，AIMD 收敛到最优）
+# 带宽约束：总带宽 5Mbps，压缩后每页 ~46KB(wire)
+# 填满 5Mbps 需 ~13.6 req/s，p50=6s → 需 ~82 并发 → 每通道 ~10
+PER_CHANNEL_INITIAL_CONCURRENCY = 5  # 每通道初始并发（5×8=40 起步，快速预热）
 PER_CHANNEL_MIN_CONCURRENCY = 1      # 每通道最小并发
-PER_CHANNEL_MAX_CONCURRENCY = 4      # 每通道最大并发（4×8=32 上限，带宽敏感）
+PER_CHANNEL_MAX_CONCURRENCY = 12     # 每通道最大并发（12×8=96 上限，AIMD 自动寻甜区）
 
 # 代理硬约束
 PROXY_BANDWIDTH_MBPS = 5         # 代理带宽上限（Mbps），用于 AIMD 带宽感知

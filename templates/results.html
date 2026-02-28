@@ -22,8 +22,9 @@
     </div>
     <div class="col-6 col-lg-3">
         <div class="stat-card warning">
-            <div class="stat-label">采集进度</div>
-            <div class="stat-number" id="stat-rate">{{ progress.success_rate }}%</div>
+            <div class="stat-label">进度 / 成功率</div>
+            <div class="stat-number" id="stat-rate">{{ progress.completion_rate }}%</div>
+            <div class="text-secondary" style="font-size:0.8rem;" id="stat-success-rate">成功率 {{ progress.success_rate }}%</div>
         </div>
     </div>
     <div class="col-6 col-lg-3">
@@ -280,7 +281,8 @@ async function loadProgress() {
 
         document.getElementById('stat-total').textContent = data.total;
         document.getElementById('stat-done').textContent = data.done;
-        document.getElementById('stat-rate').textContent = data.success_rate + '%';
+        document.getElementById('stat-rate').textContent = data.completion_rate + '%';
+        document.getElementById('stat-success-rate').textContent = '成功率 ' + data.success_rate + '%';
         document.getElementById('stat-failed').textContent = data.failed;
     } catch(e) {
         console.error('加载进度失败:', e);

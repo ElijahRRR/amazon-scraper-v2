@@ -462,6 +462,15 @@ class Worker:
                     self._channel_rate_limiter.per_channel_rate = new_ch_rate
                     changes.append(f"per_ch_QPS={new_ch_rate}")
 
+            # Per-channel 最大并发（DPS 模式）
+            new_pcmc = s.get("per_channel_max_concurrency")
+            if new_pcmc and self._proxy_mode == "tunnel":
+                config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
+                for cc in self._controller._channel_controllers.values():
+                    if cc._max != new_pcmc:
+                        cc._max = new_pcmc
+                changes.append(f"per_ch_max_c={new_pcmc}")
+
             # DPS 优化参数（初始同步）
             new_tmc = s.get("tunnel_max_concurrency")
             if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
@@ -481,10 +490,12 @@ class Worker:
                 self._controller._min = new_min
                 changes.append(f"min_c={new_min}")
 
-            new_max = s.get("max_concurrency")
-            if new_max and new_max != self._controller._max:
-                self._controller._max = new_max
-                changes.append(f"max_c={new_max}")
+            # tunnel 模式下 _controller._max 由 tunnel_max_concurrency 控制，不用 max_concurrency 覆盖
+            if self._proxy_mode != "tunnel":
+                new_max = s.get("max_concurrency")
+                if new_max and new_max != self._controller._max:
+                    self._controller._max = new_max
+                    changes.append(f"max_c={new_max}")
 
             new_initial = s.get("initial_concurrency")
             if new_initial and new_initial != self._controller._concurrency:
@@ -818,8 +829,8 @@ class Worker:
                             self._rate_limiter.rate = new_rate
                             changes.append(f"QPS={new_rate}")
 
-                    # 并发范围（仅在无配额时使用全局值）
-                    if "_quota" not in s:
+                    # 并发范围（仅在无配额时使用全局值；tunnel 模式由 tunnel_max_concurrency 控制）
+                    if "_quota" not in s and self._proxy_mode != "tunnel":
                         new_max = s.get("max_concurrency")
                         if new_max and new_max != self._controller._max:
                             self._controller._max = new_max
@@ -916,6 +927,15 @@ class Worker:
                             self._channel_rate_limiter.per_channel_rate = new_pcq
                         changes.append(f"per_ch_qps={new_pcq}")
 
+                    # Per-channel 最大并发（运行时调整）
+                    new_pcmc = s.get("per_channel_max_concurrency")
+                    if new_pcmc and new_pcmc != getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 12):
+                        config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
+                        if self._proxy_mode == "tunnel":
+                            for cc in self._controller._channel_controllers.values():
+                                cc._max = new_pcmc
+                        changes.append(f"per_ch_max_c={new_pcmc}")
+
                     # 代理模式（热切换：TPS ↔ 隧道）
                     mode_changed = False
                     new_mode = s.get("proxy_mode")
@@ -953,8 +973,10 @@ class Worker:
                         logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
 
                 # === 配额执行（每次都执行，不受 version 限制）===
+                # tunnel 模式下：_controller._max 由 tunnel_max_concurrency 控制，
+                # per-channel QPS 由 per_channel_qps 控制，配额不覆盖
                 quota = s.get("_quota")
-                if quota:
+                if quota and self._proxy_mode != "tunnel":
                     new_max_c = quota.get("concurrency")
                     if new_max_c and new_max_c != self._controller._max:
                         old_max = self._controller._max
@@ -972,9 +994,6 @@ class Worker:
                         old_qps = self._rate_limiter.rate
                         self._rate_limiter.rate = new_qps
                         logger.info(f"📊 配额: QPS {old_qps:.1f}->{new_qps:.1f}")
-                    elif new_qps and self._channel_rate_limiter:
-                        self._channel_rate_limiter.per_channel_rate = new_qps
-                        logger.info(f"📊 配额: per-ch QPS -> {new_qps:.1f}")
 
                 # === 全局封锁处理 ===
                 block_info = s.get("_global_block", {})

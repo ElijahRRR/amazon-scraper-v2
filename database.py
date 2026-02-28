@@ -460,13 +460,15 @@ class Database:
         done = row["done"] or 0
         failed = row["failed"] or 0
 
+        completed = done + failed
         return {
             "total": total,
             "pending": row["pending"] or 0,
             "processing": row["processing"] or 0,
             "done": done,
             "failed": failed,
-            "success_rate": round(done / total * 100, 1) if total > 0 else 0,
+            "success_rate": round(done / completed * 100, 1) if completed > 0 else 0,
+            "completion_rate": round(done / total * 100, 1) if total > 0 else 0,
         }
 
     async def get_batch_list(self) -> List[Dict]:
@@ -489,15 +491,18 @@ class Database:
             for row in rows:
                 total = row["total"]
                 done = row["done"] or 0
+                failed = row["failed"] or 0
+                completed = done + failed
                 batches.append({
                     "batch_name": row["batch_name"],
                     "total": total,
                     "done": done,
-                    "failed": row["failed"] or 0,
+                    "failed": failed,
                     "pending": row["pending"] or 0,
                     "processing": row["processing"] or 0,
                     "created_at": row["created_at"],
                     "progress": round(done / total * 100, 1) if total > 0 else 0,
+                    "success_rate": round(done / completed * 100, 1) if completed > 0 else 0,
                 })
             return batches
 
