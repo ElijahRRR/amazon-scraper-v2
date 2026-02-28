@@ -1619,27 +1619,45 @@ class Worker:
         """
         IP 轮换监控协程（仅隧道模式）。
 
-        每秒检查是否到达 IP 轮换时间点（60s 周期）。
-        隧道代理地址不变，出口 IP 由代理服务自动切换。
-
-        关键优化：IP 轮换后 **不重建 Session**。
-        - 代理地址 (l227.kdltps.com:15818) 不变，HTTP 连接保持
-        - Cookie 绑定的是 amazon.com 域名，不是客户端 IP
-        - 出口 IP 变化对 Session 透明，无需重建
-        - 仅重置通道封锁状态（新 IP 不受旧封锁影响）
+        双策略：
+        1. 被封换 IP：当 ≥50% channel 被封时，主动调用 ChangeTpsIp 换 IP
+           + 换 IP 后重建被封 channel 的 Session
+        2. 定时安全轮换：到达轮换周期时自动重置封锁状态
         """
         logger.info(f"🔄 IP 轮换监控启动 (周期: {config.TUNNEL_ROTATE_INTERVAL}s)")
         while self._running:
             try:
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 if not self._running:
                     break
 
+                # 策略 1：被封换 IP（≥50% channel 被封时主动换 IP）
+                total_ch = len(self.proxy_manager._channels)
+                blocked_ch = sum(
+                    1 for ch in self.proxy_manager._channels.values() if ch.blocked
+                )
+                if total_ch > 0 and blocked_ch >= max(1, total_ch // 2):
+                    logger.warning(
+                        f"🔄 {blocked_ch}/{total_ch} channel 被封，主动换 IP..."
+                    )
+                    changed = await self.proxy_manager.change_ip()
+                    if changed:
+                        logger.info("🔄 主动换 IP 成功，重建被封 Session...")
+                        # 重建被封的 session
+                        if self._session_pool:
+                            for ch_id, ch_state in self.proxy_manager._channels.items():
+                                if not ch_state.blocked:
+                                    continue
+                                await self._session_pool.rebuild_session(ch_id)
+                        continue
+
+                # 策略 2：定时安全轮换（保留作为兜底）
                 rotated = await self.proxy_manager.handle_ip_rotation()
                 if rotated:
-                    # 仅记录轮换，不重建 Session — 代理地址不变，Cookie 继续有效
-                    logger.info(f"🔄 IP 轮换完成（Session 保持）"
-                                f" | 下次轮换: {self.proxy_manager.time_to_next_rotation():.0f}s")
+                    logger.info(
+                        f"🔄 定时 IP 轮换完成（Session 保持）"
+                        f" | 下次轮换: {self.proxy_manager.time_to_next_rotation():.0f}s"
+                    )
 
             except asyncio.CancelledError:
                 break

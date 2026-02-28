@@ -70,7 +70,7 @@
       "预热备用 session pool，封锁时瞬切",
       "Python 语法检查通过"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": 7,
