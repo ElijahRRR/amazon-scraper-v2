@@ -16,7 +16,7 @@
   "min_success_rate": 0.75,
   "block_rate_threshold": 0.05,
   "cooldown_after_block": 15,
-  "proxy_bandwidth_mbps": 5,
+  "proxy_bandwidth_mbps": 15,
   "global_max_concurrency": 200,
   "global_max_qps": 10.0,
   "proxy_mode": "tunnel",

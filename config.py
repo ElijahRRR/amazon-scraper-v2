@@ -66,7 +66,7 @@ PER_CHANNEL_MIN_CONCURRENCY = 1      # 每通道最小并发
 PER_CHANNEL_MAX_CONCURRENCY = 4      # 每通道最大并发（4×8=32 上限，代理甜区 20-30）
 
 # 代理硬约束
-PROXY_BANDWIDTH_MBPS = 5         # 代理带宽上限（Mbps），用于 AIMD 带宽感知
+PROXY_BANDWIDTH_MBPS = 15        # 代理带宽上限（Mbps），用于 AIMD 带宽感知
 
 # 自适应调节参数
 ADJUST_INTERVAL_S = 10           # 评估间隔（秒）
