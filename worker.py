@@ -12,6 +12,7 @@ Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发
 import asyncio
 import argparse
 import logging
+import random
 import time
 import uuid
 import signal
@@ -1130,6 +1131,8 @@ class Worker:
                 # 快速模式: 先用 AOD 获取价格数据（信号量仅包裹 HTTP 请求）
                 if self.fast_mode and attempt == 0:
                     await self._controller.acquire(channel)
+                    # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
+                    await asyncio.sleep(random.uniform(0.05, 0.3))
                     aod_start = time.time()
                     try:
                         aod_result = await self._try_aod_fast(asin, zip_code, task, session)
@@ -1153,6 +1156,8 @@ class Worker:
                 t_sem_start = time.time()
                 await self._controller.acquire(channel)
                 t_sem_wait = time.time() - t_sem_start
+                # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
+                await asyncio.sleep(random.uniform(0.05, 0.3))
                 req_start = time.time()
                 try:
                     resp = await session.fetch_product_page(asin)

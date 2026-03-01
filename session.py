@@ -286,7 +286,7 @@ class AmazonSession:
 
         return headers
 
-    async def fetch_aod_page(self, asin: str) -> Optional[Response]:
+    async def fetch_aod_page(self, asin: str, max_recv_speed: int = 0) -> Optional[Response]:
         """采集 AOD (All Offers Display) AJAX 页面"""
         if not self._initialized:
             await self.initialize()
@@ -309,6 +309,7 @@ class AmazonSession:
             resp = await self._session.get(
                 url,
                 headers=headers,
+                max_recv_speed=max_recv_speed,
             )
 
             self._last_url = referer
@@ -319,7 +320,7 @@ class AmazonSession:
             logger.error(f"AOD 请求失败 ASIN={asin}: {e}")
             return None
 
-    async def fetch_product_page(self, asin: str) -> Optional[Response]:
+    async def fetch_product_page(self, asin: str, max_recv_speed: int = 0) -> Optional[Response]:
         """采集 Amazon 商品页面"""
         if not self._initialized:
             await self.initialize()
@@ -336,6 +337,7 @@ class AmazonSession:
             resp = await self._session.get(
                 url,
                 headers=headers,
+                max_recv_speed=max_recv_speed,
             )
 
             self._last_url = url
