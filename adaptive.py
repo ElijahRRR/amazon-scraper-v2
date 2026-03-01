@@ -441,10 +441,11 @@ class TokenBucket:
     - TokenBucket 控制新请求的产生速率
     """
 
-    def __init__(self, rate: float = None, burst: int = None):
+    def __init__(self, rate: float = None, burst: int = None,
+                 initial_tokens: float = 0.0):
         self._rate = rate or config.TOKEN_BUCKET_RATE
         self._burst = burst or 1  # 默认 burst=1，禁止积累，严格均匀间隔
-        self._tokens = 1.0        # 初始 1 个令牌，不满桶启动
+        self._tokens = initial_tokens  # 默认 0：冷启动也遵循节拍间隔
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -500,14 +501,22 @@ class ChannelRateLimiter:
             config, "PER_CHANNEL_QPS", 3.0
         )
         self._buckets: dict[int, TokenBucket] = {}
+        base_interval = 1.0 / self._per_channel_rate
         for ch_id in range(1, self._channels + 1):
+            # 相位错开：每个通道的令牌初始偏移 = (ch_index / N) * interval
+            # 通过设置 initial_tokens 为相位对应的令牌量实现
+            # ch1 最先拿到令牌，ch8 最后，均匀铺开
+            phase_offset = ((ch_id - 1) / self._channels) * base_interval
+            initial_tokens = phase_offset * self._per_channel_rate  # 0 ~ 1-1/N
             self._buckets[ch_id] = TokenBucket(
                 rate=self._per_channel_rate,
                 burst=self._calc_burst(self._per_channel_rate),
+                initial_tokens=initial_tokens,
             )
         logger.info(
             f"Per-channel 限流器初始化: {self._channels} channels × "
             f"{self._per_channel_rate} QPS = {self._channels * self._per_channel_rate:.1f} 总 QPS"
+            f" (相位错开: {base_interval/self._channels*1000:.0f}ms 间隔)"
         )
 
     async def acquire(self, channel_id: int = None):
@@ -521,11 +530,15 @@ class ChannelRateLimiter:
 
     def resize(self, channels: int):
         """运行时调整 channel 数量"""
+        base_interval = 1.0 / self._per_channel_rate
         for ch_id in range(1, channels + 1):
             if ch_id not in self._buckets:
+                phase_offset = ((ch_id - 1) / channels) * base_interval
+                initial_tokens = phase_offset * self._per_channel_rate
                 self._buckets[ch_id] = TokenBucket(
                     rate=self._per_channel_rate,
                     burst=self._calc_burst(self._per_channel_rate),
+                    initial_tokens=initial_tokens,
                 )
         to_remove = [k for k in self._buckets if k > channels]
         for k in to_remove:

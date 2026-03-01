@@ -1131,8 +1131,12 @@ class Worker:
                 # 快速模式: 先用 AOD 获取价格数据（信号量仅包裹 HTTP 请求）
                 if self.fast_mode and attempt == 0:
                     await self._controller.acquire(channel)
-                    # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
-                    await asyncio.sleep(random.uniform(0.05, 0.3))
+                    # 微抖动：绑定目标节拍间隔，避免过度随机造成碰撞
+                    _qps = (self._channel_rate_limiter.per_channel_rate
+                            if self._channel_rate_limiter
+                            else (self._rate_limiter.rate if self._rate_limiter else 5.0))
+                    _jitter_max = min(0.3, 0.5 / _qps)
+                    await asyncio.sleep(random.uniform(0, _jitter_max))
                     # 计算 per-request 带宽限速
                     aod_recv_speed = 0
                     bw_mbps = config.PROXY_BANDWIDTH_MBPS
@@ -1163,8 +1167,12 @@ class Worker:
                 t_sem_start = time.time()
                 await self._controller.acquire(channel)
                 t_sem_wait = time.time() - t_sem_start
-                # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
-                await asyncio.sleep(random.uniform(0.05, 0.3))
+                # 微抖动：绑定目标节拍间隔，避免过度随机造成碰撞
+                _qps = (self._channel_rate_limiter.per_channel_rate
+                        if self._channel_rate_limiter
+                        else (self._rate_limiter.rate if self._rate_limiter else 5.0))
+                _jitter_max = min(0.3, 0.5 / _qps)
+                await asyncio.sleep(random.uniform(0, _jitter_max))
                 # 计算 per-request 带宽限速（仅当 proxy_bandwidth_mbps > 0 时生效）
                 recv_speed = 0
                 bw_mbps = config.PROXY_BANDWIDTH_MBPS
