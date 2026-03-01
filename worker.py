@@ -1133,9 +1133,16 @@ class Worker:
                     await self._controller.acquire(channel)
                     # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
                     await asyncio.sleep(random.uniform(0.05, 0.3))
+                    # 计算 per-request 带宽限速
+                    aod_recv_speed = 0
+                    bw_mbps = config.PROXY_BANDWIDTH_MBPS
+                    if bw_mbps > 0:
+                        pipe_bps = int(bw_mbps * 1_000_000 / 8)
+                        inflight = self._metrics.inflight
+                        aod_recv_speed = pipe_bps // max(1, inflight)
                     aod_start = time.time()
                     try:
-                        aod_result = await self._try_aod_fast(asin, zip_code, task, session)
+                        aod_result = await self._try_aod_fast(asin, zip_code, task, session, max_recv_speed=aod_recv_speed)
                     finally:
                         aod_elapsed = time.time() - aod_start
                         self._controller.release(channel)
@@ -1158,9 +1165,16 @@ class Worker:
                 t_sem_wait = time.time() - t_sem_start
                 # 微抖动：打破同步波浪，错开 HTTP 请求启动时间
                 await asyncio.sleep(random.uniform(0.05, 0.3))
+                # 计算 per-request 带宽限速（仅当 proxy_bandwidth_mbps > 0 时生效）
+                recv_speed = 0
+                bw_mbps = config.PROXY_BANDWIDTH_MBPS
+                if bw_mbps > 0:
+                    pipe_bps = int(bw_mbps * 1_000_000 / 8)
+                    inflight = self._metrics.inflight
+                    recv_speed = pipe_bps // max(1, inflight)
                 req_start = time.time()
                 try:
-                    resp = await session.fetch_product_page(asin)
+                    resp = await session.fetch_product_page(asin, max_recv_speed=recv_speed)
                     resp_bytes = len(resp.content) if resp and hasattr(resp, 'content') else 0
                 finally:
                     req_elapsed = time.time() - req_start
@@ -1343,17 +1357,19 @@ class Worker:
         return (False, False, resp_bytes)
 
     async def _try_aod_fast(self, asin: str, zip_code: str, task: Dict,
-                            session: AmazonSession = None) -> Optional[Dict]:
+                            session: AmazonSession = None,
+                            max_recv_speed: int = 0) -> Optional[Dict]:
         """
         AOD 快速路径: 用 AOD AJAX 端点获取价格数据
         成功返回 result_data，失败返回 None（会 fallback 到产品页）
 
         Args:
             session: 指定使用的 session（隧道模式下传入通道 session）
+            max_recv_speed: per-request 带宽限速（bytes/s），0 = 不限
         """
         session = session or self._session
         try:
-            resp = await session.fetch_aod_page(asin)
+            resp = await session.fetch_aod_page(asin, max_recv_speed=max_recv_speed)
             if resp is None:
                 return None
             if session.is_blocked(resp):

@@ -443,8 +443,8 @@ class TokenBucket:
 
     def __init__(self, rate: float = None, burst: int = None):
         self._rate = rate or config.TOKEN_BUCKET_RATE
-        self._burst = burst or max(1, int(self._rate))
-        self._tokens = float(self._burst)
+        self._burst = burst or 1  # 默认 burst=1，禁止积累，严格均匀间隔
+        self._tokens = 1.0        # 初始 1 个令牌，不满桶启动
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -517,7 +517,7 @@ class ChannelRateLimiter:
         await self._buckets[channel_id].acquire()
 
     def _calc_burst(self, rate: float) -> int:
-        return max(4, int(rate * 2))
+        return 1  # strict pacing，禁止 burst 积累
 
     def resize(self, channels: int):
         """运行时调整 channel 数量"""
