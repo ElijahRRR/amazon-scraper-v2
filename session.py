@@ -45,16 +45,18 @@ class AmazonSession:
     ZIP_CHANGE_URL = "https://www.amazon.com/gp/delivery/ajax/address-change.html"
 
     def __init__(self, proxy_manager: ProxyManager, zip_code: str = None,
-                 proxy_url: str = None):
+                 proxy_url: str = None, max_clients: int = None):
         """
         Args:
             proxy_manager: 代理管理器
             zip_code: 配送邮编
             proxy_url: 直接指定代理 URL（隧道模式由 SessionPool 传入）
+            max_clients: 连接池大小（HTTP/1.1 下为最大 TCP 连接数）
         """
         self.proxy_manager = proxy_manager
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self._fixed_proxy_url = proxy_url  # 隧道模式：固定代理 URL
+        self._max_clients = max_clients or config.MAX_CLIENTS
         self._session: Optional[AsyncSession] = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -102,8 +104,9 @@ class AmazonSession:
                         impersonate=self._impersonate,
                         timeout=config.REQUEST_TIMEOUT,
                         proxy=proxy,
-                        max_clients=config.MAX_CLIENTS,
-                        http_version=2,
+                        max_clients=self._max_clients,
+                        # HTTP/1.1: 每个请求独立 TCP 连接，丢包隔离，避免 H2 队头阻塞
+                        # HTTP/2 在窄带宽代理管道上会导致"一卡全卡"
                     )
 
                     # 1. 访问首页获取初始 cookies
@@ -538,6 +541,7 @@ class SessionPool:
                 self.proxy_manager,
                 zip_code=self.zip_code,
                 proxy_url=proxy_url,
+                max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
             )
             ok = await session.initialize()
             if ok:
@@ -568,6 +572,7 @@ class SessionPool:
                 self.proxy_manager,
                 zip_code=self.zip_code,
                 proxy_url=proxy_url,
+                max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
             )
             ok = await session.initialize()
             if ok:
@@ -611,6 +616,7 @@ class SessionPool:
                     self.proxy_manager,
                     zip_code=self.zip_code,
                     proxy_url=proxy_url,
+                    max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
                 )
                 ok = await asyncio.wait_for(
                     new_session.initialize(),

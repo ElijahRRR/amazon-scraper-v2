@@ -39,7 +39,7 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", 8899))
 # 采集配置
 # ============================================================
 DEFAULT_ZIP_CODE = os.environ.get("DEFAULT_ZIP_CODE", "10001")
-MAX_CLIENTS = 28                 # HTTP/2 连接池 max_clients（多路复用）
+MAX_CLIENTS = 16                 # HTTP/1.1 连接池（每 session 最大 TCP 连接数）
 REQUEST_TIMEOUT = 15             # 请求超时（秒）
 MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
