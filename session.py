@@ -20,6 +20,7 @@ import logging
 import time
 from typing import Optional, Dict, Any, List
 
+from curl_cffi import CurlHttpVersion
 from curl_cffi.requests import AsyncSession, Response
 
 import config
@@ -105,8 +106,10 @@ class AmazonSession:
                         timeout=config.REQUEST_TIMEOUT,
                         proxy=proxy,
                         max_clients=self._max_clients,
-                        # HTTP/1.1: 每个请求独立 TCP 连接，丢包隔离，避免 H2 队头阻塞
-                        # HTTP/2 在窄带宽代理管道上会导致"一卡全卡"
+                        # 必须显式指定 V1_1，否则 impersonate 通过 ALPN 协商 HTTP/2
+                        # HTTP/1.1: 每请求独立 TCP 连接，丢包隔离
+                        # 注意：CurlHttpVersion.V1_1 的整数值 = 2 (CURL_HTTP_VERSION_1_1)
+                        http_version=CurlHttpVersion.V1_1,
                     )
 
                     # 1. 访问首页获取初始 cookies
