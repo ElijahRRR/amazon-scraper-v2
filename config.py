@@ -38,6 +38,9 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", 8899))
 # ============================================================
 # 采集配置
 # ============================================================
+# 解析引擎: "selectolax" (默认, Lexbor C 引擎最快) | "lxml" | "scrapling" (Parsel 风格 CSS/XPath)
+PARSER_ENGINE = os.environ.get("PARSER_ENGINE", "selectolax")
+
 DEFAULT_ZIP_CODE = os.environ.get("DEFAULT_ZIP_CODE", "10001")
 MAX_CLIENTS = 16                 # HTTP/1.1 连接池（每 session 最大 TCP 连接数）
 REQUEST_TIMEOUT = 15             # 请求超时（秒）

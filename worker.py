@@ -24,7 +24,10 @@ import httpx
 import config
 from proxy import get_proxy_manager
 from session import AmazonSession, SessionPool
-from parser import AmazonParser
+if config.PARSER_ENGINE == "scrapling":
+    from parser_scrapling import ScraplingParser as _ParserClass
+else:
+    from parser import AmazonParser as _ParserClass
 from metrics import MetricsCollector
 from adaptive import AdaptiveController, TokenBucket, ChannelRateLimiter
 
@@ -52,7 +55,7 @@ class Worker:
 
         # 组件
         self.proxy_manager = get_proxy_manager()
-        self.parser = AmazonParser()
+        self.parser = _ParserClass()
         self._session: Optional[AmazonSession] = None       # TPS 模式
         self._session_pool: Optional[SessionPool] = None    # 隧道模式
 
