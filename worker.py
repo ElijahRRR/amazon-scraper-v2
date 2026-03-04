@@ -424,9 +424,189 @@ class Worker:
     # 核心处理逻辑（保持不变）
     # ═══════════════════════════════════════════════
 
+    async def _apply_settings(self, s: dict, is_initial: bool = False) -> list:
+        """统一应用设置字段，返回变更描述列表。
+
+        is_initial=True:  启动时调用，无版本检查，处理 zip_code 和 initial_concurrency
+        is_initial=False: 运行时同步，受版本守护和配额约束
+        """
+        changes = []
+        has_quota = "_quota" in s
+
+        # --- 固定隧道代理地址 ---
+        new_tunnel_url = s.get("tunnel_proxy_url", "")
+        if new_tunnel_url != config.TUNNEL_PROXY_URL:
+            config.TUNNEL_PROXY_URL = new_tunnel_url
+            changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
+
+        # --- 隧道通道数和轮换周期 ---
+        tunnel_channels = s.get("tunnel_channels")
+        tunnel_changed = False
+        if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
+            config.TUNNEL_CHANNELS = tunnel_channels
+            tunnel_changed = True
+            changes.append(f"tunnel_channels={tunnel_channels}")
+        tunnel_rotate = s.get("tunnel_rotate_interval")
+        rotate_changed = False
+        if tunnel_rotate and tunnel_rotate != config.TUNNEL_ROTATE_INTERVAL:
+            config.TUNNEL_ROTATE_INTERVAL = tunnel_rotate
+            rotate_changed = True
+            changes.append(f"tunnel_rotate={tunnel_rotate}")
+
+        # --- 代理模式（热切换：TPS ↔ 隧道）---
+        mode_changed = False
+        new_mode = s.get("proxy_mode")
+        if new_mode and new_mode in ("tps", "tunnel") and new_mode != self._proxy_mode:
+            mode_changed = True
+            self._proxy_mode = new_mode
+            config.PROXY_MODE = new_mode  # noqa
+            self.proxy_manager.switch_mode(new_mode)
+            await self._sync_controller_mode_profile(new_mode)
+            changes.append(f"proxy_mode={new_mode}")
+            # 热切换时同步会话容器（运行时才需要）
+            if not is_initial:
+                if new_mode == "tunnel":
+                    if self._session:
+                        await self._session.close()
+                        self._session = None
+                    await self._init_session_tunnel()
+                else:
+                    if self._session_pool:
+                        await self._session_pool.close_all()
+                        self._session_pool = None
+                    await self._init_session_tps()
+
+        # --- 同模式下参数变化：重配隧道运行时结构 ---
+        if self._proxy_mode == "tunnel" and (tunnel_changed or rotate_changed) and not mode_changed:
+            self.proxy_manager.reconfigure_tunnel(
+                channels=config.TUNNEL_CHANNELS,
+                rotate_interval=config.TUNNEL_ROTATE_INTERVAL,
+            )
+            if not is_initial and self._session_pool:
+                await self._session_pool.resize(config.TUNNEL_CHANNELS)
+                changes.append("tunnel_runtime_reconfig")
+
+        # --- 代理 API 地址 ---
+        new_proxy_url = s.get("proxy_api_url")
+        if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
+            config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
+            changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+
+        # --- 邮编（仅初始同步）---
+        if is_initial:
+            new_zip = s.get("zip_code")
+            if new_zip and self.zip_code == config.DEFAULT_ZIP_CODE and new_zip != self.zip_code:
+                self.zip_code = new_zip
+                changes.append(f"zip_code={new_zip}")
+
+        # --- 令牌桶 QPS（运行时受配额守护）---
+        if is_initial or not has_quota:
+            new_rate = s.get("token_bucket_rate")
+            if new_rate and self._rate_limiter and new_rate != self._rate_limiter.rate:
+                self._rate_limiter.rate = new_rate
+                changes.append(f"QPS={new_rate}")
+
+        # --- Per-channel QPS ---
+        new_pcq = s.get("per_channel_qps")
+        if new_pcq:
+            if is_initial and self._channel_rate_limiter:
+                if new_pcq != self._channel_rate_limiter.per_channel_rate:
+                    self._channel_rate_limiter.per_channel_rate = new_pcq
+                    changes.append(f"per_ch_QPS={new_pcq}")
+            elif not is_initial and new_pcq != getattr(config, "PER_CHANNEL_QPS", 3.0):
+                config.PER_CHANNEL_QPS = new_pcq
+                if self._channel_rate_limiter:
+                    self._channel_rate_limiter.per_channel_rate = new_pcq
+                changes.append(f"per_ch_qps={new_pcq}")
+
+        # --- Per-channel 最大并发 ---
+        new_pcmc = s.get("per_channel_max_concurrency")
+        if new_pcmc and self._proxy_mode == "tunnel":
+            config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
+            for cc in self._controller._channel_controllers.values():
+                if cc._max != new_pcmc:
+                    cc._max = new_pcmc
+            changes.append(f"per_ch_max_c={new_pcmc}")
+
+        # --- DPS 优化参数 ---
+        new_tmc = s.get("tunnel_max_concurrency")
+        if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
+            config.TUNNEL_MAX_CONCURRENCY = new_tmc
+            if self._proxy_mode == "tunnel":
+                self._controller._max = new_tmc
+            changes.append(f"tunnel_max_c={new_tmc}")
+
+        new_tic = s.get("tunnel_initial_concurrency")
+        if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
+            config.TUNNEL_INITIAL_CONCURRENCY = new_tic
+            changes.append(f"tunnel_init_c={new_tic}")
+
+        # --- 并发控制：min / max / initial ---
+        new_min = s.get("min_concurrency")
+        if new_min and new_min != self._controller._min:
+            self._controller._min = new_min
+            changes.append(f"min_c={new_min}")
+
+        if (is_initial or not has_quota) and self._proxy_mode != "tunnel":
+            new_max = s.get("max_concurrency")
+            if new_max and new_max != self._controller._max:
+                self._controller._max = new_max
+                changes.append(f"max_c={new_max}")
+
+        if is_initial:
+            new_initial = s.get("initial_concurrency")
+            if new_initial and new_initial != self._controller._concurrency:
+                clamped = max(self._controller._min, min(self._controller._max, new_initial))
+                self._controller._concurrency = clamped
+                self._controller._semaphore = asyncio.Semaphore(clamped)
+                changes.append(f"initial_c={clamped}")
+
+        # --- AIMD 调控参数 ---
+        for attr, key in [
+            ("_adjust_interval", "adjust_interval"),
+            ("_target_latency", "target_latency"),
+            ("_max_latency", "max_latency"),
+            ("_target_success", "target_success_rate"),
+            ("_min_success", "min_success_rate"),
+            ("_block_threshold", "block_rate_threshold"),
+            ("_cooldown_duration", "cooldown_after_block"),
+        ]:
+            val = s.get(key)
+            if val is not None and val != getattr(self._controller, attr, None):
+                setattr(self._controller, attr, val)
+                changes.append(f"{key}={val}")
+
+        # --- 带宽上限 ---
+        new_bw = s.get("proxy_bandwidth_mbps")
+        if new_bw is not None and new_bw != config.PROXY_BANDWIDTH_MBPS:
+            config.PROXY_BANDWIDTH_MBPS = new_bw
+            changes.append(f"bandwidth={new_bw}Mbps")
+
+        # --- 其他运行参数 ---
+        new_rotate = s.get("session_rotate_every")
+        if new_rotate and new_rotate != self._rotate_every:
+            self._rotate_every = new_rotate
+            changes.append(f"rotate={new_rotate}")
+
+        new_retries = s.get("max_retries")
+        if new_retries and new_retries != self._max_retries:
+            self._max_retries = new_retries
+            changes.append(f"retries={new_retries}")
+
+        new_timeout = s.get("request_timeout")
+        if new_timeout and new_timeout != config.REQUEST_TIMEOUT:
+            config.REQUEST_TIMEOUT = new_timeout
+            changes.append(f"timeout={new_timeout}s")
+
+        new_sc = s.get("screenshot_concurrency")
+        if new_sc and new_sc != self._screenshot_concurrency:
+            self._screenshot_concurrency = new_sc
+            changes.append(f"screenshot_c={new_sc}")
+
+        return changes
+
     async def _pull_initial_settings(self):
-        """启动时从 Server 拉取一次设置，确保所有运行参数与 Server 一致。
-        远程 Worker 无需本地 .env 或环境变量，所有配置由 Server 统一下发。"""
+        """启动时从 Server 拉取一次设置，确保所有运行参数与 Server 一致。"""
         logger.info("⚙️ 从服务器拉取初始设置...")
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -436,158 +616,7 @@ class Worker:
                     return
                 s = resp.json()
 
-            changes = []
-
-            # 固定隧道代理地址
-            new_tunnel_url = s.get("tunnel_proxy_url", "")
-            if new_tunnel_url != config.TUNNEL_PROXY_URL:
-                config.TUNNEL_PROXY_URL = new_tunnel_url
-                changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
-
-            # 隧道通道数和轮换周期
-            tunnel_channels = s.get("tunnel_channels")
-            tunnel_changed = False
-            rotate_changed = False
-            if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
-                config.TUNNEL_CHANNELS = tunnel_channels
-                tunnel_changed = True
-                changes.append(f"tunnel_channels={tunnel_channels}")
-            tunnel_rotate = s.get("tunnel_rotate_interval")
-            if tunnel_rotate and tunnel_rotate != config.TUNNEL_ROTATE_INTERVAL:
-                config.TUNNEL_ROTATE_INTERVAL = tunnel_rotate
-                rotate_changed = True
-                changes.append(f"tunnel_rotate={tunnel_rotate}")
-
-            # 代理模式（最关键：决定 Worker 的运行方式）
-            new_mode = s.get("proxy_mode")
-            if new_mode and new_mode in ("tps", "tunnel") and new_mode != self._proxy_mode:
-                self._proxy_mode = new_mode
-                config.PROXY_MODE = new_mode  # noqa
-                self.proxy_manager.switch_mode(new_mode)
-                await self._sync_controller_mode_profile(new_mode)
-                changes.append(f"proxy_mode={new_mode}")
-
-            # 若当前是隧道模式，配置变化需立即重配运行时通道集合
-            if self._proxy_mode == "tunnel" and (tunnel_changed or rotate_changed):
-                self.proxy_manager.reconfigure_tunnel(
-                    channels=config.TUNNEL_CHANNELS,
-                    rotate_interval=config.TUNNEL_ROTATE_INTERVAL,
-                )
-
-            # 代理 API 地址（远程 Worker 本地凭证为空，必须从 Server 获取）
-            new_proxy_url = s.get("proxy_api_url")
-            if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
-                config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
-                changes.append("proxy_api_url")
-
-            # 邮编（命令行未指定时，用 Server 端设置覆盖）
-            new_zip = s.get("zip_code")
-            if new_zip and self.zip_code == config.DEFAULT_ZIP_CODE and new_zip != self.zip_code:
-                self.zip_code = new_zip
-                changes.append(f"zip_code={new_zip}")
-
-            # 令牌桶 QPS
-            new_rate = s.get("token_bucket_rate")
-            if new_rate and self._rate_limiter and new_rate != self._rate_limiter.rate:
-                self._rate_limiter.rate = new_rate
-                changes.append(f"QPS={new_rate}")
-
-            # Per-channel QPS（DPS 模式）
-            new_ch_rate = s.get("per_channel_qps")
-            if new_ch_rate and self._channel_rate_limiter:
-                if new_ch_rate != self._channel_rate_limiter.per_channel_rate:
-                    self._channel_rate_limiter.per_channel_rate = new_ch_rate
-                    changes.append(f"per_ch_QPS={new_ch_rate}")
-
-            # Per-channel 最大并发（DPS 模式）
-            new_pcmc = s.get("per_channel_max_concurrency")
-            if new_pcmc and self._proxy_mode == "tunnel":
-                config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
-                for cc in self._controller._channel_controllers.values():
-                    if cc._max != new_pcmc:
-                        cc._max = new_pcmc
-                changes.append(f"per_ch_max_c={new_pcmc}")
-
-            # DPS 优化参数（初始同步）
-            new_tmc = s.get("tunnel_max_concurrency")
-            if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
-                config.TUNNEL_MAX_CONCURRENCY = new_tmc
-                if self._proxy_mode == "tunnel":
-                    self._controller._max = new_tmc
-                changes.append(f"max_c={new_tmc}")
-
-            new_tic = s.get("tunnel_initial_concurrency")
-            if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
-                config.TUNNEL_INITIAL_CONCURRENCY = new_tic
-                changes.append(f"tunnel_init_c={new_tic}")
-
-            # 并发控制：min / max / initial（顺序：先设范围，再设初始值）
-            new_min = s.get("min_concurrency")
-            if new_min and new_min != self._controller._min:
-                self._controller._min = new_min
-                changes.append(f"min_c={new_min}")
-
-            # tunnel 模式下 _controller._max 由 tunnel_max_concurrency 控制，不用 max_concurrency 覆盖
-            if self._proxy_mode != "tunnel":
-                new_max = s.get("max_concurrency")
-                if new_max and new_max != self._controller._max:
-                    self._controller._max = new_max
-                    changes.append(f"max_c={new_max}")
-
-            new_initial = s.get("initial_concurrency")
-            if new_initial and new_initial != self._controller._concurrency:
-                # 确保在合法范围内
-                clamped = max(self._controller._min, min(self._controller._max, new_initial))
-                self._controller._concurrency = clamped
-                # 启动前重建信号量，使其与新并发值匹配
-                self._controller._semaphore = asyncio.Semaphore(clamped)
-                changes.append(f"initial_c={clamped}")
-
-            # 最大重试
-            new_retries = s.get("max_retries")
-            if new_retries and new_retries != self._max_retries:
-                self._max_retries = new_retries
-                changes.append(f"retries={new_retries}")
-
-            # 请求超时
-            new_timeout = s.get("request_timeout")
-            if new_timeout and new_timeout != config.REQUEST_TIMEOUT:
-                config.REQUEST_TIMEOUT = new_timeout
-                changes.append(f"timeout={new_timeout}s")
-
-            # Session 轮换
-            new_rotate = s.get("session_rotate_every")
-            if new_rotate and new_rotate != self._rotate_every:
-                self._rotate_every = new_rotate
-                changes.append(f"rotate={new_rotate}")
-
-            # 截图并发
-            new_sc = s.get("screenshot_concurrency")
-            if new_sc and new_sc != self._screenshot_concurrency:
-                self._screenshot_concurrency = new_sc
-                changes.append(f"screenshot_c={new_sc}")
-
-            # 带宽上限
-            new_bw = s.get("proxy_bandwidth_mbps")
-            if new_bw is not None and new_bw != config.PROXY_BANDWIDTH_MBPS:
-                config.PROXY_BANDWIDTH_MBPS = new_bw
-                changes.append(f"bandwidth={new_bw}Mbps")
-
-            # AIMD 调控参数
-            for attr, key in [
-                ("_adjust_interval", "adjust_interval"),
-                ("_target_latency", "target_latency"),
-                ("_max_latency", "max_latency"),
-                ("_target_success", "target_success_rate"),
-                ("_min_success", "min_success_rate"),
-                ("_block_threshold", "block_rate_threshold"),
-                ("_cooldown_duration", "cooldown_after_block"),
-            ]:
-                val = s.get(key)
-                if val is not None and val != getattr(self._controller, attr, None):
-                    setattr(self._controller, attr, val)
-                    changes.append(f"{key}={val}")
-
+            changes = await self._apply_settings(s, is_initial=True)
             self._settings_version = s.get("_version", 0)
 
             if changes:
@@ -831,179 +860,21 @@ class Worker:
                 if s is None:
                     continue
 
-                # === 现有 settings 同步 ===
+                # === 设置同步（版本守护）===
                 ver = s.get("_version", 0)
-                changes = []
-
                 if ver > self._settings_version:
                     self._settings_version = ver
-
-                    # 令牌桶 QPS（仅在无配额时使用全局值）
-                    if "_quota" not in s:
-                        new_rate = s.get("token_bucket_rate")
-                        if new_rate and self._rate_limiter and new_rate != self._rate_limiter.rate:
-                            self._rate_limiter.rate = new_rate
-                            changes.append(f"QPS={new_rate}")
-
-                    # 并发范围（仅在无配额时使用全局值；tunnel 模式由 tunnel_max_concurrency 控制）
-                    if "_quota" not in s and self._proxy_mode != "tunnel":
-                        new_max = s.get("max_concurrency")
-                        if new_max and new_max != self._controller._max:
-                            self._controller._max = new_max
-                            changes.append(f"max_c={new_max}")
-
-                    new_min = s.get("min_concurrency")
-                    if new_min and new_min != self._controller._min:
-                        self._controller._min = new_min
-                        changes.append(f"min_c={new_min}")
-
-                    # AIMD 调控参数
-                    for attr, key in [
-                        ("_adjust_interval", "adjust_interval"),
-                        ("_target_latency", "target_latency"),
-                        ("_max_latency", "max_latency"),
-                        ("_target_success", "target_success_rate"),
-                        ("_min_success", "min_success_rate"),
-                        ("_block_threshold", "block_rate_threshold"),
-                        ("_cooldown_duration", "cooldown_after_block"),
-                    ]:
-                        val = s.get(key)
-                        if val is not None and val != getattr(self._controller, attr, None):
-                            setattr(self._controller, attr, val)
-                            changes.append(f"{key}={val}")
-
-                    # 带宽上限
-                    new_bw = s.get("proxy_bandwidth_mbps")
-                    if new_bw is not None and new_bw != config.PROXY_BANDWIDTH_MBPS:
-                        config.PROXY_BANDWIDTH_MBPS = new_bw
-                        changes.append(f"bandwidth={new_bw}Mbps")
-
-                    # Session 轮换
-                    new_rotate = s.get("session_rotate_every")
-                    if new_rotate and new_rotate != self._rotate_every:
-                        self._rotate_every = new_rotate
-                        changes.append(f"rotate={new_rotate}")
-
-                    # 最大重试
-                    new_retries = s.get("max_retries")
-                    if new_retries and new_retries != self._max_retries:
-                        self._max_retries = new_retries
-                        changes.append(f"retries={new_retries}")
-
-                    # 请求超时
-                    new_timeout = s.get("request_timeout")
-                    if new_timeout and new_timeout != config.REQUEST_TIMEOUT:
-                        config.REQUEST_TIMEOUT = new_timeout
-                        changes.append(f"timeout={new_timeout}s")
-
-                    # 截图并发数
-                    new_sc = s.get("screenshot_concurrency")
-                    if new_sc and new_sc != self._screenshot_concurrency:
-                        self._screenshot_concurrency = new_sc
-                        changes.append(f"screenshot_c={new_sc}")
-
-                    # 代理 API 地址
-                    new_proxy_url = s.get("proxy_api_url")
-                    if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
-                        config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
-                        changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
-
-                    # 固定隧道代理地址
-                    new_tunnel_url = s.get("tunnel_proxy_url", "")
-                    if new_tunnel_url != config.TUNNEL_PROXY_URL:
-                        config.TUNNEL_PROXY_URL = new_tunnel_url
-                        changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
-
-                    # 隧道参数（先更新配置，再切模式，避免 switch_mode 用到旧通道数）
-                    tunnel_channels = s.get("tunnel_channels")
-                    tunnel_changed = False
-                    if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
-                        config.TUNNEL_CHANNELS = tunnel_channels
-                        tunnel_changed = True
-                        changes.append(f"tunnel_channels={tunnel_channels}")
-                    tunnel_rotate = s.get("tunnel_rotate_interval")
-                    rotate_changed = False
-                    if tunnel_rotate and tunnel_rotate != config.TUNNEL_ROTATE_INTERVAL:
-                        config.TUNNEL_ROTATE_INTERVAL = tunnel_rotate
-                        rotate_changed = True
-                        changes.append(f"tunnel_rotate={tunnel_rotate}")
-
-                    # DPS 优化参数
-                    new_tmc = s.get("tunnel_max_concurrency")
-                    if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
-                        config.TUNNEL_MAX_CONCURRENCY = new_tmc
-                        # 隧道模式下同步到控制器上限
-                        if self._proxy_mode == "tunnel":
-                            self._controller._max = new_tmc
-                        changes.append(f"tunnel_max_c={new_tmc}")
-
-                    new_tic = s.get("tunnel_initial_concurrency")
-                    if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
-                        config.TUNNEL_INITIAL_CONCURRENCY = new_tic
-                        changes.append(f"tunnel_init_c={new_tic}")
-
-                    new_pcq = s.get("per_channel_qps")
-                    if new_pcq and new_pcq != getattr(config, "PER_CHANNEL_QPS", 3.0):
-                        config.PER_CHANNEL_QPS = new_pcq
-                        if self._channel_rate_limiter:
-                            self._channel_rate_limiter.per_channel_rate = new_pcq
-                        changes.append(f"per_ch_qps={new_pcq}")
-
-                    # Per-channel 最大并发（运行时调整）
-                    new_pcmc = s.get("per_channel_max_concurrency")
-                    if new_pcmc and new_pcmc != getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 12):
-                        config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
-                        if self._proxy_mode == "tunnel":
-                            for cc in self._controller._channel_controllers.values():
-                                cc._max = new_pcmc
-                        changes.append(f"per_ch_max_c={new_pcmc}")
-
-                    # 代理模式（热切换：TPS ↔ 隧道）
-                    mode_changed = False
-                    new_mode = s.get("proxy_mode")
-                    if new_mode and new_mode in ("tps", "tunnel") and new_mode != self._proxy_mode:
-                        mode_changed = True
-                        self._proxy_mode = new_mode
-                        config.PROXY_MODE = new_mode  # noqa
-                        self.proxy_manager.switch_mode(new_mode)
-                        await self._sync_controller_mode_profile(new_mode)
-                        changes.append(f"proxy_mode={new_mode}")
-
-                        # 热切换时同步会话容器，避免 _session / _session_pool 与模式不匹配
-                        if new_mode == "tunnel":
-                            if self._session:
-                                await self._session.close()
-                                self._session = None
-                            await self._init_session_tunnel()
-                        else:
-                            if self._session_pool:
-                                await self._session_pool.close_all()
-                                self._session_pool = None
-                            await self._init_session_tps()
-
-                    # 同模式下参数变化：立即重配隧道运行时结构
-                    if self._proxy_mode == "tunnel" and (tunnel_changed or rotate_changed) and not mode_changed:
-                        self.proxy_manager.reconfigure_tunnel(
-                            channels=config.TUNNEL_CHANNELS,
-                            rotate_interval=config.TUNNEL_ROTATE_INTERVAL,
-                        )
-                        if self._session_pool:
-                            await self._session_pool.resize(config.TUNNEL_CHANNELS)
-                        changes.append("tunnel_runtime_reconfig")
-
+                    changes = await self._apply_settings(s, is_initial=False)
                     if changes:
                         logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
 
                 # === 配额执行（每次都执行，不受 version 限制）===
-                # tunnel 模式下：_controller._max 由 tunnel_max_concurrency 控制，
-                # per-channel QPS 由 per_channel_qps 控制，配额不覆盖
                 quota = s.get("_quota")
                 if quota and self._proxy_mode != "tunnel":
                     new_max_c = quota.get("concurrency")
                     if new_max_c and new_max_c != self._controller._max:
                         old_max = self._controller._max
                         self._controller._max = new_max_c
-                        # 当前并发超出配额 → 强制缩容
                         if self._controller._concurrency > new_max_c:
                             await self._controller._resize_semaphore(
                                 self._controller._concurrency, new_max_c
@@ -1023,7 +894,6 @@ class Worker:
                     epoch = block_info.get("epoch", 0)
                     if epoch > self._global_block_epoch:
                         self._global_block_epoch = epoch
-                        # 立即并发减半
                         new_c = max(
                             self._controller._min,
                             self._controller._concurrency // 2,
@@ -1033,7 +903,6 @@ class Worker:
                                 self._controller._concurrency, new_c
                             )
                             self._controller._concurrency = new_c
-                            # 设置本地冷却
                             remaining = block_info.get("remaining_s", 30)
                             self._controller._cooldown_until = time.monotonic() + remaining
                         logger.warning(

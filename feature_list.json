@@ -53,7 +53,7 @@
     "category": "refactor",
     "description": "worker.py — 合并 settings 同步（减 ~240 行，最大收益）",
     "steps": ["提取 _apply_settings 统一方法", "_pull_initial_settings 和 _settings_sync 调用 _apply_settings", "python -c 'import worker' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 9,
