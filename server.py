@@ -844,82 +844,55 @@ async def get_settings():
 
 
 def _normalize_proxy_url(raw: str) -> str:
-    """
-    自动识别多种代理 URL 格式，统一转换为 http://user:pwd@host:port
-
-    支持格式：
-      1. http://user:pwd@host:port          → 原样返回
-      2. socks5://user:pwd@host:port         → 原样返回
-      3. host:port@user:pwd                  → http://user:pwd@host:port
-      4. host:port user:pwd                  → http://user:pwd@host:port
-      5. host:port:user:pwd                  → http://user:pwd@host:port
-      6. user:pwd@host:port                  → http://user:pwd@host:port
-    """
+    """自动识别多种代理 URL 格式，统一转换为 http://user:pwd@host:port"""
     raw = raw.strip()
     if not raw:
         return raw
 
-    # 已经是标准 URL（有 scheme）→ 直接返回
+    # 已有 scheme → 直接返回
     if re.match(r'^https?://', raw) or re.match(r'^socks[45h]?://', raw):
         return raw
 
-    # 空格分隔的格式
+    # 空格分隔: "host:port user:pwd" 等
     if ' ' in raw:
-        parts = raw.split(None, 1)  # 最多分2段
+        parts = raw.split(None, 1)
         if len(parts) == 2:
             left, right = parts[0], parts[1]
             right_segs = right.split(':')
             if ':' in left and ':' in right:
-                # "host:port user:pwd"
                 return f"http://{right}@{left}"
             elif ':' not in left and len(right_segs) == 3:
-                # "host port:user:pwd" → host + port:user:pwd
                 port, user, pwd = right_segs
                 return f"http://{user}:{pwd}@{left}:{port}"
             elif ':' not in left and len(right_segs) == 2:
-                # "host:port user:pwd" 的变体不太可能，但兜底
                 return f"http://{right}@{left}"
 
-    # 格式3: host:port@user:pwd（@ 前面是 host:port）
-    # 格式6: user:pwd@host:port（@ 前面是 user:pwd）
+    # @ 分隔: host:port@user:pwd 或 user:pwd@host:port
     if '@' in raw:
         left, right = raw.split('@', 1)
         left_parts = left.split(':')
         right_parts = right.split(':')
-
         if len(left_parts) == 2 and len(right_parts) == 2:
-            # 判断哪边是 host:port：含 '.' 或纯数字端口在右侧
             left_has_dot = '.' in left_parts[0]
             right_has_dot = '.' in right_parts[0]
-
             if left_has_dot and not right_has_dot:
-                # left = host:port, right = user:pwd → 格式3
                 return f"http://{right}@{left}"
             elif right_has_dot and not left_has_dot:
-                # left = user:pwd, right = host:port → 格式6
                 return f"http://{left}@{right}"
+            elif left_parts[1].isdigit() and not right_parts[1].isdigit():
+                return f"http://{right}@{left}"
             else:
-                # 都有点或都没点 → 尝试用端口号判断
-                # 如果 left 第二段是纯数字端口 → left 是 host:port
-                if left_parts[1].isdigit() and not right_parts[1].isdigit():
-                    return f"http://{right}@{left}"
-                else:
-                    # 默认当 user:pwd@host:port
-                    return f"http://{left}@{right}"
+                return f"http://{left}@{right}"
 
-    # 格式5: host:port:user:pwd（四段冒号分隔）
+    # 四段冒号分隔: host:port:user:pwd 或 user:pwd:host:port
     parts = raw.split(':')
     if len(parts) == 4:
-        # 判断顺序：如果第一段含 '.' → host:port:user:pwd
         if '.' in parts[0]:
             host, port, user, pwd = parts
-            return f"http://{user}:{pwd}@{host}:{port}"
         else:
-            # user:pwd:host:port
             user, pwd, host, port = parts
-            return f"http://{user}:{pwd}@{host}:{port}"
+        return f"http://{user}:{pwd}@{host}:{port}"
 
-    # 无法识别 → 原样返回
     return raw
 
 

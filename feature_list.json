@@ -67,6 +67,6 @@
     "category": "refactor",
     "description": "server.py — _normalize_proxy_url 清理注释",
     "steps": ["精简注释", "python -c 'import server' 验证无语法错误"],
-    "passes": false
+    "passes": true
   }
 ]
