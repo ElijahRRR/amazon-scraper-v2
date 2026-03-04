@@ -79,8 +79,6 @@ TARGET_SUCCESS_RATE = 0.95       # 成功率目标
 MIN_SUCCESS_RATE = 0.85          # 成功率下限
 BLOCK_RATE_THRESHOLD = 0.05      # 封锁率阈值
 BANDWIDTH_SOFT_CAP = 0.80        # 带宽软上限
-COOLDOWN_AFTER_BLOCK_S = 15      # 被封后冷却时间（TPS 模式轮换快，不需要 30s）
-
 # 全局并发协调（多 Worker 场景）
 GLOBAL_MAX_CONCURRENCY = 48      # 匹配 TUNNEL_MAX_CONCURRENCY（单 Worker 场景取更高值）
 GLOBAL_MAX_QPS = 40.0            # DPS: 8 channels × 5 QPS（TPS 模式由 Server 下发配额覆盖）
@@ -135,8 +133,6 @@ TUNNEL_CHANGE_IP_URL = (
 # ============================================================
 # 反爬策略
 # ============================================================
-IMPERSONATE_BROWSER = "chrome131"  # 默认值（被 BROWSER_PROFILES 覆盖）
-
 # 浏览器指纹配置：每个 profile 包含 impersonate (TLS 指纹)、sec-ch-ua、UA 列表
 # AmazonSession 创建时随机选取一个 profile，确保 UA / sec-ch-ua / TLS 三者一致
 BROWSER_PROFILES = [

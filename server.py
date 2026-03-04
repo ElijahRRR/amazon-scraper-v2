@@ -102,7 +102,7 @@ def _default_settings() -> dict:
         "target_success_rate": config.TARGET_SUCCESS_RATE,
         "min_success_rate": config.MIN_SUCCESS_RATE,
         "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
-        "cooldown_after_block": config.COOLDOWN_AFTER_BLOCK_S,
+        "cooldown_after_block": 15,
         "proxy_bandwidth_mbps": config.PROXY_BANDWIDTH_MBPS,
         "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
         "global_max_qps": config.GLOBAL_MAX_QPS,
@@ -840,7 +840,7 @@ async def diagnostic():
             "max_concurrency": config.MAX_CONCURRENCY,
             "target_latency_s": config.TARGET_LATENCY_S,
             "max_latency_s": config.MAX_LATENCY_S,
-            "cooldown_after_block_s": config.COOLDOWN_AFTER_BLOCK_S,
+            "cooldown_after_block_s": 15,
             "proxy_mode": config.PROXY_MODE,
             "has_write_lock": hasattr(db, '_write_lock'),  # True = 新版代码
         },
@@ -1468,7 +1468,6 @@ async def settings_page(request: Request):
         "settings": _runtime_settings,
         "config": {
             "port": config.SERVER_PORT,
-            "impersonate": config.IMPERSONATE_BROWSER,
             "timeout": config.REQUEST_TIMEOUT,
         },
     })

@@ -25,7 +25,7 @@
     "category": "refactor",
     "description": "config.py — 删除未使用变量 + server.py 同步（减 ~5 行）",
     "steps": ["删除 COOLDOWN_AFTER_BLOCK_S 和 IMPERSONATE_BROWSER", "同步删除 server.py 中对应引用", "python -c 'import config' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 5,
