@@ -602,60 +602,48 @@ async def export_screenshots(batch_name: str):
     )
 
 
+def _prepare_export_rows(results: List[Dict]):
+    """准备导出数据，返回 (headers, field_keys, rows)。"""
+    field_keys = list(RESULT_FIELDS)
+    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
+    rows = [[str(row_data.get(f, "")) for f in field_keys] for row_data in results]
+    return headers, field_keys, rows
+
+
 def _export_excel(results: List[Dict], batch_name: str):
     """导出 Excel 文件"""
+    headers, _, rows = _prepare_export_rows(results)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "采集结果"
-
-    # 写表头（使用中文）
-    headers = []
-    field_keys = []
-    for field in RESULT_FIELDS:
-        cn_name = config.HEADER_MAP.get(field, field)
-        headers.append(cn_name)
-        field_keys.append(field)
-
     ws.append(headers)
-
-    # 写数据
-    for row_data in results:
-        row = [str(row_data.get(f, "")) for f in field_keys]
+    for row in rows:
         ws.append(row)
 
-    # 保存到内存
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
 
-    filename = f"{batch_name}.xlsx"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": f"attachment; filename={batch_name}.xlsx"},
     )
 
 
 def _export_csv(results: List[Dict], batch_name: str):
     """导出 CSV 文件"""
+    headers, _, rows = _prepare_export_rows(results)
     output = io.StringIO()
     writer = csv.writer(output)
-
-    # 表头
-    headers = [config.HEADER_MAP.get(f, f) for f in RESULT_FIELDS]
     writer.writerow(headers)
-
-    # 数据
-    for row_data in results:
-        row = [str(row_data.get(f, "")) for f in RESULT_FIELDS]
-        writer.writerow(row)
+    writer.writerows(rows)
 
     content = output.getvalue().encode('utf-8-sig')
-    filename = f"{batch_name}.csv"
     return StreamingResponse(
         io.BytesIO(content),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": f"attachment; filename={batch_name}.csv"},
     )
 
 

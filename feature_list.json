@@ -60,7 +60,7 @@
     "category": "refactor",
     "description": "server.py — 合并导出函数（减 ~20 行）",
     "steps": ["提取 _prepare_export_rows 返回 headers 和 rows", "_export_excel 和 _export_csv 使用新方法", "python -c 'import server' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 10,
