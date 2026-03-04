@@ -18,7 +18,7 @@
     "category": "refactor",
     "description": "proxy.py — 删除死代码 + 提取 URL 构建（减 ~15 行）",
     "steps": ["删除 init_tunnel_channels 和 refresh_tunnel_channels", "提取 _build_channel_url 方法", "python -c 'import proxy' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 4,

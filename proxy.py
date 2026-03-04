@@ -93,6 +93,14 @@ class ProxyManager:
         self._total_errors = 0
         self._total_blocked = 0
 
+    @staticmethod
+    def _build_channel_url(parsed, channel_id: int) -> str:
+        """构建带通道号的代理 URL: password:channel_id"""
+        return (
+            f"http://{parsed.username}:{parsed.password}:{channel_id}"
+            f"@{parsed.hostname}:{parsed.port}"
+        )
+
     def switch_mode(self, new_mode: str):
         """运行时切换代理模式（settings sync 检测到 proxy_mode 变化时调用）"""
         if new_mode == self.mode:
@@ -138,14 +146,7 @@ class ProxyManager:
             parsed = None
 
         for ch_id in range(1, channels + 1):
-            if parsed:
-                channel_url = (
-                    f"http://{parsed.username}:{parsed.password}:{ch_id}"
-                    f"@{parsed.hostname}:{parsed.port}"
-                )
-            else:
-                channel_url = ""
-
+            channel_url = self._build_channel_url(parsed, ch_id) if parsed else ""
             if ch_id in old_channels:
                 ch = old_channels[ch_id]
                 ch.proxy_url = channel_url
@@ -266,12 +267,7 @@ class ProxyManager:
                     # 固定隧道：所有通道共享同一代理地址（不追加 channel_id）
                     ch.proxy_url = base_url
                 else:
-                    # 快代理：password:channel_id 指定独立通道
-                    channel_url = (
-                        f"http://{parsed.username}:{parsed.password}:{ch.channel_id}"
-                        f"@{parsed.hostname}:{parsed.port}"
-                    )
-                    ch.proxy_url = channel_url
+                    ch.proxy_url = self._build_channel_url(parsed, ch.channel_id)
                 ch.reset_for_rotation()
 
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
@@ -281,13 +277,6 @@ class ProxyManager:
             for ch in self._channels.values():
                 logger.info(f"  通道 {ch.channel_id}: ...:{ch.channel_id}@{parsed.hostname}:{parsed.port}")
             return len(self._channels)
-
-    # 向后兼容
-    async def init_tunnel_channels(self):
-        return await self.init_tunnel()
-
-    async def refresh_tunnel_channels(self):
-        return await self.init_tunnel()
 
     async def change_ip(self) -> bool:
         """
