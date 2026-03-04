@@ -11,7 +11,7 @@
     "category": "refactor",
     "description": "session.py — 合并重复 session 构建器（减 ~30 行）",
     "steps": ["提取 _create_channel_session 私有方法", "get_session/rebuild_session/rolling_rebuild 使用新方法", "python -c 'import session' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 3,

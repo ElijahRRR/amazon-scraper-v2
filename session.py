@@ -519,10 +519,30 @@ class SessionPool:
         for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
             self._init_locks[ch_id] = asyncio.Lock()
 
+    async def _create_channel_session(self, channel_id: int) -> Optional[AmazonSession]:
+        """创建单个通道 Session：关闭旧 session → 构建 proxy_url → 创建 → 初始化 → 存储。"""
+        if channel_id in self._sessions:
+            await self._sessions[channel_id].close()
+            del self._sessions[channel_id]
+
+        proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
+        if not proxy_url:
+            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
+        session = AmazonSession(
+            self.proxy_manager,
+            zip_code=self.zip_code,
+            proxy_url=proxy_url,
+            max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
+        )
+        ok = await session.initialize()
+        if ok:
+            self._sessions[channel_id] = session
+            return session
+        await session.close()
+        return None
+
     async def get_session(self, channel_id: int) -> Optional[AmazonSession]:
-        """
-        获取指定槽位的 Session，不存在或未就绪则创建。
-        """
+        """获取指定槽位的 Session，不存在或未就绪则创建。"""
         if channel_id in self._sessions and self._sessions[channel_id].is_ready():
             return self._sessions[channel_id]
 
@@ -532,60 +552,25 @@ class SessionPool:
         async with self._init_locks[channel_id]:
             if channel_id in self._sessions and self._sessions[channel_id].is_ready():
                 return self._sessions[channel_id]
-
-            if channel_id in self._sessions:
-                await self._sessions[channel_id].close()
-                del self._sessions[channel_id]
-
-            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
-            if not proxy_url:
-                proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
-            session = AmazonSession(
-                self.proxy_manager,
-                zip_code=self.zip_code,
-                proxy_url=proxy_url,
-                max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
-            )
-            ok = await session.initialize()
-            if ok:
-                self._sessions[channel_id] = session
+            session = await self._create_channel_session(channel_id)
+            if session:
                 logger.info(f"✅ 槽位 {channel_id} Session 就绪")
-                return session
             else:
-                await session.close()
                 logger.warning(f"⚠️ 槽位 {channel_id} Session 初始化失败")
-                return None
+            return session
 
     async def rebuild_session(self, channel_id: int) -> bool:
-        """
-        重建指定槽位的 Session（IP 轮换后或被封后调用）。
-        """
+        """重建指定槽位的 Session（IP 轮换后或被封后调用）。"""
         if channel_id not in self._init_locks:
             self._init_locks[channel_id] = asyncio.Lock()
 
         async with self._init_locks[channel_id]:
-            if channel_id in self._sessions:
-                await self._sessions[channel_id].close()
-                del self._sessions[channel_id]
-
-            proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
-            if not proxy_url:
-                proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
-            session = AmazonSession(
-                self.proxy_manager,
-                zip_code=self.zip_code,
-                proxy_url=proxy_url,
-                max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
-            )
-            ok = await session.initialize()
-            if ok:
-                self._sessions[channel_id] = session
+            session = await self._create_channel_session(channel_id)
+            if session:
                 logger.info(f"🔄 槽位 {channel_id} Session 重建成功")
                 return True
-            else:
-                await session.close()
-                logger.warning(f"⚠️ 槽位 {channel_id} Session 重建失败")
-                return False
+            logger.warning(f"⚠️ 槽位 {channel_id} Session 重建失败")
+            return False
 
     async def rolling_rebuild(self, batch_size: int = 2,
                               per_session_timeout: float = 30.0):
@@ -610,25 +595,12 @@ class SessionPool:
 
         async def _rebuild_one(ch_id: int):
             try:
-                proxy_url = self.proxy_manager.get_channel_proxy_url(ch_id)
-                if not proxy_url:
-                    proxy_url = self.proxy_manager.get_tunnel_proxy_url()  # fallback
-                if not proxy_url:
-                    return False
-                new_session = AmazonSession(
-                    self.proxy_manager,
-                    zip_code=self.zip_code,
-                    proxy_url=proxy_url,
-                    max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
-                )
-                ok = await asyncio.wait_for(
-                    new_session.initialize(),
+                old_session = self._sessions.get(ch_id)
+                new_session = await asyncio.wait_for(
+                    self._create_channel_session(ch_id),
                     timeout=per_session_timeout,
                 )
-                if ok:
-                    old_session = self._sessions.get(ch_id)
-                    self._sessions[ch_id] = new_session
-                    # 延迟关闭旧 Session（给进行中的请求 2s 完成）
+                if new_session:
                     if old_session:
                         await asyncio.sleep(2)
                         try:
@@ -636,10 +608,8 @@ class SessionPool:
                         except Exception:
                             pass
                     return True
-                else:
-                    await new_session.close()
-                    logger.warning(f"⚠️ 槽位 {ch_id} 重建失败")
-                    return False
+                logger.warning(f"⚠️ 槽位 {ch_id} 重建失败")
+                return False
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ 槽位 {ch_id} 重建超时 ({per_session_timeout}s)")
                 return False
