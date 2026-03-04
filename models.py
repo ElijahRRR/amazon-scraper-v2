@@ -2,7 +2,7 @@
 Amazon 产品采集系统 v2 - 数据模型
 使用 dataclass 定义任务和采集结果的结构
 """
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from typing import Optional
 from datetime import datetime
 
@@ -96,15 +96,5 @@ class Result:
 
 
 # 所有采集字段名（不含 id / batch_name / created_at 等管理字段）
-RESULT_FIELDS = [
-    "asin", "crawl_time", "site", "zip_code", "product_url",
-    "title", "brand", "product_type", "manufacturer", "model_number",
-    "part_number", "country_of_origin", "is_customized", "best_sellers_rank",
-    "original_price", "current_price", "buybox_price", "buybox_shipping", "is_fba",
-    "stock_count", "stock_status", "delivery_date", "delivery_time",
-    "image_urls", "bullet_points", "long_description",
-    "upc_list", "ean_list", "parent_asin", "variation_asins",
-    "root_category_id", "category_ids", "category_tree",
-    "first_available_date", "package_dimensions", "package_weight",
-    "item_dimensions", "item_weight",
-]
+_EXCLUDED = {"id", "batch_name", "created_at"}
+RESULT_FIELDS = [f.name for f in fields(Result) if f.name not in _EXCLUDED]

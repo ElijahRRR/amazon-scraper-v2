@@ -32,7 +32,7 @@
     "category": "refactor",
     "description": "models.py — RESULT_FIELDS 自动生成（减 ~10 行）",
     "steps": ["用 dataclass fields() 自动生成 RESULT_FIELDS", "验证生成的列表与手动列表一致", "python -c 'import models; print(len(models.RESULT_FIELDS))' 验证"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 6,
