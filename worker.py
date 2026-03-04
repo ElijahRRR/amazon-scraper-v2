@@ -598,6 +598,19 @@ class Worker:
         except Exception as e:
             logger.warning(f"⚠️ 拉取初始设置异常（将使用本地配置）: {e}")
 
+    async def _create_session_with_retry(self, max_attempts: int = 3,
+                                         delay: float = 5) -> Optional[AmazonSession]:
+        """创建并初始化 AmazonSession，失败时重试。成功返回 session，全部失败返回 None。"""
+        for attempt in range(max_attempts):
+            session = AmazonSession(self.proxy_manager, self.zip_code)
+            if await session.initialize():
+                return session
+            logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/{max_attempts})")
+            await session.close()
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(delay)
+        return None
+
     async def _init_session(self):
         """初始化 Amazon session（失败时重试，确保 _session_ready 最终被 set）"""
         if self._proxy_mode == "tunnel":
@@ -609,21 +622,11 @@ class Worker:
         """TPS 模式：初始化单个全局 Session"""
         logger.info("🔧 初始化 Amazon session (TPS)...")
         self._session_ready.clear()
-        for attempt in range(3):
-            self._session = AmazonSession(self.proxy_manager, self.zip_code)
-            success = await self._session.initialize()
-            self._success_since_rotate = 0
-            if success:
-                self._session_ready.set()
-                return
-            # 初始化失败，等待后重试
-            logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/3)")
-            if self._session:
-                await self._session.close()
-            self._session = None
-            if attempt < 2:
-                await asyncio.sleep(5)
-        # 3 次全部失败，仍然 set event 让 worker 走正常的重试/失败流程
+        self._session = await self._create_session_with_retry()
+        self._success_since_rotate = 0
+        if self._session:
+            self._session_ready.set()
+            return
         logger.error("❌ Session 初始化 3 次全部失败，Worker 将在处理任务时继续重试")
         self._session_ready.set()
 
@@ -693,55 +696,34 @@ class Worker:
                 await self.proxy_manager.report_blocked()
                 return
 
-            # === Fallback：冷轮换（原逻辑）===
+            # === Fallback：冷轮换 ===
             logger.info("🔄 热备不可用，执行冷轮换...")
             await self.proxy_manager.report_blocked()
             await asyncio.sleep(1)
 
-            # 轮换重试（最多 3 次）
-            for attempt in range(3):
-                self._session = AmazonSession(self.proxy_manager, self.zip_code)
-                success = await self._session.initialize()
-                self._success_since_rotate = 0
-                self._last_rotate_time = time.monotonic()
-                if success:
-                    self._session_ready.set()
-                    logger.info("🔄 Session 冷轮换成功")
-                    return
-                # 失败，清理后重试
-                logger.warning(f"⚠️ Session 轮换初始化失败 (尝试 {attempt+1}/3)")
-                if self._session:
-                    await self._session.close()
-                self._session = None
-                if attempt < 2:
-                    await asyncio.sleep(3)
-
-            # 全部失败，set event 让 worker 走正常失败流程
-            logger.error("❌ Session 轮换 3 次全部失败")
+            self._session = await self._create_session_with_retry(delay=3)
+            self._success_since_rotate = 0
+            self._last_rotate_time = time.monotonic()
+            if self._session:
+                logger.info("🔄 Session 冷轮换成功")
+            else:
+                logger.error("❌ Session 轮换 3 次全部失败")
             self._session_ready.set()
 
     async def _standby_warmer(self):
-        """
-        TPS 热备 Session 预热协程：后台维护一个已初始化的备用 session。
-        当主 session 被封需要轮换时，可以直接 hot swap，消除 7-15 秒的停摆。
-        """
+        """TPS 热备 Session 预热协程：后台维护一个已初始化的备用 session。"""
         logger.info("🔥 Hot Standby Session 预热协程启动")
-        # 等待主 session 初始化完成后再开始（避免启动时同时抢代理 API）
         await self._session_ready.wait()
         await asyncio.sleep(3)
 
         while self._running:
             try:
-                # 只在备用 session 不可用时预热
                 if self._standby_session is None or not self._standby_session.is_ready():
                     if not self._standby_warming:
                         self._standby_warming = True
                         self._standby_ready.clear()
-
-                        standby = AmazonSession(self.proxy_manager, self.zip_code)
-                        success = await standby.initialize()
-
-                        if success:
+                        standby = await self._create_session_with_retry(max_attempts=1, delay=0)
+                        if standby:
                             old = self._standby_session
                             self._standby_session = standby
                             self._standby_ready.set()
@@ -749,12 +731,10 @@ class Worker:
                                 await old.close()
                             logger.info("🔥 Hot Standby Session 就绪")
                         else:
-                            await standby.close()
                             logger.warning("⚠️ Standby Session 初始化失败，10s 后重试")
-
                         self._standby_warming = False
 
-                await asyncio.sleep(5)  # 每 5 秒检查一次
+                await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -762,7 +742,6 @@ class Worker:
                 self._standby_warming = False
                 await asyncio.sleep(10)
 
-        # 清理
         if self._standby_session:
             await self._standby_session.close()
             self._standby_session = None

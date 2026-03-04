@@ -39,7 +39,7 @@
     "category": "refactor",
     "description": "worker.py — 提取 session 初始化重试（减 ~20 行）",
     "steps": ["提取 _create_session_with_retry 方法", "三处重试循环使用新方法", "python -c 'import worker' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 7,
