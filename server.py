@@ -63,8 +63,12 @@ templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 _worker_registry: Dict[str, Dict] = {}
 
 
+_WORKER_ID_RE = re.compile(r'^[\w\-]{1,64}$')
+
 def _register_worker(worker_id: str):
     """注册/更新 worker 心跳"""
+    if not _WORKER_ID_RE.match(worker_id):
+        return  # 拒绝非法 worker_id
     now = time.time()
     if worker_id not in _worker_registry:
         _worker_registry[worker_id] = {
@@ -104,7 +108,8 @@ def _default_settings() -> dict:
         "global_max_qps": config.GLOBAL_MAX_QPS,
         # 代理模式
         "proxy_mode": config.PROXY_MODE,
-        # 隧道代理配置（共用 proxy_api_url，只需通道数和轮换周期）
+        # 隧道代理配置
+        "tunnel_proxy_url": config.TUNNEL_PROXY_URL,
         "tunnel_channels": config.TUNNEL_CHANNELS,
         "tunnel_rotate_interval": config.TUNNEL_ROTATE_INTERVAL,
         # DPS 优化参数
@@ -850,6 +855,86 @@ async def get_settings():
     return {**_runtime_settings, "_version": _settings_version}
 
 
+def _normalize_proxy_url(raw: str) -> str:
+    """
+    自动识别多种代理 URL 格式，统一转换为 http://user:pwd@host:port
+
+    支持格式：
+      1. http://user:pwd@host:port          → 原样返回
+      2. socks5://user:pwd@host:port         → 原样返回
+      3. host:port@user:pwd                  → http://user:pwd@host:port
+      4. host:port user:pwd                  → http://user:pwd@host:port
+      5. host:port:user:pwd                  → http://user:pwd@host:port
+      6. user:pwd@host:port                  → http://user:pwd@host:port
+    """
+    raw = raw.strip()
+    if not raw:
+        return raw
+
+    # 已经是标准 URL（有 scheme）→ 直接返回
+    if re.match(r'^https?://', raw) or re.match(r'^socks[45h]?://', raw):
+        return raw
+
+    # 空格分隔的格式
+    if ' ' in raw:
+        parts = raw.split(None, 1)  # 最多分2段
+        if len(parts) == 2:
+            left, right = parts[0], parts[1]
+            right_segs = right.split(':')
+            if ':' in left and ':' in right:
+                # "host:port user:pwd"
+                return f"http://{right}@{left}"
+            elif ':' not in left and len(right_segs) == 3:
+                # "host port:user:pwd" → host + port:user:pwd
+                port, user, pwd = right_segs
+                return f"http://{user}:{pwd}@{left}:{port}"
+            elif ':' not in left and len(right_segs) == 2:
+                # "host:port user:pwd" 的变体不太可能，但兜底
+                return f"http://{right}@{left}"
+
+    # 格式3: host:port@user:pwd（@ 前面是 host:port）
+    # 格式6: user:pwd@host:port（@ 前面是 user:pwd）
+    if '@' in raw:
+        left, right = raw.split('@', 1)
+        left_parts = left.split(':')
+        right_parts = right.split(':')
+
+        if len(left_parts) == 2 and len(right_parts) == 2:
+            # 判断哪边是 host:port：含 '.' 或纯数字端口在右侧
+            left_has_dot = '.' in left_parts[0]
+            right_has_dot = '.' in right_parts[0]
+
+            if left_has_dot and not right_has_dot:
+                # left = host:port, right = user:pwd → 格式3
+                return f"http://{right}@{left}"
+            elif right_has_dot and not left_has_dot:
+                # left = user:pwd, right = host:port → 格式6
+                return f"http://{left}@{right}"
+            else:
+                # 都有点或都没点 → 尝试用端口号判断
+                # 如果 left 第二段是纯数字端口 → left 是 host:port
+                if left_parts[1].isdigit() and not right_parts[1].isdigit():
+                    return f"http://{right}@{left}"
+                else:
+                    # 默认当 user:pwd@host:port
+                    return f"http://{left}@{right}"
+
+    # 格式5: host:port:user:pwd（四段冒号分隔）
+    parts = raw.split(':')
+    if len(parts) == 4:
+        # 判断顺序：如果第一段含 '.' → host:port:user:pwd
+        if '.' in parts[0]:
+            host, port, user, pwd = parts
+            return f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            # user:pwd:host:port
+            user, pwd, host, port = parts
+            return f"http://{user}:{pwd}@{host}:{port}"
+
+    # 无法识别 → 原样返回
+    return raw
+
+
 @app.put("/api/settings")
 async def update_settings(request: Request):
     """更新运行时设置（含类型与范围校验）"""
@@ -880,7 +965,8 @@ async def update_settings(request: Request):
         "global_max_qps":         (float, 0.5, 100),
         # 代理模式
         "proxy_mode":           (str,   None, None),
-        # 隧道代理配置（共用 proxy_api_url）
+        # 隧道代理配置
+        "tunnel_proxy_url":     (str,   None, None),
         "tunnel_channels":      (int,   1,    32),
         "tunnel_rotate_interval": (int, 10,   300),
         # DPS 优化参数
@@ -893,6 +979,11 @@ async def update_settings(request: Request):
     changed = False
     errors = []
     old_values = {}  # 保存旧值用于交叉校验失败回滚
+
+    # 代理地址：提交前先规范化，确保比较用规范格式
+    if "tunnel_proxy_url" in data and data["tunnel_proxy_url"]:
+        data["tunnel_proxy_url"] = _normalize_proxy_url(data["tunnel_proxy_url"])
+
     for key in _runtime_settings:
         if key not in data or data[key] == _runtime_settings[key]:
             continue
@@ -913,6 +1004,22 @@ async def update_settings(request: Request):
         except (ValueError, TypeError):
             errors.append(f"{key}: 期望 {expected_type.__name__}，收到 {type(val).__name__}")
             continue
+
+        # 代理地址自动识别：快代理 API 地址 → 存入 proxy_api_url；否则当固定代理处理
+        if key == "tunnel_proxy_url" and val:
+            if "kdlapi.com" in val or "kdl.cc" in val:
+                # 快代理 API 地址 → 存到 proxy_api_url，清空 tunnel_proxy_url
+                old_values.setdefault("proxy_api_url", _runtime_settings["proxy_api_url"])
+                _runtime_settings["proxy_api_url"] = val
+                old_values.setdefault("tunnel_proxy_url", _runtime_settings["tunnel_proxy_url"])
+                _runtime_settings["tunnel_proxy_url"] = ""
+                logger.info(f"⚙️ 检测到快代理 API 地址，已存入 proxy_api_url")
+                changed = True
+                continue
+            original = val
+            val = _normalize_proxy_url(val)
+            if val != original:
+                logger.info(f"⚙️ 代理 URL 自动转换: {original} → {val}")
 
         # 范围校验
         if lo is not None and val < lo:

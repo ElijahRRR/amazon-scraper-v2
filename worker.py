@@ -250,20 +250,24 @@ class Worker:
                         # 检测是否有高优先级任务（优先采集）
                         has_priority = any(t.get("priority", 0) > 0 for t in tasks)
                         if has_priority and not self._task_queue.empty():
-                            # 收集被清空的旧任务 ID，通知 Server 立即归还
+                            # 只清空非优先任务，保留已有的优先任务（防止无限循环）
                             dropped_ids = []
+                            kept_items = []
                             while not self._task_queue.empty():
                                 try:
                                     item = self._task_queue.get_nowait()
-                                    # 从优先级元组中提取 task dict
                                     old_task = item[2] if isinstance(item, tuple) else item
                                     if old_task and isinstance(old_task, dict):
-                                        dropped_ids.append(old_task["id"])
+                                        if old_task.get("priority", 0) > 0:
+                                            kept_items.append(item)
+                                        else:
+                                            dropped_ids.append(old_task["id"])
                                 except asyncio.QueueEmpty:
                                     break
-                            logger.info(f"🚀 检测到优先采集任务，已清空队列中 {len(dropped_ids)} 个旧任务")
-                            # 异步通知 Server 归还旧任务（不阻塞补给流程）
+                            for item in kept_items:
+                                await self._task_queue.put(item)
                             if dropped_ids:
+                                logger.info(f"🚀 检测到优先采集任务，已清空队列中 {len(dropped_ids)} 个普通任务（保留 {len(kept_items)} 个优先任务）")
                                 asyncio.create_task(self._release_tasks(dropped_ids))
 
                         for task in tasks:
@@ -433,6 +437,12 @@ class Worker:
                 s = resp.json()
 
             changes = []
+
+            # 固定隧道代理地址
+            new_tunnel_url = s.get("tunnel_proxy_url", "")
+            if new_tunnel_url != config.TUNNEL_PROXY_URL:
+                config.TUNNEL_PROXY_URL = new_tunnel_url
+                changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
 
             # 隧道通道数和轮换周期
             tunnel_channels = s.get("tunnel_channels")
@@ -918,6 +928,12 @@ class Worker:
                     if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
                         config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
                         changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+
+                    # 固定隧道代理地址
+                    new_tunnel_url = s.get("tunnel_proxy_url", "")
+                    if new_tunnel_url != config.TUNNEL_PROXY_URL:
+                        config.TUNNEL_PROXY_URL = new_tunnel_url
+                        changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
 
                     # 隧道参数（先更新配置，再切模式，避免 switch_mode 用到旧通道数）
                     tunnel_channels = s.get("tunnel_channels")

@@ -38,11 +38,14 @@ class _BlockedSession:
     def is_ready(self) -> bool:
         return True
 
-    async def fetch_product_page(self, asin):
+    async def fetch_product_page(self, asin, max_recv_speed=0):
         return _BlockedResponse()
 
     def is_blocked(self, response) -> bool:
         return True
+
+    def is_captcha(self, response) -> bool:
+        return False
 
     def is_404(self, response) -> bool:
         return False

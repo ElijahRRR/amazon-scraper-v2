@@ -60,10 +60,11 @@
                             <small class="text-secondary">切换模式将联动调整 QPS/并发/带宽等参数</small>
                         </div>
                         <div class="col-8">
-                            <label class="form-label">代理 API 地址</label>
-                            <input type="text" class="form-control" name="proxy_api_url"
-                                   value="{{ settings.proxy_api_url }}">
-                            <small class="text-secondary">快代理 API 地址（两种模式共用）</small>
+                            <label class="form-label">代理地址</label>
+                            <input type="text" class="form-control" name="tunnel_proxy_url"
+                                   value="{{ settings.tunnel_proxy_url or settings.proxy_api_url }}"
+                                   placeholder="支持：ip:port@user:pwd / user:pwd@host:port / http://user:pwd@host:port">
+                            <small class="text-secondary">填入代理地址保存后自动转换格式，支持快代理 API 地址或帐密隧道代理</small>
                         </div>
                     </div>
                     <div id="tunnelConfig" class="row g-3 mt-1" style="{{ '' if settings.proxy_mode == 'tunnel' else 'display:none' }}">
@@ -307,9 +308,16 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
             }
             // 用服务器返回的最新值刷新表单
             const s = result.settings;
-            if (s) for (const [k,v] of Object.entries(s)) {
-                const el = document.querySelector(`[name="${k}"]`);
-                if (el) el.value = v;
+            if (s) {
+                for (const [k,v] of Object.entries(s)) {
+                    const el = document.querySelector(`[name="${k}"]`);
+                    if (el) el.value = v;
+                }
+                // 代理地址框：优先显示 tunnel_proxy_url，为空则显示 proxy_api_url
+                const proxyEl = document.querySelector('[name="tunnel_proxy_url"]');
+                if (proxyEl) {
+                    proxyEl.value = s.tunnel_proxy_url || s.proxy_api_url || '';
+                }
             }
         } else {
             resultDiv.style.display = 'block';

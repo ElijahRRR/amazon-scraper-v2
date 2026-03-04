@@ -240,37 +240,45 @@ class ProxyManager:
     async def init_tunnel(self):
         """
         隧道模式启动初始化：
-        1. 调 API 获取隧道代理地址（只需 1 个）
-        2. 为每个 channel 生成带通道号的 URL（password:channel_id）
-           → 每个通道有独立出口 IP，带宽从 3Mbps → 5Mbps
+        1. 优先使用 TUNNEL_PROXY_URL（固定帐密隧道，跳过 API）
+        2. 否则调 API 获取隧道代理地址
+        3. 为每个 channel 生成带通道号的 URL（password:channel_id）
         """
         async with self._tunnel_init_lock:
-            logger.info("🔧 获取隧道代理地址...")
-            proxies = await self._fetch_proxies_from_api(num=1)
-            if not proxies:
-                logger.error("❌ 获取隧道代理失败：API 返回空")
-                return 0
+            # 优先使用固定隧道地址（帐密模式）
+            is_fixed = bool(config.TUNNEL_PROXY_URL)
+            if is_fixed:
+                base_url = config.TUNNEL_PROXY_URL
+                logger.info(f"🔧 使用固定隧道代理: {base_url[:30]}...")
+            else:
+                logger.info("🔧 获取隧道代理地址...")
+                proxies = await self._fetch_proxies_from_api(num=1)
+                if not proxies:
+                    logger.error("❌ 获取隧道代理失败：API 返回空")
+                    return 0
+                base_url = proxies[0]
 
-            base_url = proxies[0]
-            self._tunnel_proxy_url = base_url  # 保留 base URL（向后兼容）
+            self._tunnel_proxy_url = base_url
 
-            # 解析 base URL，为每个 channel 生成带通道号的 URL
-            # 格式：http://user:pwd:channel_id@host:port
             parsed = urlparse(base_url)
             for ch in self._channels.values():
-                channel_url = (
-                    f"http://{parsed.username}:{parsed.password}:{ch.channel_id}"
-                    f"@{parsed.hostname}:{parsed.port}"
-                )
-                ch.proxy_url = channel_url
+                if is_fixed:
+                    # 固定隧道：所有通道共享同一代理地址（不追加 channel_id）
+                    ch.proxy_url = base_url
+                else:
+                    # 快代理：password:channel_id 指定独立通道
+                    channel_url = (
+                        f"http://{parsed.username}:{parsed.password}:{ch.channel_id}"
+                        f"@{parsed.hostname}:{parsed.port}"
+                    )
+                    ch.proxy_url = channel_url
                 ch.reset_for_rotation()
 
             self._rotation_at = time.monotonic() + config.TUNNEL_ROTATE_INTERVAL
             self._change_ip_count = 0
             self._total_fetched += 1
-            logger.info(f"✅ 隧道代理就绪：{base_url} → {len(self._channels)} 个独立通道")
+            logger.info(f"✅ 隧道代理就绪：{parsed.hostname}:{parsed.port} → {len(self._channels)} 个独立通道")
             for ch in self._channels.values():
-                # 只显示通道号后缀，不暴露完整凭证
                 logger.info(f"  通道 {ch.channel_id}: ...:{ch.channel_id}@{parsed.hostname}:{parsed.port}")
             return len(self._channels)
 
@@ -441,6 +449,10 @@ class ProxyManager:
 
     async def _tps_get_proxy(self) -> Optional[str]:
         """TPS: 获取当前可用代理，过期则自动刷新"""
+        # 固定隧道代理：跳过 API，直接返回
+        if config.TUNNEL_PROXY_URL:
+            self._current_proxy = config.TUNNEL_PROXY_URL
+            return self._current_proxy
         now = time.monotonic()
         if self._current_proxy and now < self._proxy_expire_at:
             return self._current_proxy
@@ -477,6 +489,11 @@ class ProxyManager:
 
     async def _tps_report_blocked(self):
         """TPS: 报告代理被封锁，强制过期触发重新获取"""
+        self._total_blocked += 1
+        if config.TUNNEL_PROXY_URL:
+            # 固定隧道代理：地址不变，只记录封锁（IP 轮换由代理服务端处理）
+            logger.warning(f"代理被封（第 {self._total_blocked} 次），固定隧道无需刷新")
+            return self._current_proxy
         logger.warning(f"代理被封（第 {self._total_blocked} 次），触发刷新")
         self._proxy_expire_at = 0
         self._current_proxy = None

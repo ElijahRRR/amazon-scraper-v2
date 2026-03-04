@@ -42,7 +42,7 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", 8899))
 PARSER_ENGINE = os.environ.get("PARSER_ENGINE", "selectolax")
 
 DEFAULT_ZIP_CODE = os.environ.get("DEFAULT_ZIP_CODE", "10001")
-MAX_CLIENTS = 16                 # HTTP/1.1 连接池（每 session 最大 TCP 连接数）
+MAX_CLIENTS = 32                 # HTTP/1.1 连接池（每 session 最大 TCP 连接数，应 ≥ max_concurrency）
 REQUEST_TIMEOUT = 15             # 请求超时（秒）
 MAX_RETRIES = 3                  # 最大重试次数
 TASK_TIMEOUT_MINUTES = 5         # 任务处理超时（分钟），超时回退为 pending
@@ -121,6 +121,9 @@ PROXY_REFRESH_INTERVAL = 30      # 代理刷新间隔（秒）
 # - 隧道: 定时换 IP，多通道并行
 TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))  # 同时获取的代理通道数
 TUNNEL_ROTATE_INTERVAL = 60        # IP 轮换周期（秒），到期后重新获取代理
+# 固定隧道代理地址（帐密模式）：设置后跳过 API 调用，直接使用该地址
+# 格式: http://user:pwd@host:port
+TUNNEL_PROXY_URL = os.environ.get("TUNNEL_PROXY_URL", "")
 
 # 隧道 ChangeTpsIp API（手动换 IP）
 TUNNEL_CHANGE_IP_URL = (

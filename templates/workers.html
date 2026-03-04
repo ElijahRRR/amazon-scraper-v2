@@ -142,21 +142,28 @@
         blockCount.textContent = '累计封锁: ' + (gb.block_count || 0) + ' 次';
     }
 
+    // ---- XSS 防护 ----
+    function escapeHtml(s) {
+        if (typeof s !== 'string') return '';
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
     // ---- worker grid update ----
     function renderWorkerCard(w) {
+        const safeId = escapeHtml(w.worker_id);
         const isOnline = w.status === 'online';
         const offlineClass = isOnline ? '' : ' worker-card-offline';
         const badge = isOnline
             ? '<span class="badge-status badge-online"><i class="bi bi-circle-fill"></i> 在线</span>'
             : '<span class="badge-status badge-offline"><i class="bi bi-circle-fill"></i> 离线</span>';
         const deleteBtn = isOnline ? '' :
-            '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="removeWorker(\'' + w.worker_id + '\')" title="移除"><i class="bi bi-x-lg"></i></button>';
+            '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="removeWorker(\'' + safeId + '\')" title="移除"><i class="bi bi-x-lg"></i></button>';
 
-        return '<div class="col-md-6 col-xl-4" data-worker="' + w.worker_id + '">' +
+        return '<div class="col-md-6 col-xl-4" data-worker="' + safeId + '">' +
             '<div class="card worker-card' + offlineClass + '">' +
                 '<div class="card-header d-flex align-items-center gap-2 py-2">' +
                     '<i class="bi bi-pc-display" style="color:var(--accent)"></i>' +
-                    '<strong style="font-size:0.9rem" class="text-truncate">' + w.worker_id + '</strong>' +
+                    '<strong style="font-size:0.9rem" class="text-truncate">' + safeId + '</strong>' +
                     badge + deleteBtn +
                 '</div>' +
                 '<div class="card-body py-2 px-3">' +

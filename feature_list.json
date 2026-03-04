@@ -4,7 +4,7 @@
     "category": "refactor",
     "description": "adaptive.py — 提取共享信号量 resize 逻辑（减 ~30 行）",
     "steps": ["提取模块级 resize_semaphore 和 _drain_permits 函数", "ChannelController 和 AdaptiveController 调用共享函数", "python -c 'import adaptive' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 2,

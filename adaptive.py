@@ -24,6 +24,41 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# 共享信号量 resize 工具函数
+# ============================================================
+
+async def resize_semaphore(sem: asyncio.Semaphore, old: int, new: int,
+                           drain_task: Optional[asyncio.Task]) -> Optional[asyncio.Task]:
+    """安全调整信号量大小，返回新的 drain task（或 None）。"""
+    if drain_task and not drain_task.done():
+        drain_task.cancel()
+        try:
+            await drain_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    diff = new - old
+    if diff > 0:
+        for _ in range(diff):
+            sem.release()
+        return None
+    elif diff < 0:
+        return asyncio.create_task(_drain_permits(sem, abs(diff)))
+    return None
+
+
+async def _drain_permits(sem: asyncio.Semaphore, count: int):
+    """后台排空 permit（可取消安全）。"""
+    drained = 0
+    try:
+        for _ in range(count):
+            await sem.acquire()
+            drained += 1
+    except asyncio.CancelledError:
+        for _ in range(drained):
+            sem.release()
+
+
+# ============================================================
 # Per-Channel 控制器（DPS 隧道模式专用）
 # ============================================================
 
@@ -119,29 +154,8 @@ class ChannelController:
                 logger.info(f"ch{self.channel_id} 并发 {old_c}->{new_c} | {reason}")
 
     async def _resize(self, old_val: int, new_val: int):
-        if self._drain_task and not self._drain_task.done():
-            self._drain_task.cancel()
-            try:
-                await self._drain_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._drain_task = None
-        diff = new_val - old_val
-        if diff > 0:
-            for _ in range(diff):
-                self._semaphore.release()
-        elif diff < 0:
-            self._drain_task = asyncio.create_task(self._drain(abs(diff)))
-
-    async def _drain(self, count: int):
-        drained = 0
-        try:
-            for _ in range(count):
-                await self._semaphore.acquire()
-                drained += 1
-        except asyncio.CancelledError:
-            for _ in range(drained):
-                self._semaphore.release()
+        self._drain_task = await resize_semaphore(
+            self._semaphore, old_val, new_val, self._drain_task)
 
     async def stop(self):
         if self._drain_task and not self._drain_task.done():
@@ -405,31 +419,8 @@ class AdaptiveController:
         """安全地调整信号量大小（仅 TPS 模式使用）"""
         if not self._semaphore:
             return
-        if self._drain_task and not self._drain_task.done():
-            self._drain_task.cancel()
-            try:
-                await self._drain_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._drain_task = None
-
-        diff = new_value - old_value
-        if diff > 0:
-            for _ in range(diff):
-                self._semaphore.release()
-        elif diff < 0:
-            self._drain_task = asyncio.create_task(self._drain_permits(abs(diff)))
-
-    async def _drain_permits(self, count: int):
-        """后台排空 permit"""
-        drained = 0
-        try:
-            for _ in range(count):
-                await self._semaphore.acquire()
-                drained += 1
-        except asyncio.CancelledError:
-            for _ in range(drained):
-                self._semaphore.release()
+        self._drain_task = await resize_semaphore(
+            self._semaphore, old_value, new_value, self._drain_task)
 
 
 class TokenBucket:
