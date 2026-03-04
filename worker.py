@@ -1052,6 +1052,22 @@ class Worker:
             except Exception as e:
                 logger.debug(f"⚙️ 设置同步异常: {e}")
 
+    def _calc_recv_speed(self) -> int:
+        """计算 per-request 带宽限速（bytes/s），0 = 不限。"""
+        bw_mbps = config.PROXY_BANDWIDTH_MBPS
+        if bw_mbps <= 0:
+            return 0
+        pipe_bps = int(bw_mbps * 1_000_000 / 8)
+        return pipe_bps // max(1, self._metrics.inflight)
+
+    async def _apply_jitter(self):
+        """微抖动：绑定目标节拍间隔，避免过度随机造成碰撞。"""
+        _qps = (self._channel_rate_limiter.per_channel_rate
+                if self._channel_rate_limiter
+                else (self._rate_limiter.rate if self._rate_limiter else 5.0))
+        _jitter_max = min(0.3, 0.5 / _qps)
+        await asyncio.sleep(random.uniform(0, _jitter_max))
+
     async def _process_task(self, task: Dict) -> tuple:
         """
         处理单个采集任务
@@ -1129,19 +1145,8 @@ class Worker:
                 # 快速模式: 先用 AOD 获取价格数据（信号量仅包裹 HTTP 请求）
                 if self.fast_mode and attempt == 0:
                     await self._controller.acquire(channel)
-                    # 微抖动：绑定目标节拍间隔，避免过度随机造成碰撞
-                    _qps = (self._channel_rate_limiter.per_channel_rate
-                            if self._channel_rate_limiter
-                            else (self._rate_limiter.rate if self._rate_limiter else 5.0))
-                    _jitter_max = min(0.3, 0.5 / _qps)
-                    await asyncio.sleep(random.uniform(0, _jitter_max))
-                    # 计算 per-request 带宽限速
-                    aod_recv_speed = 0
-                    bw_mbps = config.PROXY_BANDWIDTH_MBPS
-                    if bw_mbps > 0:
-                        pipe_bps = int(bw_mbps * 1_000_000 / 8)
-                        inflight = self._metrics.inflight
-                        aod_recv_speed = pipe_bps // max(1, inflight)
+                    await self._apply_jitter()
+                    aod_recv_speed = self._calc_recv_speed()
                     aod_start = time.time()
                     try:
                         aod_result = await self._try_aod_fast(asin, zip_code, task, session, max_recv_speed=aod_recv_speed)
@@ -1165,19 +1170,8 @@ class Worker:
                 t_sem_start = time.time()
                 await self._controller.acquire(channel)
                 t_sem_wait = time.time() - t_sem_start
-                # 微抖动：绑定目标节拍间隔，避免过度随机造成碰撞
-                _qps = (self._channel_rate_limiter.per_channel_rate
-                        if self._channel_rate_limiter
-                        else (self._rate_limiter.rate if self._rate_limiter else 5.0))
-                _jitter_max = min(0.3, 0.5 / _qps)
-                await asyncio.sleep(random.uniform(0, _jitter_max))
-                # 计算 per-request 带宽限速（仅当 proxy_bandwidth_mbps > 0 时生效）
-                recv_speed = 0
-                bw_mbps = config.PROXY_BANDWIDTH_MBPS
-                if bw_mbps > 0:
-                    pipe_bps = int(bw_mbps * 1_000_000 / 8)
-                    inflight = self._metrics.inflight
-                    recv_speed = pipe_bps // max(1, inflight)
+                await self._apply_jitter()
+                recv_speed = self._calc_recv_speed()
                 req_start = time.time()
                 try:
                     resp = await session.fetch_product_page(asin, max_recv_speed=recv_speed)

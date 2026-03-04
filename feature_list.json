@@ -46,7 +46,7 @@
     "category": "refactor",
     "description": "worker.py — 提取带宽/抖动计算（减 ~15 行）",
     "steps": ["提取 _calc_recv_speed 和 _apply_jitter 方法", "AOD 和正常路径使用新方法", "python -c 'import worker' 验证无语法错误"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 8,
