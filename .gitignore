@@ -18,3 +18,8 @@ feature_list*.json
 progress*.md
 docs/
 test_aod.py
+screenshot_cache/
+parser_scrapling.py
+*.db-shm
+*.db-wal
+server.log

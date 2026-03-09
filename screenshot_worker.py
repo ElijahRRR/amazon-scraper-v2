@@ -1,20 +1,20 @@
 """
 独立截图进程：与采集 Worker 完全隔离的 asyncio 事件循环。
 
+流程：每张截图渲染完立即上传 Server，上传成功后删除 HTML 源文件。
+不积攒等待批次完成，确保截图实时上传。
+
 通信协议（基于文件系统）：
   screenshot_cache/html/{batch_name}/{asin}.html  — 采集 Worker 写入的 HTML
-  screenshot_cache/html/{batch_name}/_scraping_done — 采集完成标记
-  screenshot_cache/png/{batch_name}/{asin}.png     — 渲染后的截图
-  screenshot_cache/html/{batch_name}/_uploaded      — 上传完成标记（通知主 Worker）
+  screenshot_cache/html/{batch_name}/_scraping_done — 采集完成标记（主 Worker 写入）
+  screenshot_cache/_uploaded_{batch_name}           — 批次全部完成标记（通知主 Worker 门控）
 
 启动方式：由 worker.py 作为子进程启动，传入 server_url 参数。
 """
 
 import asyncio
-import json
 import logging
 import os
-import re
 import shutil
 import sys
 import time
@@ -33,7 +33,6 @@ class ScreenshotWorker:
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
         )
         self.html_dir = os.path.join(self.base_dir, "html")
-        self.png_dir = os.path.join(self.base_dir, "png")
         self._browsers_count = browsers_count
         self._pages_per_browser = pages_per_browser
         self._concurrency = browsers_count * pages_per_browser
@@ -41,34 +40,39 @@ class ScreenshotWorker:
         self._browser_lock = asyncio.Lock()
         self._browser_counter = 0
         self._running = True
-        self._uploading_batches: set = set()  # 正在上传中的批次（防重复触发）
+        self._http_client: Optional[httpx.AsyncClient] = None
 
     async def start(self):
-        """主循环：扫描 HTML 目录，渲染截图，上传完成后写标记"""
+        """主循环：扫描 HTML → 渲染 → 立即上传 → 删除 HTML → 检查批次完成"""
         os.makedirs(self.html_dir, exist_ok=True)
-        os.makedirs(self.png_dir, exist_ok=True)
-        logger.info(f"📸 截图独立进程启动（并发: {self._concurrency}, 监控: {self.html_dir}）")
+        self._http_client = httpx.AsyncClient(timeout=30)
+        logger.info(f"截图独立进程启动（并发: {self._concurrency}, 监控: {self.html_dir}）")
 
         try:
             while self._running:
-                batches = self._scan_pending_batches()
-                if not batches:
+                pending = self._scan_pending()
+                if not pending:
+                    # 没有待处理的 HTML，检查是否有已完成的批次
+                    self._check_batch_completion()
                     await asyncio.sleep(1)
                     continue
 
-                for batch_name, html_files in batches.items():
-                    await self._process_batch(batch_name, html_files)
+                await self._process_pending(pending)
+                # 处理完一轮后立即检查批次完成状态
+                self._check_batch_completion()
         except KeyboardInterrupt:
             pass
         finally:
             await self._close_browsers()
-            logger.info("📸 截图独立进程退出")
+            if self._http_client:
+                await self._http_client.aclose()
+            logger.info("截图独立进程退出")
 
-    def _scan_pending_batches(self) -> dict:
-        """扫描有未处理 HTML 的批次"""
-        batches = {}
+    def _scan_pending(self) -> list:
+        """扫描所有待处理的 HTML 文件，返回 [(batch_name, asin, html_path), ...]"""
+        pending = []
         if not os.path.isdir(self.html_dir):
-            return batches
+            return pending
 
         for batch_name in os.listdir(self.html_dir):
             batch_dir = os.path.join(self.html_dir, batch_name)
@@ -78,138 +82,115 @@ class ScreenshotWorker:
             if os.path.exists(os.path.join(self.base_dir, f"_uploaded_{batch_name}")):
                 continue
 
-            html_files = [f for f in os.listdir(batch_dir)
-                          if f.endswith(".html") and not f.startswith("_")]
-            # 找出尚未渲染的
-            png_batch_dir = os.path.join(self.png_dir, batch_name)
-            pending = []
-            for f in html_files:
-                asin = f[:-5]  # remove .html
-                png_path = os.path.join(png_batch_dir, f"{asin}.png")
-                if not os.path.exists(png_path):
-                    pending.append(f)
+            for fname in os.listdir(batch_dir):
+                if fname.endswith(".html") and not fname.startswith("_"):
+                    asin = fname[:-5]
+                    html_path = os.path.join(batch_dir, fname)
+                    pending.append((batch_name, asin, html_path))
 
-            if pending:
-                batches[batch_name] = pending
-            elif (os.path.exists(os.path.join(batch_dir, "_scraping_done"))
-                  and batch_name not in self._uploading_batches):
-                # 所有 HTML 都已渲染，触发上传（防重复）
-                self._uploading_batches.add(batch_name)
-                asyncio.ensure_future(self._upload_and_mark(batch_name))
+        return pending
 
-        return batches
-
-    async def _process_batch(self, batch_name: str, html_files: list):
-        """并发渲染一个批次的截图"""
-        logger.info(f"📸 开始渲染批次: {batch_name} ({len(html_files)} 张待处理)")
+    async def _process_pending(self, pending: list):
+        """并发处理：渲染 → 上传 → 删除 HTML"""
+        logger.info(f"处理 {len(pending)} 张待截图")
         sem = asyncio.Semaphore(self._concurrency)
 
-        async def render_one(filename):
-            asin = filename[:-5]
+        async def process_one(batch_name, asin, html_path):
             async with sem:
-                await self._render_and_save(batch_name, asin)
+                await self._render_upload_cleanup(batch_name, asin, html_path)
 
-        tasks = [asyncio.create_task(render_one(f)) for f in html_files]
+        tasks = [
+            asyncio.create_task(process_one(b, a, p))
+            for b, a, p in pending
+        ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 检查是否采集已完成 + 全部渲染完毕
-        batch_html_dir = os.path.join(self.html_dir, batch_name)
-        scraping_done = os.path.exists(os.path.join(batch_html_dir, "_scraping_done"))
-        if scraping_done:
-            # 再检查一次是否全部渲染完
-            all_html = [f for f in os.listdir(batch_html_dir)
-                        if f.endswith(".html") and not f.startswith("_")]
-            png_batch_dir = os.path.join(self.png_dir, batch_name)
-            all_done = all(
-                os.path.exists(os.path.join(png_batch_dir, f"{f[:-5]}.png"))
-                for f in all_html
-            )
-            if all_done and batch_name not in self._uploading_batches:
-                self._uploading_batches.add(batch_name)
-                await self._upload_and_mark(batch_name)
-
-    async def _render_and_save(self, batch_name: str, asin: str):
-        """读取 HTML，渲染截图，保存 PNG"""
-        html_path = os.path.join(self.html_dir, batch_name, f"{asin}.html")
+    async def _render_upload_cleanup(self, batch_name: str, asin: str, html_path: str):
+        """单张截图完整流程：渲染 → 上传 → 删除 HTML"""
+        # 1. 读取 HTML
         try:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
                 html_content = f.read()
         except FileNotFoundError:
             return
 
+        # 2. 渲染截图
         png_bytes = await self._render_screenshot(html_content, asin)
-        if png_bytes:
-            png_dir = os.path.join(self.png_dir, batch_name)
-            os.makedirs(png_dir, exist_ok=True)
-            png_path = os.path.join(png_dir, f"{asin}.png")
-            with open(png_path, "wb") as f:
-                f.write(png_bytes)
-            logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes)")
-        else:
-            # 渲染失败也标记为完成（写空 PNG 占位，避免无限重试）
-            png_dir = os.path.join(self.png_dir, batch_name)
-            os.makedirs(png_dir, exist_ok=True)
-            png_path = os.path.join(png_dir, f"{asin}.png")
-            with open(png_path, "wb") as f:
-                f.write(b"")
-            logger.warning(f"📸 截图渲染失败: {asin}")
 
-    async def _upload_and_mark(self, batch_name: str):
-        """上传批次所有截图到 Server，写 _uploaded 标记"""
-        png_dir = os.path.join(self.png_dir, batch_name)
-        if not os.path.isdir(png_dir):
+        # 3. 上传到服务器（仅有效截图）
+        if png_bytes and len(png_bytes) > 0:
+            upload_ok = await self._upload_screenshot(batch_name, asin, png_bytes)
+            if upload_ok:
+                logger.info(f"截图完成并上传: {asin} ({len(png_bytes)} bytes)")
+            else:
+                logger.warning(f"截图上传失败: {asin}")
+        else:
+            logger.warning(f"截图渲染失败: {asin}")
+
+        # 4. 无论成功失败都删除 HTML（避免无限重试）
+        try:
+            os.remove(html_path)
+        except OSError:
+            pass
+
+    async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
+        """上传单张截图到服务器"""
+        fname = f"{asin}.png"
+        for attempt in range(3):
+            try:
+                resp = await self._http_client.post(
+                    f"{self.server_url}/api/tasks/screenshot",
+                    files={"file": (fname, png_bytes, "image/png")},
+                    data={"batch_name": batch_name, "asin": asin},
+                )
+                if resp.status_code == 200:
+                    return True
+                logger.warning(f"上传失败 {asin}: HTTP {resp.status_code} (尝试 {attempt + 1}/3)")
+            except Exception as e:
+                logger.error(f"上传异常 {asin}: {e} (尝试 {attempt + 1}/3)")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        return False
+
+    def _check_batch_completion(self):
+        """检查批次是否已完成（_scraping_done 存在 + 无剩余 HTML）→ 写 _uploaded 标记"""
+        if not os.path.isdir(self.html_dir):
             return
 
-        files = [f for f in os.listdir(png_dir) if f.endswith(".png")]
-        valid_files = []
-        for f in files:
-            fpath = os.path.join(png_dir, f)
-            if os.path.getsize(fpath) > 0:
-                valid_files.append(f)
+        for batch_name in os.listdir(self.html_dir):
+            batch_dir = os.path.join(self.html_dir, batch_name)
+            if not os.path.isdir(batch_dir):
+                continue
+            # 已标记完成的跳过
+            uploaded_marker = os.path.join(self.base_dir, f"_uploaded_{batch_name}")
+            if os.path.exists(uploaded_marker):
+                continue
 
-        if valid_files:
-            logger.info(f"📸 开始上传截图: {batch_name} ({len(valid_files)} 张)")
-            uploaded = 0
-            failed = 0
-            async with httpx.AsyncClient(timeout=30) as client:
-                for fname in valid_files:
-                    asin = fname[:-4]
-                    fpath = os.path.join(png_dir, fname)
-                    try:
-                        with open(fpath, "rb") as f:
-                            png_bytes = f.read()
-                        resp = await client.post(
-                            f"{self.server_url}/api/tasks/screenshot",
-                            files={"file": (fname, png_bytes, "image/png")},
-                            data={"batch_name": batch_name, "asin": asin},
-                        )
-                        if resp.status_code == 200:
-                            uploaded += 1
-                        else:
-                            failed += 1
-                            logger.warning(f"截图上传失败 {asin}: HTTP {resp.status_code}")
-                    except Exception as e:
-                        failed += 1
-                        logger.error(f"截图上传异常 {asin}: {e}")
-            logger.info(f"📸 上传完成: {batch_name} (成功 {uploaded}, 失败 {failed})")
+            # 需要 _scraping_done 标记
+            scraping_done = os.path.join(batch_dir, "_scraping_done")
+            if not os.path.exists(scraping_done):
+                continue
 
-        # 写 _uploaded 标记到 screenshot_cache/ 根目录（不放在被清理的子目录里）
-        uploaded_marker = os.path.join(self.base_dir, f"_uploaded_{batch_name}")
-        with open(uploaded_marker, "w") as f:
-            f.write(str(time.time()))
-        logger.info(f"📸 批次完成标记已写入: {batch_name}")
+            # 检查是否还有未处理的 HTML
+            remaining = [f for f in os.listdir(batch_dir)
+                         if f.endswith(".html") and not f.startswith("_")]
+            if remaining:
+                continue
 
-        # 清理 HTML 和 PNG 暂存
-        html_batch_dir = os.path.join(self.html_dir, batch_name)
-        shutil.rmtree(html_batch_dir, ignore_errors=True)
-        shutil.rmtree(png_dir, ignore_errors=True)
+            # 全部完成：写 _uploaded 标记
+            with open(uploaded_marker, "w") as f:
+                f.write(str(time.time()))
+            logger.info(f"批次完成标记已写入: {batch_name}")
+
+            # 清理批次目录
+            shutil.rmtree(batch_dir, ignore_errors=True)
 
     async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
         """Playwright 渲染截图"""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            logger.warning("📸 playwright 未安装，跳过截图渲染")
+            logger.warning("playwright 未安装，跳过截图渲染")
             return None
 
         page = None
@@ -226,7 +207,7 @@ class ScreenshotWorker:
                                       "--no-sandbox", "--disable-extensions"]
                             )
                             self._browser_slots.append({"playwright": pw, "browser": browser})
-                        logger.info(f"📸 浏览器池启动（{self._browsers_count} 实例）")
+                        logger.info(f"浏览器池启动（{self._browsers_count} 实例）")
 
             idx = self._browser_counter % len(self._browser_slots)
             self._browser_counter += 1
@@ -270,6 +251,30 @@ class ScreenshotWorker:
             except Exception:
                 pass
 
+            # 等待主图加载完成（最多 8 秒）
+            try:
+                await page.evaluate("""() => new Promise((resolve) => {
+                    const selectors = [
+                        '#landingImage',
+                        '#imgBlkFront',
+                        '#main-image',
+                        '#imgTagWrapperId img',
+                        '#imageBlock img[src*="images-amazon"]'
+                    ];
+                    let img = null;
+                    for (const sel of selectors) {
+                        img = document.querySelector(sel);
+                        if (img) break;
+                    }
+                    if (!img) return resolve(false);
+                    if (img.complete && img.naturalWidth > 0) return resolve(true);
+                    img.addEventListener('load', () => resolve(true), {once: true});
+                    img.addEventListener('error', () => resolve(false), {once: true});
+                    setTimeout(() => resolve(false), 7000);
+                })""")
+            except Exception:
+                pass
+
             # 检查页面可见内容
             has_content = await page.evaluate("""() => {
                 if (!document.body) return false;
@@ -286,17 +291,17 @@ class ScreenshotWorker:
             )
 
             if len(screenshot) < 10240 and not has_content:
-                logger.warning(f"📸 空白截图已丢弃: {asin} ({len(screenshot)} bytes)")
+                logger.warning(f"空白截图已丢弃: {asin} ({len(screenshot)} bytes)")
                 return None
 
             return screenshot
         except Exception as e:
             err_msg = str(e)
             if "browser has been closed" in err_msg or "Target closed" in err_msg:
-                logger.error(f"📸 浏览器崩溃，将重启: {asin}")
+                logger.error(f"浏览器崩溃，将重启: {asin}")
                 await self._close_browsers()
             else:
-                logger.warning(f"📸 渲染失败 {asin}: {e}")
+                logger.warning(f"渲染失败 {asin}: {e}")
             return None
         finally:
             if page:
@@ -333,8 +338,8 @@ def main():
         sys.exit(1)
 
     server_url = sys.argv[1].rstrip("/")
-    browsers_count = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    pages_per_browser = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+    browsers_count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    pages_per_browser = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 
     worker = ScreenshotWorker(
         server_url=server_url,
