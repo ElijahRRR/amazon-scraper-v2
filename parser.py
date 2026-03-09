@@ -8,7 +8,9 @@ lxml 作为 fallback
 import re
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_CN_TZ = timezone(timedelta(hours=8))
 from typing import Optional, List, Dict, Any, Tuple
 
 # 优先 selectolax，fallback 到 lxml
@@ -772,7 +774,7 @@ class AmazonParser:
         """创建默认结果字典"""
         return {
             "asin": asin,
-            "crawl_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "crawl_time": datetime.now(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
             "site": "US",
             "zip_code": zip_code,
             "product_url": f"https://www.amazon.com/dp/{asin}",

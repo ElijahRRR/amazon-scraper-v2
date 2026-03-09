@@ -95,7 +95,7 @@ def _default_settings() -> dict:
         "min_concurrency": config.MIN_CONCURRENCY,
         "max_concurrency": config.MAX_CONCURRENCY,
         "session_rotate_every": config.SESSION_ROTATE_EVERY,
-        "screenshot_concurrency": 3,
+        "screenshot_browsers": 2,
         "adjust_interval": config.ADJUST_INTERVAL_S,
         "target_latency": config.TARGET_LATENCY_S,
         "max_latency": config.MAX_LATENCY_S,
@@ -602,11 +602,45 @@ async def export_screenshots(batch_name: str):
     )
 
 
+def _parse_price(s: str) -> float | None:
+    """解析 '$12.99' 格式的价格字符串为浮点数，失败返回 None。"""
+    if not s or s == "N/A":
+        return None
+    s = s.strip().replace(",", "")
+    if s.startswith("$"):
+        s = s[1:]
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _prepare_export_rows(results: List[Dict]):
     """准备导出数据，返回 (headers, field_keys, rows)。"""
     field_keys = list(RESULT_FIELDS)
     headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
     rows = [[str(row_data.get(f, "")) for f in field_keys] for row_data in results]
+
+    # 在 "BuyBox 运费" 后插入 "总价" 列
+    shipping_header = "BuyBox 运费"
+    if shipping_header in headers:
+        insert_idx = headers.index(shipping_header) + 1
+        headers.insert(insert_idx, "总价")
+        for i, row_data in enumerate(results):
+            price = _parse_price(str(row_data.get("buybox_price", "")))
+            shipping_str = str(row_data.get("buybox_shipping", ""))
+            if price is None:
+                total = "N/A"
+            elif shipping_str.upper() == "FREE":
+                total = f"${price:.2f}"
+            else:
+                shipping = _parse_price(shipping_str)
+                if shipping is None:
+                    total = f"${price:.2f}"
+                else:
+                    total = f"${price + shipping:.2f}"
+            rows[i].insert(insert_idx, total)
+
     return headers, field_keys, rows
 
 
@@ -913,7 +947,7 @@ async def update_settings(request: Request):
         "min_concurrency":      (int,   1,    20),
         "max_concurrency":      (int,   2,    500),
         "session_rotate_every": (int,   50,   10000),
-        "screenshot_concurrency": (int, 1,    6),
+        "screenshot_browsers":    (int, 1,    6),
         "adjust_interval":      (int,   3,    60),
         "target_latency":       (float, 1,    30),
         "max_latency":          (float, 2,    60),

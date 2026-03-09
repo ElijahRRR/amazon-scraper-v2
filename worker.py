@@ -126,10 +126,13 @@ class Worker:
 
         # 截图队列（有界，防止内存无限增长）
         self._screenshot_queue: asyncio.Queue = None
-        self._screenshot_concurrency = 3   # 并发截图协程数
-        self._browser = None               # 持久化 Playwright 浏览器实例
-        self._playwright = None            # Playwright 上下文管理器
+        self._browsers_count = 2             # 浏览器实例数
+        self._pages_per_browser = 6          # 每个浏览器最大并发 page 数
+        self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
+        self._browsers: list = []            # 浏览器实例列表
+        self._playwright = None              # Playwright 上下文管理器
         self._browser_lock = asyncio.Lock()  # 浏览器初始化/关闭锁
+        self._browser_counter = 0            # 轮询计数器
 
         # 设置同步
         self._settings_version = 0
@@ -598,10 +601,11 @@ class Worker:
             config.REQUEST_TIMEOUT = new_timeout
             changes.append(f"timeout={new_timeout}s")
 
-        new_sc = s.get("screenshot_concurrency")
-        if new_sc and new_sc != self._screenshot_concurrency:
-            self._screenshot_concurrency = new_sc
-            changes.append(f"screenshot_c={new_sc}")
+        new_browsers = s.get("screenshot_browsers")
+        if new_browsers and new_browsers != self._browsers_count:
+            self._browsers_count = new_browsers
+            self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
+            changes.append(f"screenshot_browsers={new_browsers}, total_concurrency={self._screenshot_concurrency}")
 
         return changes
 
@@ -1376,8 +1380,8 @@ class Worker:
 
     async def _screenshot_workers(self):
         """
-        截图协程池：动态管理多个并发截图协程，共享同一个 Playwright 浏览器实例。
-        Playwright 原生支持多 page 并发（每个 page 独立渲染管线），无线程安全问题。
+        截图协程池：动态管理多个并发截图协程，使用多浏览器实例池。
+        每个浏览器最多运行 pages_per_browser 个并发 page，轮询分配。
         """
         n = self._screenshot_concurrency
         logger.info(f"📸 截图协程池启动（{n} 并发）")
@@ -1453,19 +1457,25 @@ class Worker:
 
         page = None
         try:
-            # 懒初始化：首次调用时启动浏览器（加锁防止并发重复初始化）
-            if self._browser is None:
+            # 懒初始化：首次调用时启动多个浏览器（加锁防止并发重复初始化）
+            if not self._browsers:
                 async with self._browser_lock:
-                    if self._browser is None:  # double-check
+                    if not self._browsers:  # double-check
                         self._playwright = await async_playwright().__aenter__()
-                        self._browser = await self._playwright.chromium.launch(
-                            headless=True,
-                            args=["--disable-gpu", "--disable-dev-shm-usage",
-                                  "--no-sandbox", "--disable-extensions"]
-                        )
-                        logger.info("📸 Playwright 浏览器已启动（持久化复用）")
+                        for i in range(self._browsers_count):
+                            browser = await self._playwright.chromium.launch(
+                                headless=True,
+                                args=["--disable-gpu", "--disable-dev-shm-usage",
+                                      "--no-sandbox", "--disable-extensions"]
+                            )
+                            self._browsers.append(browser)
+                        logger.info(f"📸 Playwright 浏览器池已启动（{self._browsers_count} 个实例，每个最多 {self._pages_per_browser} page）")
 
-            page = await self._browser.new_page(viewport={"width": 1280, "height": 900})
+            # 轮询分配浏览器
+            idx = self._browser_counter % len(self._browsers)
+            self._browser_counter += 1
+            browser = self._browsers[idx]
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
 
             # 屏蔽无关资源：只保留 CSS 和图片，保证页面外观
             async def block_resources(route):
@@ -1532,8 +1542,8 @@ class Worker:
                         if (rect.bottom > maxBottom) maxBottom = rect.bottom;
                     }
                 }
-                // 找到了锚点元素 → 底部加 100px 边距
-                if (maxBottom > 0) return Math.ceil(maxBottom + 100);
+                // 找到了锚点元素 → 底部加 200px 边距
+                if (maxBottom > 0) return Math.ceil(maxBottom + 200);
                 // 兜底：取页面实际高度，但不超过 3000px
                 return Math.min(document.body.scrollHeight || 1200, 3000);
             }""")
@@ -1579,19 +1589,19 @@ class Worker:
                     pass
 
     async def _close_browser(self):
-        """安全关闭 Playwright 浏览器（加锁防止并发关闭冲突）"""
+        """安全关闭所有 Playwright 浏览器（加锁防止并发关闭冲突）"""
         async with self._browser_lock:
-            try:
-                if self._browser:
-                    await self._browser.close()
-            except Exception:
-                pass
+            for browser in self._browsers:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            self._browsers.clear()
             try:
                 if self._playwright:
                     await self._playwright.__aexit__(None, None, None)
             except Exception:
                 pass
-            self._browser = None
             self._playwright = None
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):

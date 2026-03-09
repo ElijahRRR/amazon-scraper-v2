@@ -38,10 +38,10 @@
                             <small class="text-secondary">每 N 次成功请求后轮换 Session</small>
                         </div>
                         <div class="col-md-4">
-                            <label class="form-label">截图并发数</label>
-                            <input type="number" class="form-control" name="screenshot_concurrency"
-                                   value="{{ settings.screenshot_concurrency }}" min="1" max="6">
-                            <small class="text-secondary">同时渲染的截图数量（共享浏览器）</small>
+                            <label class="form-label">截图浏览器数</label>
+                            <input type="number" class="form-control" name="screenshot_browsers"
+                                   value="{{ settings.screenshot_browsers }}" min="1" max="6">
+                            <small class="text-secondary">浏览器实例数（每个最多 6 并发 page）</small>
                         </div>
                     </div>
 
@@ -279,7 +279,7 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     // 数值类型转换
     const intFields = ['max_retries', 'request_timeout', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
-                       'proxy_bandwidth_mbps', 'screenshot_concurrency', 'global_max_concurrency',
+                       'proxy_bandwidth_mbps', 'screenshot_browsers', 'global_max_concurrency',
                        'tunnel_channels', 'tunnel_rotate_interval',
                        'tunnel_max_concurrency', 'tunnel_initial_concurrency',
                        'per_channel_max_concurrency'];
