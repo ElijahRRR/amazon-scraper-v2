@@ -27,7 +27,7 @@ logger = logging.getLogger("screenshot_worker")
 
 class ScreenshotWorker:
     def __init__(self, server_url: str, base_dir: str = None,
-                 browsers_count: int = 2, pages_per_browser: int = 6):
+                 browsers_count: int = 1, pages_per_browser: int = 3):
         self.server_url = server_url
         self.base_dir = base_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
