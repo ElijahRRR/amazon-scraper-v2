@@ -1191,14 +1191,17 @@ class Worker:
                 if self._stats["total"] % 5 == 0:
                     logger.info(f"⏱️ 链路 | token:{t_token_wait:.2f}s sem:{t_sem_wait:.2f}s http:{req_elapsed:.2f}s parse:{t_parse:.3f}s bytes:{resp_bytes}")
 
-                # 截图存证：放入有界截图队列（背压防止内存失控）
+                # 截图存证：非阻塞放入队列（队列满则丢弃，避免拖慢采集）
                 if task.get("needs_screenshot"):
-                    await self._screenshot_queue.put({
-                        "task_id": task_id,
-                        "asin": asin,
-                        "batch_name": task.get("batch_name", ""),
-                        "html": resp.text,
-                    })
+                    try:
+                        self._screenshot_queue.put_nowait({
+                            "task_id": task_id,
+                            "asin": asin,
+                            "batch_name": task.get("batch_name", ""),
+                            "html": resp.text,
+                        })
+                    except asyncio.QueueFull:
+                        logger.warning(f"📸 截图队列已满，跳过 {asin}")
 
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测（仅 TPS 模式）
                 if not is_tunnel:
@@ -1523,18 +1526,21 @@ class Worker:
             except Exception:
                 pass  # 超时仍继续截图，大部分资源应已加载
 
-            # 计算裁剪高度：扫描多个锚点元素，取最大 bottom 值
+            # 计算裁剪高度：扫描锚点 + 递归扫描右栏子元素，取最大 bottom 值
             clip_height = await page.evaluate("""() => {
-                // 防御 document.body 为 null（setContent 异常时可能发生）
                 if (!document.body) return 1200;
+                let maxBottom = 0;
+
+                // 1) 扫描锚点容器元素
                 const anchors = [
                     '#buybox', '#rightCol', '#buyBoxAccordion',
                     '#add-to-cart-button', '#buy-now-button',
                     '#submitOrderButtonId', '#averageCustomerReviews',
                     '#productOverview_feature_div', '#centerCol',
-                    '#apex_desktop_newAccordionRow'
+                    '#apex_desktop_newAccordionRow',
+                    '#desktop_buybox_group_1', '#qualifiedBuybox',
+                    '#addToList_feature_div', '#addToCart_feature_div'
                 ];
-                let maxBottom = 0;
                 for (const sel of anchors) {
                     const el = document.querySelector(sel);
                     if (el) {
@@ -1542,7 +1548,19 @@ class Worker:
                         if (rect.bottom > maxBottom) maxBottom = rect.bottom;
                     }
                 }
-                // 找到了锚点元素 → 底部加 200px 边距
+
+                // 2) 递归扫描 #rightCol 所有子元素的实际 bottom（捕获 BuyBox 完整区域）
+                const rightCol = document.querySelector('#rightCol');
+                if (rightCol) {
+                    rightCol.querySelectorAll('*').forEach(el => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.height > 0 && rect.width > 50 && rect.bottom > maxBottom) {
+                            maxBottom = rect.bottom;
+                        }
+                    });
+                }
+
+                // 找到了元素 → 底部加 200px 边距
                 if (maxBottom > 0) return Math.ceil(maxBottom + 200);
                 // 兜底：取页面实际高度，但不超过 3000px
                 return Math.min(document.body.scrollHeight || 1200, 3000);
