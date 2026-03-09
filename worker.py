@@ -127,17 +127,15 @@ class Worker:
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
 
-        # 截图队列（无界，截图独立于采集，不丢弃任务）
-        self._screenshot_queue: asyncio.Queue = None
-        self._browsers_count = 2             # 浏览器实例数
+        # 截图：独立子进程架构（采集与截图完全隔离事件循环）
+        self._browsers_count = 2             # 截图浏览器实例数
         self._pages_per_browser = 6          # 每个浏览器最大并发 page 数
-        self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
-        # 每个浏览器独立的 Playwright 实例（独立 Node.js 进程，避免单进程瓶颈）
-        self._browser_slots: list = []       # [{playwright, browser}]
-        self._browser_lock = asyncio.Lock()  # 浏览器初始化锁
-        self._browser_counter = 0            # 轮询计数器
-        self._screenshot_local_dir: str = None  # 本地截图暂存目录
-        self._screenshot_pending_batches: dict = {}  # {batch_name: {total, done}} 待上传批次跟踪
+        self._screenshot_base_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
+        )
+        self._screenshot_html_dir = os.path.join(self._screenshot_base_dir, "html")
+        self._screenshot_process: Optional[asyncio.subprocess.Process] = None
+        self._screenshot_pending_batches: set = set()  # 有截图任务的批次名集合
         self._screenshot_gate = asyncio.Event()  # 截图批次门控：set=可拉新任务, clear=等截图完成
         self._screenshot_gate.set()  # 默认开启
 
@@ -165,7 +163,6 @@ class Worker:
         # 初始化队列
         self._task_queue = asyncio.PriorityQueue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
-        self._screenshot_queue = asyncio.Queue()  # 无界队列，截图独立消化
 
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
@@ -180,13 +177,13 @@ class Worker:
         # 启动自适应控制器
         await self._controller.start()
 
-        # 启动核心协程（含截图后台 worker）
+        # 启动核心协程
         try:
             coroutines = [
                 self._task_feeder(),         # 1. 持续从 Server 拉任务
                 self._worker_pool(),         # 2. 工人池：自适应并发
                 self._batch_submitter(),     # 3. 批量回传结果
-                self._screenshot_workers(),   # 4. 截图渲染（多协程并发）
+                self._screenshot_gate_monitor(),  # 4. 截图完成监控（检查子进程标记）
                 self._settings_sync(),       # 5. 定期同步服务端设置
             ]
             # 隧道模式：添加 IP 轮换监控协程
@@ -238,20 +235,20 @@ class Worker:
             try:
                 queue_size = self._task_queue.qsize()
 
-                # 截图门控：队列已空 + 有未完成的截图批次 → 阻塞等待截图上传完成再拉新任务
-                # 只在队列空时检查，避免采集期间误触发（采集中 total 持续增长）
-                if queue_size == 0:
-                    pending_ss = {
-                        b: info for b, info in self._screenshot_pending_batches.items()
-                        if info["done"] < info["total"]
-                    }
-                    if pending_ss:
-                        total_remaining = sum(i["total"] - i["done"] for i in pending_ss.values())
-                        logger.info(f"⏸️ 等待截图完成后再拉取新任务（剩余 {total_remaining} 张截图待处理）")
-                        self._screenshot_gate.clear()
-                        await self._screenshot_gate.wait()
-                        logger.info("▶️ 截图批次已完成，继续拉取新任务")
-                        continue
+                # 截图门控：队列已空 + 有未完成的截图批次 → 写采集完成标记，等截图上传完成
+                if queue_size == 0 and self._screenshot_pending_batches:
+                    for batch in self._screenshot_pending_batches:
+                        marker = os.path.join(self._screenshot_html_dir, batch, "_scraping_done")
+                        if not os.path.exists(marker):
+                            os.makedirs(os.path.dirname(marker), exist_ok=True)
+                            with open(marker, "w") as f:
+                                f.write(str(time.time()))
+                    pending = len(self._screenshot_pending_batches)
+                    logger.info(f"⏸️ 等待截图完成后再拉取新任务（{pending} 个批次待处理）")
+                    self._screenshot_gate.clear()
+                    await self._screenshot_gate.wait()
+                    logger.info("▶️ 截图批次已完成，继续拉取新任务")
+                    continue
                 threshold = int(self._queue_size * self._prefetch_threshold)
 
                 if queue_size < threshold:
@@ -625,13 +622,8 @@ class Worker:
 
         new_browsers = s.get("screenshot_browsers")
         if new_browsers and new_browsers != self._browsers_count:
-            # 浏览器数量仅在启动前生效；运行中已有浏览器池则跳过
-            if not self._browser_slots:
-                self._browsers_count = new_browsers
-                self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
-                changes.append(f"screenshot_browsers={new_browsers}, total_concurrency={self._screenshot_concurrency}")
-            else:
-                changes.append(f"screenshot_browsers={new_browsers}(忽略，需重启生效)")
+            self._browsers_count = new_browsers
+            changes.append(f"screenshot_browsers={new_browsers} (截图子进程下次启动时生效)")
 
         return changes
 
@@ -1217,19 +1209,18 @@ class Worker:
                 if self._stats["total"] % 5 == 0:
                     logger.info(f"⏱️ 链路 | token:{t_token_wait:.2f}s sem:{t_sem_wait:.2f}s http:{req_elapsed:.2f}s parse:{t_parse:.3f}s bytes:{resp_bytes}")
 
-                # 截图存证：放入无界队列，截图独立于采集异步消化
+                # 截图存证：写 HTML 到磁盘，由独立截图子进程渲染
                 if task.get("needs_screenshot"):
                     batch = task.get("batch_name", "")
-                    self._screenshot_queue.put_nowait({
-                        "task_id": task_id,
-                        "asin": asin,
-                        "batch_name": batch,
-                        "html": resp.text,
-                    })
-                    # 跟踪批次截图总数
-                    if batch not in self._screenshot_pending_batches:
-                        self._screenshot_pending_batches[batch] = {"total": 0, "done": 0}
-                    self._screenshot_pending_batches[batch]["total"] += 1
+                    safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch).strip('_') or "default"
+                    html_dir = os.path.join(self._screenshot_html_dir, safe_batch)
+                    os.makedirs(html_dir, exist_ok=True)
+                    html_path = os.path.join(html_dir, f"{asin}.html")
+                    async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
+                        await f.write(resp.text)
+                    self._screenshot_pending_batches.add(safe_batch)
+                    # 确保截图子进程已启动
+                    await self._ensure_screenshot_process()
 
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测（仅 TPS 模式）
                 if not is_tunnel:
@@ -1406,288 +1397,65 @@ class Worker:
                     logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
 
     # ═══════════════════════════════════════════════
-    # 截图渲染管道
+    # 截图：独立子进程架构
     # ═══════════════════════════════════════════════
 
-    async def _screenshot_workers(self):
-        """
-        截图协程池：动态管理多个并发截图协程，使用多浏览器实例池。
-        每个浏览器最多运行 pages_per_browser 个并发 page，轮询分配。
-        截图先存本地，批次截图全部完成后批量上传到 Server。
-        """
-        # 初始化本地暂存目录
-        self._screenshot_local_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
+    async def _ensure_screenshot_process(self):
+        """确保截图子进程已启动，未启动则启动"""
+        if self._screenshot_process and self._screenshot_process.returncode is None:
+            return  # 已在运行
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot_worker.py")
+        self._screenshot_process = await asyncio.create_subprocess_exec(
+            sys.executable, script,
+            self.server_url,
+            str(self._browsers_count),
+            str(self._pages_per_browser),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        os.makedirs(self._screenshot_local_dir, exist_ok=True)
+        # 异步转发子进程日志
+        asyncio.create_task(self._forward_screenshot_logs())
+        logger.info(f"📸 截图子进程已启动 (PID: {self._screenshot_process.pid})")
 
-        n = self._screenshot_concurrency
-        logger.info(f"📸 截图协程池启动（{n} 并发，本地暂存: {self._screenshot_local_dir}）")
-        tasks: List[asyncio.Task] = []
-        for i in range(n):
-            tasks.append(asyncio.create_task(self._screenshot_loop(i)))
-
-        # 监控循环：检查批次完成情况，触发批量上传
-        uploaded_batches = set()
-        while self._running or not self._screenshot_queue.empty():
-            await asyncio.sleep(3)
-            # 动态扩容截图协程
-            target = self._screenshot_concurrency
-            active = [t for t in tasks if not t.done()]
-            current = len(active)
-            if target > current:
-                for i in range(target - current):
-                    idx = len(tasks)
-                    tasks.append(asyncio.create_task(self._screenshot_loop(idx)))
-                logger.info(f"📸 截图协程扩容: {current} → {target}")
-            tasks = [t for t in tasks if not t.done()]
-
-            # 检查已完成的批次，触发批量上传
-            for batch_name, info in list(self._screenshot_pending_batches.items()):
-                if batch_name in uploaded_batches:
-                    continue
-                if info["done"] >= info["total"] and info["total"] > 0:
-                    uploaded_batches.add(batch_name)
-                    asyncio.create_task(self._batch_upload_screenshots(batch_name))
-
-            # 日志：队列剩余
-            qsize = self._screenshot_queue.qsize()
-            if qsize > 0:
-                logger.info(f"📸 截图队列剩余: {qsize}")
-
-        # 等待所有截图协程完成
-        remaining = [t for t in tasks if not t.done()]
-        if remaining:
-            await asyncio.gather(*remaining, return_exceptions=True)
-
-        # 最终上传所有未上传的批次
-        for batch_name in list(self._screenshot_pending_batches.keys()):
-            if batch_name not in uploaded_batches:
-                await self._batch_upload_screenshots(batch_name)
-        logger.info("📸 截图协程池退出")
-
-    async def _screenshot_loop(self, idx: int):
-        """单个截图协程：从队列取任务，渲染并保存到本地"""
-        while self._running or not self._screenshot_queue.empty():
-            try:
-                try:
-                    item = await asyncio.wait_for(
-                        self._screenshot_queue.get(), timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-
-                asin = item["asin"]
-                batch_name = item["batch_name"]
-                html_content = item["html"]
-
-                try:
-                    png_bytes = await self._render_screenshot(html_content, asin)
-                    if png_bytes:
-                        # 保存到本地暂存目录
-                        await self._save_screenshot_local(batch_name, asin, png_bytes)
-                        logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes) [worker-{idx}]")
-                    else:
-                        logger.warning(f"📸 截图渲染失败: {asin}")
-                    # 更新批次完成计数
-                    if batch_name in self._screenshot_pending_batches:
-                        self._screenshot_pending_batches[batch_name]["done"] += 1
-                except Exception as e:
-                    logger.error(f"📸 截图异常 {asin}: {e}")
-                    if batch_name in self._screenshot_pending_batches:
-                        self._screenshot_pending_batches[batch_name]["done"] += 1
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"📸 截图协程 #{idx} 异常: {e}")
-                await asyncio.sleep(1)
-
-    async def _render_screenshot(self, html_content: str, asin: str) -> Optional[bytes]:
-        """
-        用 Playwright 渲染 Amazon 网页截图
-
-        优化点：
-        1. setContent() 直接注入 HTML，省去 URL 导航和主文档拦截开销
-        2. 屏蔽 JS/字体/媒体/追踪，只保留 CSS 和图片保证页面外观
-        3. 固定 1280x1300px 截图尺寸
-        4. 浏览器持久化复用，page 级错误不杀浏览器（防止级联崩溃）
-        """
+    async def _forward_screenshot_logs(self):
+        """将截图子进程的 stdout 转发到主进程日志"""
         try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            logger.warning("📸 playwright 未安装，跳过截图渲染")
-            return None
+            while True:
+                line = await self._screenshot_process.stdout.readline()
+                if not line:
+                    break
+                logger.info(f"[SS] {line.decode().rstrip()}")
+        except Exception:
+            pass
 
-        page = None
-        try:
-            # 懒初始化：每个浏览器配独立 Playwright 进程（避免单 Node.js 进程瓶颈）
-            if not self._browser_slots:
-                async with self._browser_lock:
-                    if not self._browser_slots:
-                        for i in range(self._browsers_count):
-                            pw = await async_playwright().__aenter__()
-                            browser = await pw.chromium.launch(
-                                headless=True,
-                                args=["--disable-gpu", "--disable-dev-shm-usage",
-                                      "--no-sandbox", "--disable-extensions"]
-                            )
-                            self._browser_slots.append({"playwright": pw, "browser": browser})
-                        logger.info(f"📸 Playwright 浏览器池已启动（{self._browsers_count} 个独立实例，每个最多 {self._pages_per_browser} page）")
+    async def _screenshot_gate_monitor(self):
+        """监控截图子进程的 _uploaded 标记，完成后开门放行"""
+        while self._running:
+            await asyncio.sleep(2)
+            if not self._screenshot_pending_batches:
+                continue
 
-            # 轮询分配浏览器
-            idx = self._browser_counter % len(self._browser_slots)
-            self._browser_counter += 1
-            browser = self._browser_slots[idx]["browser"]
-            page = await browser.new_page(viewport={"width": 1280, "height": 1300})
+            completed = set()
+            for batch in self._screenshot_pending_batches:
+                marker = os.path.join(self._screenshot_html_dir, batch, "_uploaded")
+                if os.path.exists(marker):
+                    completed.add(batch)
 
-            # 屏蔽无关资源：只保留 CSS 和图片，保证页面外观
-            async def block_resources(route):
-                rt = route.request.resource_type
-                url = route.request.url
-                if rt in ("stylesheet", "image"):
-                    await route.continue_()
-                elif rt in ("script", "font", "media", "websocket",
-                            "manifest", "other"):
-                    await route.abort()
-                elif any(x in url for x in ("analytics", "tracking", "beacon",
-                                            "ads", "doubleclick", "facebook")):
-                    await route.abort()
-                else:
-                    await route.continue_()
+            if completed:
+                self._screenshot_pending_batches -= completed
+                logger.info(f"📸 截图批次已上传: {completed}")
+                if not self._screenshot_pending_batches:
+                    self._screenshot_gate.set()
 
-            await page.route("**/*", block_resources)
-
-            # 注入 <base> 标签，使 protocol-relative URL (//...) 和相对路径都能正确解析
-            # setContent 在 about:blank 上下文中运行，没有 base 则 //cdn... 会变成 about://cdn...
-            base_tag = '<base href="https://www.amazon.com/">'
-            lower_head = html_content[:2000].lower()
-            if "<base " not in lower_head:
-                # 找到 <head> 或 <head ...> 的结束位置
-                head_pos = lower_head.find("<head")
-                if head_pos != -1:
-                    close_pos = html_content.index(">", head_pos) + 1
-                    html_content = html_content[:close_pos] + base_tag + html_content[close_pos:]
-                else:
-                    html_content = base_tag + html_content
-
-            # setContent 直接注入 HTML（比 goto + route 拦截快 ~500ms）
+    async def _stop_screenshot_process(self):
+        """停止截图子进程"""
+        if self._screenshot_process and self._screenshot_process.returncode is None:
+            self._screenshot_process.terminate()
             try:
-                await page.set_content(
-                    html_content,
-                    wait_until="domcontentloaded",
-                    timeout=5000,
-                )
-            except Exception:
-                pass  # 超时不影响截图
-
-            # 截图前检查页面是否有可见内容（防止空白截图）
-            has_content = await page.evaluate("""() => {
-                if (!document.body) return false;
-                // 检查是否有可见的文本或图片
-                const text = document.body.innerText || '';
-                if (text.trim().length > 50) return true;
-                const imgs = document.querySelectorAll('img[src]');
-                if (imgs.length > 0) return true;
-                return false;
-            }""")
-
-            screenshot = await page.screenshot(
-                type="png",
-                clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
-            )
-
-            # 空白检测：PNG < 10KB 且页面无可见内容 → 判定为空白截图
-            if len(screenshot) < 10240 and not has_content:
-                logger.warning(f"📸 空白截图已丢弃: {asin} ({len(screenshot)} bytes, 无可见内容)")
-                return None
-
-            return screenshot
-        except Exception as e:
-            err_msg = str(e)
-            # 只有浏览器进程级崩溃才重置浏览器；page 级错误不连坐
-            if "browser has been closed" in err_msg or "Target closed" in err_msg:
-                logger.error(f"📸 浏览器进程崩溃，将重新启动: {asin}")
-                await self._close_browser()
-            else:
-                logger.warning(f"📸 页面渲染失败 {asin}: {e}")
-            return None
-        finally:
-            # 无论成功失败都安全关闭 page（不影响浏览器和其他 page）
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-
-    async def _close_browser(self):
-        """安全关闭所有 Playwright 浏览器和进程（加锁防止并发关闭冲突）"""
-        async with self._browser_lock:
-            for slot in self._browser_slots:
-                try:
-                    await slot["browser"].close()
-                except Exception:
-                    pass
-                try:
-                    await slot["playwright"].stop()
-                except Exception:
-                    pass
-            self._browser_slots.clear()
-
-    async def _save_screenshot_local(self, batch_name: str, asin: str, png_bytes: bytes):
-        """将截图保存到本地暂存目录"""
-        safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
-        local_dir = os.path.join(self._screenshot_local_dir, safe_batch)
-        os.makedirs(local_dir, exist_ok=True)
-        filepath = os.path.join(local_dir, f"{asin}.png")
-        async with aiofiles.open(filepath, "wb") as f:
-            await f.write(png_bytes)
-
-    async def _batch_upload_screenshots(self, batch_name: str):
-        """批量上传某批次的所有本地截图到 Server"""
-        safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
-        local_dir = os.path.join(self._screenshot_local_dir, safe_batch)
-        if not os.path.isdir(local_dir):
-            return
-        files = [f for f in os.listdir(local_dir) if f.endswith(".png")]
-        if not files:
-            return
-        logger.info(f"📸 开始批量上传截图: {batch_name} ({len(files)} 张)")
-        uploaded = 0
-        failed = 0
-        async with httpx.AsyncClient(timeout=30) as client:
-            for fname in files:
-                asin = fname[:-4]  # remove .png
-                fpath = os.path.join(local_dir, fname)
-                try:
-                    with open(fpath, "rb") as f:
-                        png_bytes = f.read()
-                    resp = await client.post(
-                        f"{self.server_url}/api/tasks/screenshot",
-                        files={"file": (fname, png_bytes, "image/png")},
-                        data={"batch_name": batch_name, "asin": asin},
-                    )
-                    if resp.status_code == 200:
-                        uploaded += 1
-                    else:
-                        failed += 1
-                        logger.warning(f"截图上传失败 {asin}: HTTP {resp.status_code}")
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"截图上传异常 {asin}: {e}")
-        logger.info(f"📸 批量上传完成: {batch_name} (成功 {uploaded}, 失败 {failed})")
-        # 从待处理列表移除已完成批次
-        self._screenshot_pending_batches.pop(batch_name, None)
-        # 检查是否所有截图批次都已完成，开门放行
-        pending = any(
-            info["done"] < info["total"]
-            for info in self._screenshot_pending_batches.values()
-        )
-        if not pending:
-            self._screenshot_gate.set()
-        # 清理本地暂存
-        import shutil as _shutil
-        _shutil.rmtree(local_dir, ignore_errors=True)
+                await asyncio.wait_for(self._screenshot_process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                self._screenshot_process.kill()
+            logger.info("📸 截图子进程已停止")
 
     # ═══════════════════════════════════════════════
     # 隧道模式 IP 轮换监控
@@ -1768,8 +1536,8 @@ class Worker:
         # 关闭 SessionPool（隧道模式）
         if self._session_pool:
             await self._session_pool.close_all()
-        # 关闭持久化浏览器
-        await self._close_browser()
+        # 停止截图子进程
+        await self._stop_screenshot_process()
 
     def _print_stats(self):
         """打印统计信息"""
