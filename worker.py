@@ -237,6 +237,21 @@ class Worker:
         while self._running:
             try:
                 queue_size = self._task_queue.qsize()
+
+                # 截图门控：队列已空 + 有未完成的截图批次 → 阻塞等待截图上传完成再拉新任务
+                # 只在队列空时检查，避免采集期间误触发（采集中 total 持续增长）
+                if queue_size == 0:
+                    pending_ss = {
+                        b: info for b, info in self._screenshot_pending_batches.items()
+                        if info["done"] < info["total"]
+                    }
+                    if pending_ss:
+                        total_remaining = sum(i["total"] - i["done"] for i in pending_ss.values())
+                        logger.info(f"⏸️ 等待截图完成后再拉取新任务（剩余 {total_remaining} 张截图待处理）")
+                        self._screenshot_gate.clear()
+                        await self._screenshot_gate.wait()
+                        logger.info("▶️ 截图批次已完成，继续拉取新任务")
+                        continue
                 threshold = int(self._queue_size * self._prefetch_threshold)
 
                 if queue_size < threshold:
@@ -287,21 +302,6 @@ class Worker:
                             await self._task_queue.put((prio, self._task_seq, task))
                         logger.debug(f"📡 补给 {len(tasks)} 个任务 (队列: {self._task_queue.qsize()})")
                     else:
-                        # 服务端无待处理任务 → 检查是否有截图批次未完成
-                        pending_ss = {
-                            b: info for b, info in self._screenshot_pending_batches.items()
-                            if info["done"] < info["total"]
-                        }
-                        if pending_ss and self._task_queue.empty():
-                            # 当前截图批次的采集已完成，但截图/上传未完成 → 阻塞等待
-                            self._screenshot_gate.clear()
-                            total_remaining = sum(i["total"] - i["done"] for i in pending_ss.values())
-                            logger.info(f"⏸️ 等待截图完成后再拉取新任务（剩余 {total_remaining} 张截图待处理）")
-                            await self._screenshot_gate.wait()
-                            logger.info("▶️ 截图批次已完成，继续拉取新任务")
-                            empty_streak = 0
-                            continue
-
                         # 真正没有待处理任务 → 温和退避（上限 5s，避免长时间空闲）
                         empty_streak += 1
                         wait = min(2 * empty_streak, 5)
