@@ -13,3 +13,8 @@ tmp/
 .pytest_cache/
 .vscode/
 .claude/
+runtime_settings.json
+feature_list*.json
+progress*.md
+docs/
+test_aod.py
