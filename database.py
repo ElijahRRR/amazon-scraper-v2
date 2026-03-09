@@ -188,13 +188,20 @@ class Database:
             # BEGIN IMMEDIATE 保证写锁，防止两个 Worker 同时拉到相同任务
             await self._db.execute("BEGIN IMMEDIATE")
             try:
+                # 先查最高优先级，只返回该优先级的任务（不混合不同优先级）
+                async with self._db.execute(
+                    "SELECT MAX(priority) FROM tasks WHERE status = 'pending'"
+                ) as cur:
+                    row = await cur.fetchone()
+                    top_priority = row[0] if row and row[0] is not None else 0
+
                 async with self._db.execute(
                     """SELECT id, batch_name, asin, zip_code, retry_count, priority, needs_screenshot
                        FROM tasks
-                       WHERE status = 'pending'
-                       ORDER BY priority DESC, id ASC
+                       WHERE status = 'pending' AND priority = ?
+                       ORDER BY id ASC
                        LIMIT ?""",
-                    (count,)
+                    (top_priority, count)
                 ) as cursor:
                     rows = await cursor.fetchall()
 
