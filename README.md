@@ -28,28 +28,30 @@
 │  Worker 1  │  │  Worker 2  │  │  Worker N  │
 │ curl_cffi  │  │ curl_cffi  │  │ curl_cffi  │
 │ quota=15   │  │ quota=10   │  │ quota=5    │
-└──────┬─────┘  └──────┬─────┘  └──────┬─────┘
-       │               │               │
-       └───────────────┼───────────────┘
-                       │
-              ┌────────▼────────┐
-              │   快代理 TPS     │
-              │   隧道代理       │
-              │  (自动换 IP)     │
-              └────────┬────────┘
-                       │
-              ┌────────▼────────┐
-              │   Amazon.com    │
-              └─────────────────┘
+│     │      │  └──────┬─────┘  └──────┬─────┘
+│     │ HTML │         │               │
+│  ┌──▼────┐ │         └───────┼───────┘
+│  │截图子 │ │                 │
+│  │进程   │ │        ┌────────▼────────┐
+│  │Playw. │ │        │   快代理 TPS     │
+│  └───────┘ │        │   隧道代理       │
+└────────────┘        │  (自动换 IP)     │
+                      └────────┬────────┘
+                               │
+                      ┌────────▼────────┐
+                      │   Amazon.com    │
+                      └─────────────────┘
 ```
 
 ### 数据流
 
 1. 用户通过 Web UI 上传 ASIN 文件 → Server 创建采集任务入库
-2. Worker 从 Server 拉取待处理任务（`/api/tasks/pull`）
+2. Worker 从 Server 拉取待处理任务（`/api/tasks/pull`），优先任务独占队列
 3. Worker 通过隧道代理向 Amazon 发起请求，解析 HTML 提取数据
 4. Worker 将采集结果批量推送回 Server（`/api/tasks/result/batch`）
-5. 用户在 Web UI 查看进度、浏览结果、导出 Excel/CSV
+5. 若任务需要截图：HTML 写入磁盘 → 截图子进程（独立 Python 进程）渲染 PNG → 上传 Server
+6. 截图批次上传完成前，Worker 暂停拉取新任务（门控机制）
+7. 用户在 Web UI 查看进度、浏览结果、导出 Excel/CSV
 
 ## 技术栈
 
@@ -157,8 +159,11 @@ cp .env.example .env
 
 ```
 task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] → batch_submitter
-                                ↑
-                     adaptive_controller 实时调整 N
+                  ↑               │ (needs_screenshot)
+       adaptive_controller        ↓
+         实时调整 N          HTML→磁盘 → 截图子进程(独立PID) → 上传Server
+                                         ↓ _uploaded标记
+                              gate_monitor → 开门放行
 ```
 
 - **全异步架构**：Worker↔Server 通信（拉取任务、提交结果、同步设置）全部使用 `httpx.AsyncClient`，不阻塞 event loop
@@ -169,26 +174,43 @@ task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] →
 - **封锁处理**：检测到 403/503/验证码 → 自动轮换 Session（换 IP + 换 Cookie）
 - **主动轮换**：每 1000 次成功请求主动更换 Session
 - **快速模式** (`--fast`)：优先用 AOD AJAX 获取价格，失败再 fallback 到完整产品页
-- **截图存证**：需要截图的任务自动入队（有界队列 maxsize=200 防内存溢出），Playwright 多协程并发渲染，复用共享浏览器实例
+- **截图存证**：需要截图的任务 HTML 写入磁盘，由独立子进程（`screenshot_worker.py`）渲染，采集与截图完全隔离事件循环
 - **启动设置全量同步**：Worker 启动时自动从 Server 拉取所有 18 项运行参数（并发控制、QPS、AIMD 参数、代理地址等），远程 Worker 无需本地 `.env` 或环境变量
 - **全局协调同步**：每 30 秒通过 `POST /api/worker/sync` 上报 metrics 快照 + 接收 Server 分配的并发/QPS 配额 + 检测全局封锁事件，无需重启即可热更新所有参数
 - **批量提交**：结果先入队列，攒满 10 条或每 2 秒批量 POST，失败自动 3 次重试后逐条回退
 - **优雅退出**：SIGINT/SIGTERM 信号处理，退出前刷新队列
 
-**截图存证子系统：**
+**截图存证子系统（独立子进程架构）：**
 
-Worker 内置 Playwright 截图引擎，对标记 `needs_screenshot` 的任务自动渲染商品页 PNG 截图并上传至 Server：
+截图功能采用**进程级隔离**——采集 Worker 和截图渲染运行在两个独立的 Python 进程中，各自拥有独立的 asyncio 事件循环，彻底避免 CPU/事件循环争抢：
 
-- **多协程并发**：可配置 1-6 个截图协程（默认 3），共享单个 Chromium 浏览器实例，每个协程独立 Page
-- **持久化浏览器**：Chromium 实例在 Worker 生命周期内复用，避免每次冷启动（首次 ~2s，后续每张 ~1-2s）
-- **`setContent()` 渲染**：直接将已获取的 HTML 注入 Page，无需 `page.goto()` 导航，减少 ~500ms 延迟
-- **`<base>` 标签注入**：注入 `<base href="https://www.amazon.com/">`，修复协议相对 URL（`//m.media-amazon.com/...`）在 `about:blank` 上下文中无法加载的问题
-- **`networkidle` 等待**：等待网络空闲后再截图（超时 5 秒），确保图片等资源加载完成
-- **空白截图检测**：截图小于 10KB 且页面无可见文本/图片时自动丢弃，避免存储无效白图
-- **智能裁剪**：通过 10 个锚点元素（`#buybox`、`#rightCol` 等）定位购物车区域，只截取商品关键信息
-- **资源拦截**：屏蔽 JS、字体、追踪脚本，只加载 CSS 和图片，大幅减少等待时间
-- **级联崩溃防护**：页面级错误仅关闭当前 Page，不影响共享浏览器；仅浏览器进程崩溃才触发实例重建
-- 截图保存路径：`static/screenshots/{batch_name}/{asin}.png`
+```
+┌─────────────────────────┐    ┌──────────────────────────┐
+│  Worker 主进程 (采集)     │    │  截图子进程 (独立 PID)     │
+│  asyncio 事件循环 #1     │    │  asyncio 事件循环 #2      │
+│                         │    │                          │
+│  curl_cffi HTTP 请求     │    │  Playwright/Chromium 渲染  │
+│  HTML 解析              │    │  截图上传至 Server         │
+│  ↓                      │    │  ↑                        │
+│  写 HTML 到磁盘 ─────────┼──→─│  读 HTML 从磁盘            │
+│                         │    │  ↓                        │
+│  检查 _uploaded 标记 ←───┼──←─│  写 _uploaded 标记         │
+└─────────────────────────┘    └──────────────────────────┘
+```
+
+- **进程隔离**：采集与截图各自独立的 asyncio 事件循环 + GC，互不干扰
+- **按需启动**：仅当任务标记 `needs_screenshot=True` 时才保存 HTML 并启动截图子进程；未开启截图功能时零开销
+- **文件系统通信**：采集完成的 HTML 写入 `screenshot_cache/html/{batch}/`，截图子进程监控该目录自动渲染
+- **批次门控**：截图批次的采集完成后写入 `_scraping_done` 标记 → 截图子进程渲染完毕并上传后写入 `_uploaded` 标记 → 主 Worker 检测到标记后才拉取下一批次任务
+- **优先任务独占**：优先批次采集期间，数据库只返回该优先级的任务，不混入普通任务
+- **固定截图尺寸**：1280×1300px viewport，不再动态计算裁剪高度
+- **持久化浏览器池**：Chromium 实例在截图子进程生命周期内复用（默认 2 个浏览器实例，每个最多 6 个并发 Page）
+- **`setContent()` 渲染**：直接将 HTML 注入 Page，无需网络导航
+- **`<base>` 标签注入**：修复协议相对 URL 在 `about:blank` 上下文中无法加载的问题
+- **空白截图检测**：PNG < 10KB 且页面无可见内容时自动丢弃
+- **资源拦截**：屏蔽 JS、字体、追踪脚本，只加载 CSS 和图片
+- **级联崩溃防护**：页面级错误仅关闭当前 Page；浏览器进程崩溃才触发实例重建
+- 截图保存路径：Server 端 `static/screenshots/{batch_name}/{asin}.png`
 - 截图为可选功能，需安装 `requirements-screenshot.txt` 中的依赖
 
 ### `adaptive.py` — AIMD 自适应并发控制器
@@ -475,7 +497,7 @@ python worker.py --server http://127.0.0.1:8899 --fast
 Worker 只需以下文件即可独立运行（不需要完整项目）：
 
 ```
-worker.py, config.py, models.py, proxy.py, session.py, parser.py, metrics.py, adaptive.py
+worker.py, screenshot_worker.py, config.py, models.py, proxy.py, session.py, parser.py, metrics.py, adaptive.py
 requirements-worker.txt（精简依赖，pip install -r requirements-worker.txt）
 requirements-screenshot.txt（可选，截图功能需要 playwright）
 ```
@@ -559,6 +581,7 @@ amazon-scraper-v2/
 ├── config.py              # 配置中心（凭证通过环境变量注入）
 ├── server.py              # FastAPI 服务端（API + Web UI）
 ├── worker.py              # 采集 Worker（流水线 + 自适应并发，可多机部署）
+├── screenshot_worker.py   # 截图独立子进程（Playwright 渲染，独立事件循环）
 ├── adaptive.py            # AIMD 自适应并发控制器（类 TCP 拥塞控制）
 ├── metrics.py             # 滑动窗口指标采集器（延迟/成功率/带宽实时追踪）
 ├── session.py             # Amazon 会话管理（TLS 指纹、Cookie、邮编）
