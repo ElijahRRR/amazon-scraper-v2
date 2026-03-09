@@ -74,7 +74,7 @@ class ScreenshotWorker:
             if not os.path.isdir(batch_dir):
                 continue
             # 已上传完成的批次跳过
-            if os.path.exists(os.path.join(batch_dir, "_uploaded")):
+            if os.path.exists(os.path.join(self.base_dir, f"_uploaded_{batch_name}")):
                 continue
 
             html_files = [f for f in os.listdir(batch_dir)
@@ -189,8 +189,8 @@ class ScreenshotWorker:
                         logger.error(f"截图上传异常 {asin}: {e}")
             logger.info(f"📸 上传完成: {batch_name} (成功 {uploaded}, 失败 {failed})")
 
-        # 写 _uploaded 标记，通知主 Worker
-        uploaded_marker = os.path.join(self.html_dir, batch_name, "_uploaded")
+        # 写 _uploaded 标记到 screenshot_cache/ 根目录（不放在被清理的子目录里）
+        uploaded_marker = os.path.join(self.base_dir, f"_uploaded_{batch_name}")
         with open(uploaded_marker, "w") as f:
             f.write(str(time.time()))
         logger.info(f"📸 批次完成标记已写入: {batch_name}")

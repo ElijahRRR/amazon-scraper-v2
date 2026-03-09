@@ -1437,11 +1437,18 @@ class Worker:
 
             completed = set()
             for batch in self._screenshot_pending_batches:
-                marker = os.path.join(self._screenshot_html_dir, batch, "_uploaded")
+                marker = os.path.join(self._screenshot_base_dir, f"_uploaded_{batch}")
                 if os.path.exists(marker):
                     completed.add(batch)
 
             if completed:
+                for batch in completed:
+                    # 清理标记文件
+                    marker = os.path.join(self._screenshot_base_dir, f"_uploaded_{batch}")
+                    try:
+                        os.remove(marker)
+                    except OSError:
+                        pass
                 self._screenshot_pending_batches -= completed
                 logger.info(f"📸 截图批次已上传: {completed}")
                 if not self._screenshot_pending_batches:
