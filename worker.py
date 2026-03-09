@@ -1493,7 +1493,7 @@ class Worker:
         优化点：
         1. setContent() 直接注入 HTML，省去 URL 导航和主文档拦截开销
         2. 屏蔽 JS/字体/媒体/追踪，只保留 CSS 和图片保证页面外观
-        3. 更可靠的裁剪逻辑：扫描多个锚点元素取最大 bottom
+        3. 固定 1280x1300px 截图尺寸
         4. 浏览器持久化复用，page 级错误不杀浏览器（防止级联崩溃）
         """
         try:
@@ -1522,7 +1522,7 @@ class Worker:
             idx = self._browser_counter % len(self._browser_slots)
             self._browser_counter += 1
             browser = self._browser_slots[idx]["browser"]
-            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            page = await browser.new_page(viewport={"width": 1280, "height": 1300})
 
             # 屏蔽无关资源：只保留 CSS 和图片，保证页面外观
             async def block_resources(route):
@@ -1559,57 +1559,10 @@ class Worker:
                 await page.set_content(
                     html_content,
                     wait_until="domcontentloaded",
-                    timeout=15000,
+                    timeout=5000,
                 )
             except Exception:
                 pass  # 超时不影响截图
-
-            # 等待网络空闲（CSS/图片加载完毕），超时 2s 兼顾速度与质量
-            try:
-                await page.wait_for_load_state("networkidle", timeout=2000)
-            except Exception:
-                pass  # 超时仍继续截图，大部分资源应已加载
-
-            # 计算裁剪高度：扫描锚点 + 递归扫描右栏子元素，取最大 bottom 值
-            clip_height = await page.evaluate("""() => {
-                if (!document.body) return 1200;
-                let maxBottom = 0;
-
-                // 1) 扫描锚点容器元素
-                const anchors = [
-                    '#buybox', '#rightCol', '#buyBoxAccordion',
-                    '#add-to-cart-button', '#buy-now-button',
-                    '#submitOrderButtonId', '#averageCustomerReviews',
-                    '#productOverview_feature_div', '#centerCol',
-                    '#apex_desktop_newAccordionRow',
-                    '#desktop_buybox_group_1', '#qualifiedBuybox',
-                    '#addToList_feature_div', '#addToCart_feature_div'
-                ];
-                for (const sel of anchors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.bottom > maxBottom) maxBottom = rect.bottom;
-                    }
-                }
-
-                // 2) 递归扫描 #rightCol 所有子元素的实际 bottom（捕获 BuyBox 完整区域）
-                const rightCol = document.querySelector('#rightCol');
-                if (rightCol) {
-                    rightCol.querySelectorAll('*').forEach(el => {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.height > 0 && rect.width > 50 && rect.bottom > maxBottom) {
-                            maxBottom = rect.bottom;
-                        }
-                    });
-                }
-
-                // 找到了元素 → 底部加 200px 边距
-                if (maxBottom > 0) return Math.ceil(maxBottom + 200);
-                // 兜底：取页面实际高度，但不超过 3000px
-                return Math.min(document.body.scrollHeight || 1200, 3000);
-            }""")
-            clip_height = max(800, min(clip_height, 3000))
 
             # 截图前检查页面是否有可见内容（防止空白截图）
             has_content = await page.evaluate("""() => {
@@ -1624,7 +1577,7 @@ class Worker:
 
             screenshot = await page.screenshot(
                 type="png",
-                clip={"x": 0, "y": 0, "width": 1280, "height": clip_height}
+                clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )
 
             # 空白检测：PNG < 10KB 且页面无可见内容 → 判定为空白截图

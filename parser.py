@@ -131,7 +131,12 @@ class AmazonParser:
             result["is_fba"] = self._slx_parse_fulfillment(tree, html_text)
             avail_node = tree.css_first('div#availability span')
             stock_text = avail_node.text(strip=True) if avail_node else ""
-            result["stock_status"] = stock_text if stock_text else jsonld.get("stock_status", "In Stock")
+            if stock_text:
+                result["stock_status"] = stock_text
+            elif result["current_price"] == "N/A" and result["buybox_price"] == "N/A":
+                result["stock_status"] = "N/A"
+            else:
+                result["stock_status"] = jsonld.get("stock_status", "In Stock")
             result["stock_count"] = str(self._slx_parse_stock_count(result["stock_status"], tree))
             d_date, d_time = self._slx_parse_delivery(tree)
             result["delivery_date"] = d_date
@@ -256,7 +261,6 @@ class AmazonParser:
                 '#priceblock_dealprice',
                 '#priceToPay span.a-offscreen',
                 '#apex_offerDisplay_desktop span.a-offscreen',
-                'div.a-section span.a-price span.a-offscreen',
             ]
             for sel in price_selectors:
                 node = tree.css_first(sel)
@@ -266,7 +270,7 @@ class AmazonParser:
                         return p
             # 方法2: 拆分整数+小数（限定到价格容器）
             for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
-                              '#price', '#apex_offerDisplay_desktop', '']:
+                              '#price', '#apex_offerDisplay_desktop']:
                 prefix = f'{container} ' if container else ''
                 whole_node = tree.css_first(f'{prefix}span.a-price-whole')
                 frac_node = tree.css_first(f'{prefix}span.a-price-fraction')
@@ -303,9 +307,10 @@ class AmazonParser:
 
     def _slx_parse_original_price(self, tree) -> str:
         try:
-            node = tree.css_first('span[data-a-strike="true"] span.a-offscreen')
-            if node:
-                return node.text(strip=True)
+            for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div', '#price']:
+                node = tree.css_first(f'{container} span[data-a-strike="true"] span.a-offscreen')
+                if node:
+                    return node.text(strip=True)
         except Exception:
             pass
         return "N/A"
@@ -544,14 +549,17 @@ class AmazonParser:
                         parts.append(text)
 
             if not parts:
-                json_desc = re.search(r'"description"\s*:\s*"([^"]+)"', html_text)
-                if json_desc:
+                seo_keywords = ['ai-optimized', 'search submission', 'noindex', 'sponsored']
+                for m in re.finditer(r'"description"\s*:\s*"([^"]{20,})"', html_text):
+                    text = m.group(1)
+                    if any(kw in text.lower() for kw in seo_keywords):
+                        continue
                     try:
-                        decoded = json_desc.group(1).encode('utf-8').decode('unicode_escape')
+                        decoded = text.encode('utf-8').decode('unicode_escape')
                         clean = re.sub(r'<[^>]+>', '\n', decoded)
                         return clean.strip()[:4000]
                     except Exception:
-                        pass
+                        continue
 
             return "\n".join(parts)[:10000]
         except Exception:
@@ -1072,11 +1080,7 @@ class AmazonParser:
                     f = frac[0].strip()
                     if w and f:
                         return f"${w}.{f}"
-            # 最终 fallback: 全页匹配（兼容旧版页面）
-            whole = self._get_text(tree, ['//span[@class="a-price-whole"]/text()'])
-            frac = self._get_text(tree, ['//span[@class="a-price-fraction"]/text()'])
-            if whole and frac:
-                return f"${whole.replace('.', '')}.{frac.strip()}"
+            # 全局 fallback 已移除，避免匹配推荐区域价格
         except Exception:
             pass
         return "N/A"
@@ -1104,9 +1108,10 @@ class AmazonParser:
 
     def _parse_original_price(self, tree) -> str:
         try:
-            orig = tree.xpath('//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
-            if orig:
-                return orig[0].strip()
+            for container_id in ['corePrice_feature_div', 'corePriceDisplay_desktop_feature_div', 'price']:
+                orig = tree.xpath(f'//*[@id="{container_id}"]//span[@data-a-strike="true"]//span[@class="a-offscreen"]/text()')
+                if orig:
+                    return orig[0].strip()
         except Exception:
             pass
         return "N/A"
@@ -1297,14 +1302,17 @@ class AmazonParser:
                         parts.append(text)
 
             if not parts:
-                json_desc = re.search(r'"description"\s*:\s*"([^"]+)"', html_text)
-                if json_desc:
+                seo_keywords = ['ai-optimized', 'search submission', 'noindex', 'sponsored']
+                for m in re.finditer(r'"description"\s*:\s*"([^"]{20,})"', html_text):
+                    text = m.group(1)
+                    if any(kw in text.lower() for kw in seo_keywords):
+                        continue
                     try:
-                        decoded = json_desc.group(1).encode('utf-8').decode('unicode_escape')
+                        decoded = text.encode('utf-8').decode('unicode_escape')
                         clean = re.sub(r'<[^>]+>', '\n', decoded)
                         return clean.strip()[:4000]
                     except Exception:
-                        pass
+                        continue
 
             return "\n".join(parts)[:10000]
         except Exception:
