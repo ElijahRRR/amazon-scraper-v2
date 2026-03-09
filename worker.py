@@ -132,9 +132,9 @@ class Worker:
         self._browsers_count = 2             # 浏览器实例数
         self._pages_per_browser = 6          # 每个浏览器最大并发 page 数
         self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
-        self._browsers: list = []            # 浏览器实例列表
-        self._playwright = None              # Playwright 上下文管理器
-        self._browser_lock = asyncio.Lock()  # 浏览器初始化/关闭锁
+        # 每个浏览器独立的 Playwright 实例（独立 Node.js 进程，避免单进程瓶颈）
+        self._browser_slots: list = []       # [{playwright, browser}]
+        self._browser_lock = asyncio.Lock()  # 浏览器初始化锁
         self._browser_counter = 0            # 轮询计数器
         self._screenshot_local_dir: str = None  # 本地截图暂存目录
         self._screenshot_pending_batches: dict = {}  # {batch_name: {total, done}} 待上传批次跟踪
@@ -609,7 +609,7 @@ class Worker:
         new_browsers = s.get("screenshot_browsers")
         if new_browsers and new_browsers != self._browsers_count:
             # 浏览器数量仅在启动前生效；运行中已有浏览器池则跳过
-            if not self._browsers:
+            if not self._browser_slots:
                 self._browsers_count = new_browsers
                 self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
                 changes.append(f"screenshot_browsers={new_browsers}, total_concurrency={self._screenshot_concurrency}")
@@ -1504,24 +1504,24 @@ class Worker:
 
         page = None
         try:
-            # 懒初始化：首次调用时启动多个浏览器（加锁防止并发重复初始化）
-            if not self._browsers:
+            # 懒初始化：每个浏览器配独立 Playwright 进程（避免单 Node.js 进程瓶颈）
+            if not self._browser_slots:
                 async with self._browser_lock:
-                    if not self._browsers:  # double-check
-                        self._playwright = await async_playwright().__aenter__()
+                    if not self._browser_slots:
                         for i in range(self._browsers_count):
-                            browser = await self._playwright.chromium.launch(
+                            pw = await async_playwright().__aenter__()
+                            browser = await pw.chromium.launch(
                                 headless=True,
                                 args=["--disable-gpu", "--disable-dev-shm-usage",
                                       "--no-sandbox", "--disable-extensions"]
                             )
-                            self._browsers.append(browser)
-                        logger.info(f"📸 Playwright 浏览器池已启动（{self._browsers_count} 个实例，每个最多 {self._pages_per_browser} page）")
+                            self._browser_slots.append({"playwright": pw, "browser": browser})
+                        logger.info(f"📸 Playwright 浏览器池已启动（{self._browsers_count} 个独立实例，每个最多 {self._pages_per_browser} page）")
 
             # 轮询分配浏览器
-            idx = self._browser_counter % len(self._browsers)
+            idx = self._browser_counter % len(self._browser_slots)
             self._browser_counter += 1
-            browser = self._browsers[idx]
+            browser = self._browser_slots[idx]["browser"]
             page = await browser.new_page(viewport={"width": 1280, "height": 900})
 
             # 屏蔽无关资源：只保留 CSS 和图片，保证页面外观
@@ -1651,20 +1651,18 @@ class Worker:
                     pass
 
     async def _close_browser(self):
-        """安全关闭所有 Playwright 浏览器（加锁防止并发关闭冲突）"""
+        """安全关闭所有 Playwright 浏览器和进程（加锁防止并发关闭冲突）"""
         async with self._browser_lock:
-            for browser in self._browsers:
+            for slot in self._browser_slots:
                 try:
-                    await browser.close()
+                    await slot["browser"].close()
                 except Exception:
                     pass
-            self._browsers.clear()
-            try:
-                if self._playwright:
-                    await self._playwright.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._playwright = None
+                try:
+                    await slot["playwright"].stop()
+                except Exception:
+                    pass
+            self._browser_slots.clear()
 
     async def _save_screenshot_local(self, batch_name: str, asin: str, png_bytes: bytes):
         """将截图保存到本地暂存目录"""
