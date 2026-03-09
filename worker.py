@@ -138,6 +138,8 @@ class Worker:
         self._browser_counter = 0            # 轮询计数器
         self._screenshot_local_dir: str = None  # 本地截图暂存目录
         self._screenshot_pending_batches: dict = {}  # {batch_name: {total, done}} 待上传批次跟踪
+        self._screenshot_gate = asyncio.Event()  # 截图批次门控：set=可拉新任务, clear=等截图完成
+        self._screenshot_gate.set()  # 默认开启
 
         # 设置同步
         self._settings_version = 0
@@ -285,6 +287,21 @@ class Worker:
                             await self._task_queue.put((prio, self._task_seq, task))
                         logger.debug(f"📡 补给 {len(tasks)} 个任务 (队列: {self._task_queue.qsize()})")
                     else:
+                        # 服务端无待处理任务 → 检查是否有截图批次未完成
+                        pending_ss = {
+                            b: info for b, info in self._screenshot_pending_batches.items()
+                            if info["done"] < info["total"]
+                        }
+                        if pending_ss and self._task_queue.empty():
+                            # 当前截图批次的采集已完成，但截图/上传未完成 → 阻塞等待
+                            self._screenshot_gate.clear()
+                            total_remaining = sum(i["total"] - i["done"] for i in pending_ss.values())
+                            logger.info(f"⏸️ 等待截图完成后再拉取新任务（剩余 {total_remaining} 张截图待处理）")
+                            await self._screenshot_gate.wait()
+                            logger.info("▶️ 截图批次已完成，继续拉取新任务")
+                            empty_streak = 0
+                            continue
+
                         # 真正没有待处理任务 → 温和退避（上限 5s，避免长时间空闲）
                         empty_streak += 1
                         wait = min(2 * empty_streak, 5)
@@ -1659,6 +1676,15 @@ class Worker:
                     failed += 1
                     logger.error(f"截图上传异常 {asin}: {e}")
         logger.info(f"📸 批量上传完成: {batch_name} (成功 {uploaded}, 失败 {failed})")
+        # 从待处理列表移除已完成批次
+        self._screenshot_pending_batches.pop(batch_name, None)
+        # 检查是否所有截图批次都已完成，开门放行
+        pending = any(
+            info["done"] < info["total"]
+            for info in self._screenshot_pending_batches.values()
+        )
+        if not pending:
+            self._screenshot_gate.set()
         # 清理本地暂存
         import shutil as _shutil
         _shutil.rmtree(local_dir, ignore_errors=True)
