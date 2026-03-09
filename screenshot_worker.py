@@ -41,6 +41,7 @@ class ScreenshotWorker:
         self._browser_lock = asyncio.Lock()
         self._browser_counter = 0
         self._running = True
+        self._uploading_batches: set = set()  # 正在上传中的批次（防重复触发）
 
     async def start(self):
         """主循环：扫描 HTML 目录，渲染截图，上传完成后写标记"""
@@ -90,8 +91,10 @@ class ScreenshotWorker:
 
             if pending:
                 batches[batch_name] = pending
-            elif os.path.exists(os.path.join(batch_dir, "_scraping_done")):
-                # 所有 HTML 都已渲染，触发上传
+            elif (os.path.exists(os.path.join(batch_dir, "_scraping_done"))
+                  and batch_name not in self._uploading_batches):
+                # 所有 HTML 都已渲染，触发上传（防重复）
+                self._uploading_batches.add(batch_name)
                 asyncio.ensure_future(self._upload_and_mark(batch_name))
 
         return batches
@@ -121,7 +124,8 @@ class ScreenshotWorker:
                 os.path.exists(os.path.join(png_batch_dir, f"{f[:-5]}.png"))
                 for f in all_html
             )
-            if all_done:
+            if all_done and batch_name not in self._uploading_batches:
+                self._uploading_batches.add(batch_name)
                 await self._upload_and_mark(batch_name)
 
     async def _render_and_save(self, batch_name: str, asin: str):
