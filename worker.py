@@ -603,9 +603,13 @@ class Worker:
 
         new_browsers = s.get("screenshot_browsers")
         if new_browsers and new_browsers != self._browsers_count:
-            self._browsers_count = new_browsers
-            self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
-            changes.append(f"screenshot_browsers={new_browsers}, total_concurrency={self._screenshot_concurrency}")
+            # 浏览器数量仅在启动前生效；运行中已有浏览器池则跳过
+            if not self._browsers:
+                self._browsers_count = new_browsers
+                self._screenshot_concurrency = self._browsers_count * self._pages_per_browser
+                changes.append(f"screenshot_browsers={new_browsers}, total_concurrency={self._screenshot_concurrency}")
+            else:
+                changes.append(f"screenshot_browsers={new_browsers}(忽略，需重启生效)")
 
         return changes
 
