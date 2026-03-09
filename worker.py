@@ -624,6 +624,10 @@ class Worker:
         if new_browsers and new_browsers != self._browsers_count:
             self._browsers_count = new_browsers
             changes.append(f"screenshot_browsers={new_browsers} (截图子进程下次启动时生效)")
+        new_pages = s.get("screenshot_pages_per_browser")
+        if new_pages and new_pages != self._pages_per_browser:
+            self._pages_per_browser = new_pages
+            changes.append(f"screenshot_pages_per_browser={new_pages} (截图子进程下次启动时生效)")
 
         return changes
 
