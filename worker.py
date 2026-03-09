@@ -12,13 +12,16 @@ Amazon 产品采集系统 v2 - Worker 采集引擎（流水线 + 自适应并发
 import asyncio
 import argparse
 import logging
+import os
 import random
+import re
 import time
 import uuid
 import signal
 import sys
 from typing import Optional, Dict, List
 
+import aiofiles
 import httpx
 
 import config
@@ -124,7 +127,7 @@ class Worker:
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
 
-        # 截图队列（有界，防止内存无限增长）
+        # 截图队列（无界，截图独立于采集，不丢弃任务）
         self._screenshot_queue: asyncio.Queue = None
         self._browsers_count = 2             # 浏览器实例数
         self._pages_per_browser = 6          # 每个浏览器最大并发 page 数
@@ -133,6 +136,8 @@ class Worker:
         self._playwright = None              # Playwright 上下文管理器
         self._browser_lock = asyncio.Lock()  # 浏览器初始化/关闭锁
         self._browser_counter = 0            # 轮询计数器
+        self._screenshot_local_dir: str = None  # 本地截图暂存目录
+        self._screenshot_pending_batches: dict = {}  # {batch_name: {total, done}} 待上传批次跟踪
 
         # 设置同步
         self._settings_version = 0
@@ -158,7 +163,7 @@ class Worker:
         # 初始化队列
         self._task_queue = asyncio.PriorityQueue(maxsize=self._queue_size)
         self._result_queue = asyncio.Queue()
-        self._screenshot_queue = asyncio.Queue(maxsize=200)  # 有界队列，防止内存无限增长
+        self._screenshot_queue = asyncio.Queue()  # 无界队列，截图独立消化
 
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
@@ -1195,17 +1200,19 @@ class Worker:
                 if self._stats["total"] % 5 == 0:
                     logger.info(f"⏱️ 链路 | token:{t_token_wait:.2f}s sem:{t_sem_wait:.2f}s http:{req_elapsed:.2f}s parse:{t_parse:.3f}s bytes:{resp_bytes}")
 
-                # 截图存证：非阻塞放入队列（队列满则丢弃，避免拖慢采集）
+                # 截图存证：放入无界队列，截图独立于采集异步消化
                 if task.get("needs_screenshot"):
-                    try:
-                        self._screenshot_queue.put_nowait({
-                            "task_id": task_id,
-                            "asin": asin,
-                            "batch_name": task.get("batch_name", ""),
-                            "html": resp.text,
-                        })
-                    except asyncio.QueueFull:
-                        logger.warning(f"📸 截图队列已满，跳过 {asin}")
+                    batch = task.get("batch_name", "")
+                    self._screenshot_queue.put_nowait({
+                        "task_id": task_id,
+                        "asin": asin,
+                        "batch_name": batch,
+                        "html": resp.text,
+                    })
+                    # 跟踪批次截图总数
+                    if batch not in self._screenshot_pending_batches:
+                        self._screenshot_pending_batches[batch] = {"total": 0, "done": 0}
+                    self._screenshot_pending_batches[batch]["total"] += 1
 
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测（仅 TPS 模式）
                 if not is_tunnel:
@@ -1389,16 +1396,25 @@ class Worker:
         """
         截图协程池：动态管理多个并发截图协程，使用多浏览器实例池。
         每个浏览器最多运行 pages_per_browser 个并发 page，轮询分配。
+        截图先存本地，批次截图全部完成后批量上传到 Server。
         """
+        # 初始化本地暂存目录
+        self._screenshot_local_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
+        )
+        os.makedirs(self._screenshot_local_dir, exist_ok=True)
+
         n = self._screenshot_concurrency
-        logger.info(f"📸 截图协程池启动（{n} 并发）")
+        logger.info(f"📸 截图协程池启动（{n} 并发，本地暂存: {self._screenshot_local_dir}）")
         tasks: List[asyncio.Task] = []
         for i in range(n):
             tasks.append(asyncio.create_task(self._screenshot_loop(i)))
 
-        # 监控循环：动态增减截图协程
+        # 监控循环：检查批次完成情况，触发批量上传
+        uploaded_batches = set()
         while self._running or not self._screenshot_queue.empty():
             await asyncio.sleep(3)
+            # 动态扩容截图协程
             target = self._screenshot_concurrency
             active = [t for t in tasks if not t.done()]
             current = len(active)
@@ -1409,14 +1425,32 @@ class Worker:
                 logger.info(f"📸 截图协程扩容: {current} → {target}")
             tasks = [t for t in tasks if not t.done()]
 
+            # 检查已完成的批次，触发批量上传
+            for batch_name, info in list(self._screenshot_pending_batches.items()):
+                if batch_name in uploaded_batches:
+                    continue
+                if info["done"] >= info["total"] and info["total"] > 0:
+                    uploaded_batches.add(batch_name)
+                    asyncio.create_task(self._batch_upload_screenshots(batch_name))
+
+            # 日志：队列剩余
+            qsize = self._screenshot_queue.qsize()
+            if qsize > 0:
+                logger.info(f"📸 截图队列剩余: {qsize}")
+
         # 等待所有截图协程完成
         remaining = [t for t in tasks if not t.done()]
         if remaining:
             await asyncio.gather(*remaining, return_exceptions=True)
+
+        # 最终上传所有未上传的批次
+        for batch_name in list(self._screenshot_pending_batches.keys()):
+            if batch_name not in uploaded_batches:
+                await self._batch_upload_screenshots(batch_name)
         logger.info("📸 截图协程池退出")
 
     async def _screenshot_loop(self, idx: int):
-        """单个截图协程：从队列取任务，渲染并上传"""
+        """单个截图协程：从队列取任务，渲染并保存到本地"""
         while self._running or not self._screenshot_queue.empty():
             try:
                 try:
@@ -1433,12 +1467,18 @@ class Worker:
                 try:
                     png_bytes = await self._render_screenshot(html_content, asin)
                     if png_bytes:
-                        await self._upload_screenshot(batch_name, asin, png_bytes)
+                        # 保存到本地暂存目录
+                        await self._save_screenshot_local(batch_name, asin, png_bytes)
                         logger.info(f"📸 截图完成: {asin} ({len(png_bytes)} bytes) [worker-{idx}]")
                     else:
                         logger.warning(f"📸 截图渲染失败: {asin}")
+                    # 更新批次完成计数
+                    if batch_name in self._screenshot_pending_batches:
+                        self._screenshot_pending_batches[batch_name]["done"] += 1
                 except Exception as e:
                     logger.error(f"📸 截图异常 {asin}: {e}")
+                    if batch_name in self._screenshot_pending_batches:
+                        self._screenshot_pending_batches[batch_name]["done"] += 1
 
             except asyncio.CancelledError:
                 break
@@ -1626,18 +1666,51 @@ class Worker:
                 pass
             self._playwright = None
 
-    async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes):
-        """将截图 POST 到 Server"""
-        try:
-            url = f"{self.server_url}/api/tasks/screenshot"
-            files = {"file": (f"{asin}.png", png_bytes, "image/png")}
-            data = {"batch_name": batch_name, "asin": asin}
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, files=files, data=data)
-            if resp.status_code != 200:
-                logger.warning(f"截图上传失败 {asin}: HTTP {resp.status_code}")
-        except Exception as e:
-            logger.error(f"截图上传异常 {asin}: {e}")
+    async def _save_screenshot_local(self, batch_name: str, asin: str, png_bytes: bytes):
+        """将截图保存到本地暂存目录"""
+        safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+        local_dir = os.path.join(self._screenshot_local_dir, safe_batch)
+        os.makedirs(local_dir, exist_ok=True)
+        filepath = os.path.join(local_dir, f"{asin}.png")
+        async with aiofiles.open(filepath, "wb") as f:
+            await f.write(png_bytes)
+
+    async def _batch_upload_screenshots(self, batch_name: str):
+        """批量上传某批次的所有本地截图到 Server"""
+        safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+        local_dir = os.path.join(self._screenshot_local_dir, safe_batch)
+        if not os.path.isdir(local_dir):
+            return
+        files = [f for f in os.listdir(local_dir) if f.endswith(".png")]
+        if not files:
+            return
+        logger.info(f"📸 开始批量上传截图: {batch_name} ({len(files)} 张)")
+        uploaded = 0
+        failed = 0
+        async with httpx.AsyncClient(timeout=30) as client:
+            for fname in files:
+                asin = fname[:-4]  # remove .png
+                fpath = os.path.join(local_dir, fname)
+                try:
+                    with open(fpath, "rb") as f:
+                        png_bytes = f.read()
+                    resp = await client.post(
+                        f"{self.server_url}/api/tasks/screenshot",
+                        files={"file": (fname, png_bytes, "image/png")},
+                        data={"batch_name": batch_name, "asin": asin},
+                    )
+                    if resp.status_code == 200:
+                        uploaded += 1
+                    else:
+                        failed += 1
+                        logger.warning(f"截图上传失败 {asin}: HTTP {resp.status_code}")
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"截图上传异常 {asin}: {e}")
+        logger.info(f"📸 批量上传完成: {batch_name} (成功 {uploaded}, 失败 {failed})")
+        # 清理本地暂存
+        import shutil as _shutil
+        _shutil.rmtree(local_dir, ignore_errors=True)
 
     # ═══════════════════════════════════════════════
     # 隧道模式 IP 轮换监控

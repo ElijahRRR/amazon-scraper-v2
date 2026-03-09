@@ -947,7 +947,7 @@ async def update_settings(request: Request):
         "min_concurrency":      (int,   1,    20),
         "max_concurrency":      (int,   2,    500),
         "session_rotate_every": (int,   50,   10000),
-        "screenshot_browsers":    (int, 1,    6),
+        "screenshot_browsers":    (int, 1,    20),
         "adjust_interval":      (int,   3,    60),
         "target_latency":       (float, 1,    30),
         "max_latency":          (float, 2,    60),

@@ -40,8 +40,8 @@
                         <div class="col-md-4">
                             <label class="form-label">截图浏览器数</label>
                             <input type="number" class="form-control" name="screenshot_browsers"
-                                   value="{{ settings.screenshot_browsers }}" min="1" max="6">
-                            <small class="text-secondary">浏览器实例数（每个最多 6 并发 page）</small>
+                                   value="{{ settings.screenshot_browsers }}" min="1" max="20">
+                            <small class="text-secondary">浏览器实例数（每个 6 并发 page，需重启 Worker 生效）</small>
                         </div>
                     </div>
 
