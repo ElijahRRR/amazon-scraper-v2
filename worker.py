@@ -246,8 +246,22 @@ class Worker:
                     pending = len(self._screenshot_pending_batches)
                     logger.info(f"⏸️ 等待截图完成后再拉取新任务（{pending} 个批次待处理）")
                     self._screenshot_gate.clear()
-                    await self._screenshot_gate.wait()
-                    logger.info("▶️ 截图批次已完成，继续拉取新任务")
+
+                    # 检测截图子进程是否存活，崩溃则强制放行
+                    if self._screenshot_process and self._screenshot_process.returncode is not None:
+                        logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，跳过门控")
+                        self._screenshot_pending_batches.clear()
+                        self._screenshot_gate.set()
+                        continue
+
+                    # 门控超时：最多等 5 分钟，避免子进程异常导致 Worker 永久卡死
+                    try:
+                        await asyncio.wait_for(self._screenshot_gate.wait(), timeout=300)
+                        logger.info("▶️ 截图批次已完成，继续拉取新任务")
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ 截图门控超时（5分钟），强制放行继续拉取任务")
+                        self._screenshot_pending_batches.clear()
+                        self._screenshot_gate.set()
                     continue
                 threshold = int(self._queue_size * self._prefetch_threshold)
 
@@ -1376,6 +1390,13 @@ class Worker:
         while self._running:
             await asyncio.sleep(2)
             if not self._screenshot_pending_batches:
+                continue
+
+            # 子进程已退出 → 立即放行
+            if self._screenshot_process and self._screenshot_process.returncode is not None:
+                logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，清除门控")
+                self._screenshot_pending_batches.clear()
+                self._screenshot_gate.set()
                 continue
 
             completed = set()

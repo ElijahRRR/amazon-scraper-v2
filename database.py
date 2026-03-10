@@ -37,6 +37,10 @@ class Database:
         await self._db.execute("PRAGMA journal_mode=WAL")
         # 写锁等待 5 秒（避免 busy_timeout=0 导致并发写入立即失败）
         await self._db.execute("PRAGMA busy_timeout=5000")
+        # 限制缓存大小（默认 -2000 即 2MB，负值表示 KB）避免小内存服务器 OOM
+        await self._db.execute("PRAGMA cache_size=-32000")  # 32MB
+        # 限制 mmap 大小防止内存映射过大
+        await self._db.execute("PRAGMA mmap_size=67108864")  # 64MB
         # 返回字典行
         self._db.row_factory = aiosqlite.Row
         await self.init_tables()
