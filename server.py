@@ -65,7 +65,7 @@ _worker_registry: Dict[str, Dict] = {}
 
 _WORKER_ID_RE = re.compile(r'^[\w\-]{1,64}$')
 
-def _register_worker(worker_id: str):
+def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = None):
     """注册/更新 worker 心跳"""
     if not _WORKER_ID_RE.match(worker_id):
         return  # 拒绝非法 worker_id
@@ -77,8 +77,14 @@ def _register_worker(worker_id: str):
             "last_seen": now,
             "tasks_pulled": 0,
             "results_submitted": 0,
+            "enable_screenshot": True,
+            "ip": None,
         }
     _worker_registry[worker_id]["last_seen"] = now
+    if enable_screenshot is not None:
+        _worker_registry[worker_id]["enable_screenshot"] = enable_screenshot
+    if ip is not None:
+        _worker_registry[worker_id]["ip"] = ip
 
 
 # ==================== 运行时设置（可通过 API 修改，Worker 定期同步）====================
@@ -416,8 +422,12 @@ async def pull_tasks(
     """Worker 拉取待处理任务"""
     db = await get_db()
     _register_worker(worker_id)
-    
-    tasks = await db.pull_tasks(worker_id, max(1, min(count, 50)))
+
+    # 不支持截图的 Worker 只拉取不需要截图的任务
+    worker_info = _worker_registry.get(worker_id, {})
+    screenshot_only = None if worker_info.get("enable_screenshot", True) else False
+
+    tasks = await db.pull_tasks(worker_id, max(1, min(count, 50)), needs_screenshot=screenshot_only)
     
     if worker_id in _worker_registry:
         _worker_registry[worker_id]["tasks_pulled"] += len(tasks)
@@ -711,6 +721,8 @@ async def get_workers():
             "block_rate": round(metrics["block_rate"] * 100, 2) if "block_rate" in metrics else None,
             "latency_p50": metrics.get("latency_p50"),
             "inflight": metrics.get("inflight"),
+            "enable_screenshot": info.get("enable_screenshot", True),
+            "ip": info.get("ip"),
         })
     return {"workers": workers}
 
@@ -748,7 +760,14 @@ async def worker_sync(request: Request):
 
     metrics = data.get("metrics")
 
-    _register_worker(worker_id)
+    # 获取客户端 IP
+    client_ip = request.client.host if request.client else None
+
+    _register_worker(
+        worker_id,
+        enable_screenshot=data.get("enable_screenshot"),
+        ip=client_ip,
+    )
 
     # 处理 metrics（可能触发全局封锁）
     if metrics:

@@ -172,7 +172,7 @@ class Database:
             inserted = self._db.total_changes - before
         return inserted
 
-    async def pull_tasks(self, worker_id: str, count: int = 10) -> List[Dict]:
+    async def pull_tasks(self, worker_id: str, count: int = 10, needs_screenshot = None) -> List[Dict]:
         """
         Worker 拉取待处理任务
         原子操作：在写锁 + BEGIN IMMEDIATE 中完成 SELECT + UPDATE，防止并发重复分发
@@ -191,19 +191,27 @@ class Database:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
                 # 先查最高优先级，只返回该优先级的任务（不混合不同优先级）
+                # needs_screenshot 过滤：None=不过滤, False=只拉不需要截图的
+                ss_filter = ""
+                ss_params = []
+                if needs_screenshot is not None:
+                    ss_filter = " AND needs_screenshot = ?"
+                    ss_params = [1 if needs_screenshot else 0]
+
                 async with self._db.execute(
-                    "SELECT MAX(priority) FROM tasks WHERE status = 'pending'"
+                    f"SELECT MAX(priority) FROM tasks WHERE status = 'pending'{ss_filter}",
+                    ss_params
                 ) as cur:
                     row = await cur.fetchone()
                     top_priority = row[0] if row and row[0] is not None else 0
 
                 async with self._db.execute(
-                    """SELECT id, batch_name, asin, zip_code, retry_count, priority, needs_screenshot
+                    f"""SELECT id, batch_name, asin, zip_code, retry_count, priority, needs_screenshot
                        FROM tasks
-                       WHERE status = 'pending' AND priority = ?
+                       WHERE status = 'pending' AND priority = ?{ss_filter}
                        ORDER BY id ASC
                        LIMIT ?""",
-                    (top_priority, count)
+                    (top_priority, *ss_params, count)
                 ) as cursor:
                     rows = await cursor.fetchall()
 

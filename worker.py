@@ -852,6 +852,7 @@ class Worker:
                 snap = self._metrics.snapshot()
                 payload = {
                     "worker_id": self.worker_id,
+                    "enable_screenshot": self._enable_screenshot,
                     "metrics": {
                         "total": snap["total"],
                         "success_rate": snap["success_rate"],

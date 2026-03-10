@@ -159,15 +159,21 @@
         const deleteBtn = isOnline ? '' :
             '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="removeWorker(\'' + safeId + '\')" title="移除"><i class="bi bi-x-lg"></i></button>';
 
+        const screenshotBadge = w.enable_screenshot
+            ? '<span class="badge bg-success bg-opacity-25 text-success" style="font-size:0.7rem"><i class="bi bi-camera-fill"></i> 截图</span>'
+            : '<span class="badge bg-secondary bg-opacity-25 text-secondary" style="font-size:0.7rem"><i class="bi bi-camera-video-off"></i> 无截图</span>';
+        const ipText = w.ip ? escapeHtml(w.ip) : '-';
+
         return '<div class="col-md-6 col-xl-4" data-worker="' + safeId + '">' +
             '<div class="card worker-card' + offlineClass + '">' +
                 '<div class="card-header d-flex align-items-center gap-2 py-2">' +
                     '<i class="bi bi-pc-display" style="color:var(--accent)"></i>' +
                     '<strong style="font-size:0.9rem" class="text-truncate">' + safeId + '</strong>' +
-                    badge + deleteBtn +
+                    screenshotBadge + badge + deleteBtn +
                 '</div>' +
                 '<div class="card-body py-2 px-3">' +
                     '<div class="worker-metrics">' +
+                        '<div class="wm-item"><span class="wm-label">IP 地址</span><span class="wm-value" style="font-family:monospace;font-size:0.75rem">' + ipText + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">配额并发</span><span class="wm-value">' + val(w.quota_concurrency) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">配额 QPS</span><span class="wm-value">' + val(w.quota_qps, '', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">成功率</span><span class="wm-value ' + successRateClass(w.success_rate) + '">' + val(w.success_rate, '%', 1) + '</span></div>' +
