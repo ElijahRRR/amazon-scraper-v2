@@ -122,16 +122,20 @@ class ScreenshotWorker:
             upload_ok = await self._upload_screenshot(batch_name, asin, png_bytes)
             if upload_ok:
                 logger.info(f"截图完成并上传: {asin} ({len(png_bytes)} bytes)")
+                # 上传成功才删除 HTML
+                try:
+                    os.remove(html_path)
+                except OSError:
+                    pass
             else:
-                logger.warning(f"截图上传失败: {asin}")
+                logger.warning(f"截图上传失败，保留 HTML 待重试: {asin}")
         else:
             logger.warning(f"截图渲染失败: {asin}")
-
-        # 4. 无论成功失败都删除 HTML（避免无限重试）
-        try:
-            os.remove(html_path)
-        except OSError:
-            pass
+            # 渲染失败删除 HTML（避免无限重试）
+            try:
+                os.remove(html_path)
+            except OSError:
+                pass
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
         """上传单张截图到服务器"""

@@ -35,6 +35,8 @@ class Database:
         self._db = await aiosqlite.connect(self.db_path)
         # 启用 WAL 模式提升并发性能
         await self._db.execute("PRAGMA journal_mode=WAL")
+        # 写锁等待 5 秒（避免 busy_timeout=0 导致并发写入立即失败）
+        await self._db.execute("PRAGMA busy_timeout=5000")
         # 返回字典行
         self._db.row_factory = aiosqlite.Row
         await self.init_tables()
