@@ -240,10 +240,13 @@ def _allocate_quotas():
         scale = total_qps / sum_qps
         raw_qps = {wid: v * scale for wid, v in raw_qps.items()}
 
+    # 单 Worker 并发上限：不超过 max_concurrency 设置
+    per_worker_max = _runtime_settings["max_concurrency"]
+
     new_quotas = {}
     for wid in active:
         new_quotas[wid] = {
-            "concurrency": int_conc[wid],
+            "concurrency": min(int_conc[wid], per_worker_max),
             "qps": round(max(0.1, raw_qps[wid]), 2),
             "assigned_at": now,
         }
