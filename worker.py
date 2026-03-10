@@ -400,7 +400,9 @@ class Worker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker-{worker_idx} 异常: {e}")
+                logger.error(f"Worker-{worker_idx} 未捕获异常: {type(e).__name__}: {e}")
+                # 不提交 failed（避免需要手动重试），让任务留在 processing
+                # 由 Server 端超时回收机制自动重置为 pending 重新分发
                 await asyncio.sleep(1)
 
     async def _sync_controller_mode_profile(self, mode: str):
@@ -814,6 +816,7 @@ class Worker:
             params = {
                 "worker_id": self.worker_id,
                 "count": count or self._controller.current_concurrency,
+                "enable_screenshot": "1" if self._enable_screenshot else "0",
             }
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url, params=params)
@@ -1317,7 +1320,7 @@ class Worker:
                     return
                 logger.warning(f"批量提交失败 HTTP {resp.status_code} (尝试 {attempt+1}/{retry})")
             except Exception as e:
-                logger.error(f"批量提交异常 (尝试 {attempt+1}/{retry}): {e}")
+                logger.error(f"批量提交异常 (尝试 {attempt+1}/{retry}): {type(e).__name__}: {e}")
             if attempt < retry - 1:
                 await asyncio.sleep(2 ** attempt)
         # 全部重试失败，回退逐条提交

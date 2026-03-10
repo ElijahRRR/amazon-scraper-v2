@@ -323,7 +323,7 @@ async def _timeout_task_loop():
         # 兜底配额重算（确保 Worker 离线后配额被回收）
         _allocate_quotas()
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 # ==================== API 端点 ====================
@@ -418,14 +418,21 @@ async def upload_asin_file(
 async def pull_tasks(
     worker_id: str = Query(...),
     count: int = Query(10),
+    enable_screenshot: str = Query(None),
 ):
     """Worker 拉取待处理任务"""
     db = await get_db()
-    _register_worker(worker_id)
+
+    # 从请求参数直接判断截图能力（不依赖注册表，避免首次 pull 时默认值错误）
+    if enable_screenshot is not None:
+        has_screenshot = enable_screenshot == "1"
+        _register_worker(worker_id, enable_screenshot=has_screenshot)
+    else:
+        _register_worker(worker_id)
+        has_screenshot = _worker_registry.get(worker_id, {}).get("enable_screenshot", True)
 
     # 不支持截图的 Worker 只拉取不需要截图的任务
-    worker_info = _worker_registry.get(worker_id, {})
-    screenshot_only = None if worker_info.get("enable_screenshot", True) else False
+    screenshot_only = None if has_screenshot else False
 
     tasks = await db.pull_tasks(worker_id, max(1, min(count, 50)), needs_screenshot=screenshot_only)
     
