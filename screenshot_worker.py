@@ -39,6 +39,8 @@ class ScreenshotWorker:
         self._browser_slots = []
         self._browser_lock = asyncio.Lock()
         self._browser_counter = 0
+        self._render_count = 0          # 累计渲染计数
+        self._restart_every = 200       # 每渲染 200 张重启浏览器回收内存
         self._running = True
         self._http_client: Optional[httpx.AsyncClient] = None
 
@@ -104,6 +106,13 @@ class ScreenshotWorker:
             for b, a, p in pending
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 定期重启浏览器回收内存（Chromium 长期运行会内存泄漏）
+        self._render_count += len(pending)
+        if self._render_count >= self._restart_every:
+            logger.info(f"已渲染 {self._render_count} 张，重启浏览器回收内存")
+            await self._close_browsers()
+            self._render_count = 0
 
     async def _render_upload_cleanup(self, batch_name: str, asin: str, html_path: str):
         """单张截图完整流程：渲染 → 上传 → 删除 HTML"""

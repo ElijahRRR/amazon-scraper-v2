@@ -47,10 +47,11 @@ class Worker:
     """流水线异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
-                 zip_code: str = None):
+                 zip_code: str = None, enable_screenshot: bool = True):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
+        self._enable_screenshot = enable_screenshot
 
         # 代理模式
         self._proxy_mode = config.PROXY_MODE
@@ -152,6 +153,7 @@ class Worker:
         logger.info(f"   初始并发: {self._controller.current_concurrency}")
         logger.info(f"   并发范围: [{config.MIN_CONCURRENCY}, {self._controller._max}]")
         logger.info(f"   邮编: {self.zip_code}")
+        logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
         logger.info(f"   代理模式: {self._proxy_mode.upper()}"
                      + (f" ({config.TUNNEL_CHANNELS} 通道)" if self._proxy_mode == "tunnel" else ""))
 
@@ -1188,7 +1190,7 @@ class Worker:
                     logger.info(f"⏱️ 链路 | token:{t_token_wait:.2f}s sem:{t_sem_wait:.2f}s http:{req_elapsed:.2f}s parse:{t_parse:.3f}s bytes:{resp_bytes}")
 
                 # 截图存证：写 HTML 到磁盘，由独立截图子进程渲染
-                if task.get("needs_screenshot"):
+                if task.get("needs_screenshot") and self._enable_screenshot:
                     batch = task.get("batch_name", "")
                     safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch).strip('_') or "default"
                     html_dir = os.path.join(self._screenshot_html_dir, safe_batch)
@@ -1513,6 +1515,7 @@ def main():
     arg_parser.add_argument("--concurrency", type=int, default=None,
                             help=f"最大并发数上限（默认 {config.MAX_CONCURRENCY}，自适应控制器自动探索最优值）")
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
+    arg_parser.add_argument("--no-screenshot", action="store_true", help="禁用截图功能（仅采集数据）")
     args = arg_parser.parse_args()
 
     worker = Worker(
@@ -1520,6 +1523,7 @@ def main():
         worker_id=args.worker_id,
         concurrency=args.concurrency,
         zip_code=args.zip_code,
+        enable_screenshot=not args.no_screenshot,
     )
 
     # 优雅退出
