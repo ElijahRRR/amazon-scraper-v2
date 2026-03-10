@@ -292,40 +292,6 @@ class AmazonSession:
 
         return headers
 
-    async def fetch_aod_page(self, asin: str, max_recv_speed: int = 0) -> Optional[Response]:
-        """采集 AOD (All Offers Display) AJAX 页面"""
-        if not self._initialized:
-            await self.initialize()
-
-        if self._session is None:
-            logger.warning(f"⚠️ Session 未就绪，跳过 AOD ASIN={asin}")
-            return None
-
-        url = f"{self.AMAZON_BASE}/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=true"
-        referer = f"{self.AMAZON_BASE}/dp/{asin}"
-        headers = self._build_headers(referer=referer)
-        headers.update({
-            "X-Requested-With": "XMLHttpRequest",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Accept": "text/html,*/*",
-        })
-
-        try:
-            resp = await self._session.get(
-                url,
-                headers=headers,
-                max_recv_speed=max_recv_speed,
-            )
-
-            self._last_url = referer
-            self._request_count += 1
-
-            return resp
-        except Exception as e:
-            logger.error(f"AOD 请求失败 ASIN={asin}: {e}")
-            return None
-
     async def fetch_product_page(self, asin: str, max_recv_speed: int = 0) -> Optional[Response]:
         """采集 Amazon 商品页面"""
         if not self._initialized:

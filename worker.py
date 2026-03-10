@@ -47,11 +47,10 @@ class Worker:
     """流水线异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
-                 zip_code: str = None, fast_mode: bool = False):
+                 zip_code: str = None):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
-        self.fast_mode = fast_mode  # 快速模式: AOD 优先获取价格
 
         # 代理模式
         self._proxy_mode = config.PROXY_MODE
@@ -153,7 +152,6 @@ class Worker:
         logger.info(f"   初始并发: {self._controller.current_concurrency}")
         logger.info(f"   并发范围: [{config.MIN_CONCURRENCY}, {self._controller._max}]")
         logger.info(f"   邮编: {self.zip_code}")
-        logger.info(f"   快速模式: {'开启 (AOD优先)' if self.fast_mode else '关闭'}")
         logger.info(f"   代理模式: {self._proxy_mode.upper()}"
                      + (f" ({config.TUNNEL_CHANNELS} 通道)" if self._proxy_mode == "tunnel" else ""))
 
@@ -1037,30 +1035,6 @@ class Worker:
                     await self._rate_limiter.acquire()
                 t_token_wait = time.time() - t_token_start
 
-                # 快速模式: 先用 AOD 获取价格数据（信号量仅包裹 HTTP 请求）
-                if self.fast_mode and attempt == 0:
-                    await self._controller.acquire(channel)
-                    await self._apply_jitter()
-                    aod_recv_speed = self._calc_recv_speed()
-                    aod_start = time.time()
-                    try:
-                        aod_result = await self._try_aod_fast(asin, zip_code, task, session, max_recv_speed=aod_recv_speed)
-                    finally:
-                        aod_elapsed = time.time() - aod_start
-                        self._controller.release(channel)
-                    if aod_result is not None:
-                        self._controller.record_result(aod_elapsed, True, False, 0, channel_id=channel)
-                        await self._submit_result(task_id, aod_result, success=True)
-                        self._stats["success"] += 1
-                        self._stats["total"] += 1
-                        title_short = aod_result["title"][:40] if aod_result.get("title") else "AOD"
-                        logger.info(f"AOD {asin}{ch_tag} | {title_short}... | {aod_result['buybox_price']}")
-                        if not is_tunnel:
-                            self._success_since_rotate += 1
-                            if self._success_since_rotate >= self._rotate_every:
-                                await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
-                        return (True, False, resp_bytes)
-
                 # 发起请求（信号量仅包裹 HTTP 请求，响应处理不占槽位）
                 t_sem_start = time.time()
                 await self._controller.acquire(channel)
@@ -1254,47 +1228,6 @@ class Worker:
         self._stats["failed"] += 1
         self._stats["total"] += 1
         return (False, False, resp_bytes)
-
-    async def _try_aod_fast(self, asin: str, zip_code: str, task: Dict,
-                            session: AmazonSession = None,
-                            max_recv_speed: int = 0) -> Optional[Dict]:
-        """
-        AOD 快速路径: 用 AOD AJAX 端点获取价格数据
-        成功返回 result_data，失败返回 None（会 fallback 到产品页）
-
-        Args:
-            session: 指定使用的 session（隧道模式下传入通道 session）
-            max_recv_speed: per-request 带宽限速（bytes/s），0 = 不限
-        """
-        session = session or self._session
-        try:
-            resp = await session.fetch_aod_page(asin, max_recv_speed=max_recv_speed)
-            if resp is None:
-                return None
-            if session.is_blocked(resp):
-                return None
-            if resp.status_code != 200:
-                return None
-
-            aod_data = self.parser.parse_aod_response(resp.text, asin)
-
-            # AOD 必须至少有价格才算成功
-            if not aod_data.get("offers") or aod_data["buybox_price"] == "N/A":
-                return None
-
-            # 构建完整结果（AOD 只有价格数据，其他字段留默认）
-            result_data = self.parser._default_result(asin, zip_code)
-            result_data["title"] = f"[AOD] {asin}"  # AOD 不包含标题
-            result_data["buybox_price"] = aod_data["buybox_price"]
-            result_data["current_price"] = aod_data["buybox_price"]
-            result_data["buybox_shipping"] = aod_data["buybox_shipping"]
-            result_data["is_fba"] = aod_data["is_fba"]
-            result_data["batch_name"] = task.get("batch_name", "")
-            return result_data
-
-        except Exception as e:
-            logger.debug(f"AOD 快速路径失败 {asin}: {e}")
-            return None
 
     # ═══════════════════════════════════════════════
     # 结果提交（保持不变）
@@ -1580,8 +1513,6 @@ def main():
     arg_parser.add_argument("--concurrency", type=int, default=None,
                             help=f"最大并发数上限（默认 {config.MAX_CONCURRENCY}，自适应控制器自动探索最优值）")
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
-    arg_parser.add_argument("--fast", action="store_true", help="快速模式: AOD 优先获取价格数据")
-
     args = arg_parser.parse_args()
 
     worker = Worker(
@@ -1589,7 +1520,6 @@ def main():
         worker_id=args.worker_id,
         concurrency=args.concurrency,
         zip_code=args.zip_code,
-        fast_mode=args.fast,
     )
 
     # 优雅退出

@@ -150,7 +150,6 @@ cp .env.example .env
   - `initialize()`：访问首页获取 Cookie → POST 设置邮编，带 `asyncio.Lock` 防并发初始化 + 3 次重试
   - `is_ready()`：检查 session 是否已初始化并可用（Worker 在处理任务前调用）
   - `fetch_product_page(asin)`：采集商品详情页
-  - `fetch_aod_page(asin)`：采集 AOD (All Offers Display) AJAX 页面，响应体仅为产品页的 10-20%
   - `is_blocked(resp)`：检测 403/503/验证码拦截（含页面体积阈值，避免正常产品页误判）
 
 ### `worker.py` — 采集引擎（流水线 + 自适应并发）
@@ -173,7 +172,6 @@ task_feeder → [task_queue] → worker_pool (N个协程) → [result_queue] →
 - **任务预取**：队列低于 50% 时触发补给，保持 Worker 始终有任务可做
 - **封锁处理**：检测到 403/503/验证码 → 自动轮换 Session（换 IP + 换 Cookie）
 - **主动轮换**：每 1000 次成功请求主动更换 Session
-- **快速模式** (`--fast`)：优先用 AOD AJAX 获取价格，失败再 fallback 到完整产品页
 - **截图存证**：需要截图的任务 HTML 写入磁盘，由独立子进程（`screenshot_worker.py`）渲染，采集与截图完全隔离事件循环
 - **启动设置全量同步**：Worker 启动时自动从 Server 拉取所有 18 项运行参数（并发控制、QPS、AIMD 参数、代理地址等），远程 Worker 无需本地 `.env` 或环境变量
 - **全局协调同步**：每 30 秒通过 `POST /api/worker/sync` 上报 metrics 快照 + 接收 Server 分配的并发/QPS 配额 + 检测全局封锁事件，无需重启即可热更新所有参数
@@ -489,9 +487,6 @@ python worker.py --server http://192.168.1.100:8899 \
   --concurrency 10 \
   --zip-code 10001 \
   --worker-id my-worker-1
-
-# 快速模式（AOD 优先获取价格，响应更小更快）
-python worker.py --server http://127.0.0.1:8899 --fast
 ```
 
 Worker 只需以下文件即可独立运行（不需要完整项目）：
@@ -521,7 +516,6 @@ Worker 命令行参数：
 | `--worker-id` | 自动生成 | Worker 唯一标识 |
 | `--concurrency` | 50 | 最大并发上限（自适应控制器自动探索最优值） |
 | `--zip-code` | 10001 | 配送邮编 |
-| `--fast` | 关闭 | AOD 快速模式 |
 
 ### 使用流程
 
