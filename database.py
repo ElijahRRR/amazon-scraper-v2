@@ -123,8 +123,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_name);
             CREATE INDEX IF NOT EXISTS idx_tasks_batch_asin ON tasks(batch_name, asin);
             CREATE INDEX IF NOT EXISTS idx_results_batch ON results(batch_name);
-            CREATE INDEX IF NOT EXISTS idx_results_asin ON results(asin);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_results_batch_asin ON results(batch_name, asin);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_results_asin_unique ON results(asin);
         """)
 
         # 迁移：为已存在的表添加新列（CREATE TABLE IF NOT EXISTS 不会修改已有表）
@@ -144,6 +143,78 @@ class Database:
                     logger.warning(f"Migration 异常 ({table}.{column}): {e}")
 
         await self._db.commit()
+
+        # v2 迁移：ASIN 主表模式
+        await self._migrate_v2()
+
+    async def _migrate_v2(self):
+        """v2 迁移：ASIN 主表模式（显式事务，原子性）"""
+        async with self._db.execute("PRAGMA user_version") as c:
+            version = (await c.fetchone())[0]
+
+        if version >= 2:
+            return  # 已迁移
+
+        try:
+            await self._db.execute("BEGIN IMMEDIATE")
+
+            # 1. 新增变动追踪列
+            for col_sql in [
+                "ALTER TABLE results ADD COLUMN price_change TEXT",
+                "ALTER TABLE results ADD COLUMN stock_qty_change TEXT",
+                "ALTER TABLE results ADD COLUMN stock_status_change TEXT",
+                "ALTER TABLE results ADD COLUMN other_change INTEGER DEFAULT 0",
+                "ALTER TABLE results ADD COLUMN prev_current_price TEXT",
+                "ALTER TABLE results ADD COLUMN prev_buybox_price TEXT",
+                "ALTER TABLE results ADD COLUMN prev_stock_count TEXT",
+                "ALTER TABLE results ADD COLUMN prev_stock_status TEXT",
+                "ALTER TABLE results ADD COLUMN is_new INTEGER DEFAULT 0",
+                "ALTER TABLE results ADD COLUMN updated_at TEXT",
+                "ALTER TABLE results ADD COLUMN content_hash TEXT",
+                "ALTER TABLE results ADD COLUMN last_change_at TEXT",
+                "ALTER TABLE results ADD COLUMN change_seq INTEGER DEFAULT 0",
+            ]:
+                try:
+                    await self._db.execute(col_sql)
+                except Exception as e:
+                    if "duplicate column name" in str(e).lower():
+                        pass
+                    else:
+                        raise
+
+            # 2. 合并重复 ASIN（保留最新 crawl_time 的行）
+            await self._db.execute("""
+                DELETE FROM results WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY asin
+                            ORDER BY COALESCE(crawl_time, '') DESC, id DESC
+                        ) AS rn FROM results
+                    ) WHERE rn = 1
+                )
+            """)
+
+            # 3. 创建计数器表
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER DEFAULT 0)")
+            await self._db.execute(
+                "INSERT OR IGNORE INTO counters (name, value) VALUES ('change_seq', 0)")
+
+            # 4. 切换唯一索引：(batch_name, asin) → (asin)
+            await self._db.execute("DROP INDEX IF EXISTS idx_results_batch_asin")
+            await self._db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_results_asin_unique ON results(asin)")
+
+            # 5. 标记版本
+            await self._db.execute("PRAGMA user_version = 2")
+            await self._db.commit()
+            logger.info("数据库迁移完成: v1 → v2 (ASIN 主表模式)")
+        except Exception:
+            try:
+                await self._db.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     # ==================== 任务操作 ====================
 

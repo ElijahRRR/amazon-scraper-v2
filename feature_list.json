@@ -11,7 +11,7 @@
     "category": "infrastructure",
     "description": "数据库迁移框架: PRAGMA user_version + 显式事务 + ASIN 唯一索引 + counters 表",
     "steps": ["_migrate 方法存在", "新增列 ALTER TABLE", "合并重复ASIN", "计数器表 counters", "唯一索引 idx_results_asin_unique", "PRAGMA user_version=2"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 3,
