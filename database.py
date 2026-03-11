@@ -693,29 +693,50 @@ class Database:
             return dict(row) if row else None
 
     async def get_all_results(self, batch_name: str) -> List[Dict]:
-        """获取某批次的全部结果（用于导出）"""
+        """获取某批次的全部结果（用于导出，EXISTS 筛选）"""
         async with self._db.execute(
-            "SELECT * FROM results WHERE batch_name = ? ORDER BY id ASC",
+            """SELECT r.* FROM results r
+               WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.batch_name = ? AND t.asin = r.asin AND t.status = 'done')
+               ORDER BY r.id ASC""",
             (batch_name,)
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
-    async def iter_results(self, batch_name: str, chunk_size: int = 500):
-        """分批迭代某批次的结果（游标分页，恒定 O(1) 每批，不随数据量退化）"""
+    async def iter_results(self, batch_name: str = None, chunk_size: int = 500,
+                           change_filter: str = "all"):
+        """分批迭代结果（游标分页，支持批次 EXISTS 筛选 + change_filter）"""
+        where, params = self._build_where(batch_name=batch_name, change_filter=change_filter)
+        # 追加游标条件
         last_id = 0
         while True:
+            cursor_where = f"{where} AND r.id > ?" if where else "WHERE r.id > ?"
+            cursor_params = params + [last_id, chunk_size]
             async with self._db.execute(
-                "SELECT * FROM results WHERE batch_name = ? AND id > ? ORDER BY id ASC LIMIT ?",
-                (batch_name, last_id, chunk_size)
+                f"SELECT r.* FROM results r {cursor_where} ORDER BY r.id ASC LIMIT ?",
+                cursor_params
             ) as cursor:
                 rows = await cursor.fetchall()
                 if not rows:
                     break
                 for row in rows:
-                    d = dict(row)
-                    yield d
+                    yield dict(row)
                 last_id = rows[-1]["id"]
+
+    async def count_results(self, batch_name: str = None, change_filter: str = "all") -> int:
+        """按筛选条件计数结果"""
+        where, params = self._build_where(batch_name=batch_name, change_filter=change_filter)
+        async with self._db.execute(
+            f"SELECT COUNT(*) as cnt FROM results r {where}", params
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["cnt"]
+
+    async def get_all_asins(self) -> List[str]:
+        """获取主表中所有 ASIN（用于定时采集）"""
+        async with self._db.execute("SELECT asin FROM results ORDER BY id ASC") as cursor:
+            rows = await cursor.fetchall()
+            return [row["asin"] for row in rows]
 
     # ==================== 统计与进度 ====================
 

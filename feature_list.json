@@ -39,7 +39,7 @@
     "category": "core",
     "description": "iter_results + count_results 支持批次筛选和 change_filter",
     "steps": ["iter_results 用 EXISTS + change_filter", "count_results 方法", "get_all_asins 方法"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 7,
