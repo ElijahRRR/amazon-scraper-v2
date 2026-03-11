@@ -288,6 +288,20 @@
                 <div id="scheduleEmpty" class="text-secondary text-center py-3" style="display:none;">
                     暂无定时任务，点击"新增"添加
                 </div>
+                <div id="scheduleNewRow" class="row g-2 align-items-end mt-2" style="display:none;">
+                    <div class="col">
+                        <label class="form-label">执行时间</label>
+                        <input type="time" class="form-control" id="newScheduleTime" value="08:00">
+                    </div>
+                    <div class="col-auto d-flex gap-1" style="padding-bottom:1px;">
+                        <button class="btn btn-accent" onclick="confirmAddSchedule()">
+                            <i class="bi bi-check-lg"></i> 确认
+                        </button>
+                        <button class="btn btn-outline-secondary" onclick="cancelAddSchedule()">
+                            取消
+                        </button>
+                    </div>
+                </div>
                 <div id="scheduleResult" class="mt-2" style="display:none;"></div>
             </div>
         </div>
@@ -469,10 +483,20 @@ function renderSchedules() {
     }).join('');
 }
 
-async function addSchedule() {
-    const timeStr = prompt('输入每天执行时间（HH:MM 格式，如 13:35）');
+function addSchedule() {
+    const row = document.getElementById('scheduleNewRow');
+    row.style.display = '';
+    document.getElementById('newScheduleTime').focus();
+}
+
+function cancelAddSchedule() {
+    document.getElementById('scheduleNewRow').style.display = 'none';
+}
+
+async function confirmAddSchedule() {
+    const input = document.getElementById('newScheduleTime');
+    const timeStr = input.value.trim();
     if (!timeStr) return;
-    const resultDiv = document.getElementById('scheduleResult');
     try {
         const resp = await fetch('/api/auto-scrape/schedules', {
             method: 'POST',
@@ -483,6 +507,8 @@ async function addSchedule() {
         if (resp.ok) {
             _schedules = data.schedules;
             renderSchedules();
+            document.getElementById('scheduleNewRow').style.display = 'none';
+            input.value = '08:00';
             showScheduleMsg('success', '已添加');
         } else {
             showScheduleMsg('danger', data.detail || '添加失败');
