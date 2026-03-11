@@ -1198,12 +1198,20 @@ class Worker:
                 # 核心字段缺失检测：有标题但价格/库存/品牌全为空 → 页面降级，重试
                 _na = {"", "N/A", "N/a", "n/a", "None", None, "0"}
                 _core_fields = ["current_price", "buybox_price", "stock_status", "brand"]
-                if all(result_data.get(f) in _na for f in _core_fields):
+                _is_degraded = all(result_data.get(f) in _na for f in _core_fields)
+
+                # 价格 N/A + 库存 999 = 页面部分解析但价格区块缺失，重试
+                _price_na = result_data.get("current_price") in _na and result_data.get("buybox_price") in _na
+                _stock_999 = str(result_data.get("stock_count", "")).strip() == "999"
+                _is_incomplete = _price_na and _stock_999
+
+                if _is_degraded or _is_incomplete:
                     self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
                     attempt += 1
+                    reason = "核心字段全部缺失" if _is_degraded else "价格缺失+库存999"
                     last_error_type = "parse_error"
-                    last_error_detail = "核心字段全部缺失（页面降级）"
-                    logger.warning(f"ASIN {asin}{ch_tag} 核心字段缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
+                    last_error_detail = f"解析不完整（{reason}）"
+                    logger.warning(f"ASIN {asin}{ch_tag} {reason}，疑似降级页面 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
 

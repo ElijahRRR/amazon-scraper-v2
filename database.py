@@ -27,11 +27,18 @@ _NA_VALUES = {"", "N/A", "n/a", "None", "none", None}
 
 
 def _is_parse_failure(data: dict) -> bool:
-    """检测采集结果是否为解析失败（关键字段全为 N/A / 空）。
-    如果价格、库存、品牌全部缺失，视为页面解析失败，不应覆盖已有数据。
+    """检测采集结果是否为解析失败，不应覆盖已有数据。
+    两种情况：
+    1. 关键字段全为 N/A / 空（页面降级）
+    2. 价格全为 N/A + 库存 999（价格区块缺失）
     """
     key_fields = ["current_price", "buybox_price", "stock_count", "stock_status", "brand"]
-    return all(data.get(f) in _NA_VALUES for f in key_fields)
+    all_empty = all(data.get(f) in _NA_VALUES for f in key_fields)
+
+    price_na = data.get("current_price") in _NA_VALUES and data.get("buybox_price") in _NA_VALUES
+    stock_999 = str(data.get("stock_count", "")).strip() == "999"
+
+    return all_empty or (price_na and stock_999)
 
 def _parse_price_float(s) -> Optional[float]:
     """解析价格字符串为 float（移除 $, ¥, 逗号等）"""
