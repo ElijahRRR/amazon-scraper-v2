@@ -966,6 +966,32 @@ class Database:
             await self._db.execute("DELETE FROM tasks WHERE batch_name = ?", (batch_name,))
             await self._db.commit()
 
+    async def get_screenshot_paths(self, asin_list: List[str]) -> List[str]:
+        """获取指定 ASIN 的 screenshot_path 列表"""
+        if not asin_list:
+            return []
+        placeholders = ",".join(["?"] * len(asin_list))
+        async with self._db.execute(
+            f"SELECT screenshot_path FROM results WHERE asin IN ({placeholders}) AND screenshot_path IS NOT NULL",
+            asin_list
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row["screenshot_path"] for row in rows]
+
+    async def delete_results(self, asin_list: List[str] = None, delete_all: bool = False) -> int:
+        """显式删除 ASIN 数据（不影响 tasks 历史）"""
+        async with self._write_lock:
+            if delete_all:
+                result = await self._db.execute("DELETE FROM results")
+            elif asin_list:
+                placeholders = ",".join(["?"] * len(asin_list))
+                result = await self._db.execute(
+                    f"DELETE FROM results WHERE asin IN ({placeholders})", asin_list)
+            else:
+                return 0
+            await self._db.commit()
+            return result.rowcount
+
     async def clear_all(self) -> Dict[str, int]:
         """清空所有数据（tasks + results 表）"""
         async with self._write_lock:

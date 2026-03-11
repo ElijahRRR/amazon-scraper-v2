@@ -53,7 +53,7 @@
     "category": "core",
     "description": "DELETE /api/results 端点 + delete_results 数据库方法",
     "steps": ["database delete_results + get_screenshot_paths", "server DELETE /api/results 路由", "截图文件清理 + 越界检测"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 9,

@@ -1299,6 +1299,44 @@ async def delete_batch(batch_name: str):
     return {"status": "ok"}
 
 
+@app.delete("/api/results")
+async def delete_results(request: Request):
+    """显式删除 ASIN 数据（不影响 tasks 历史）"""
+    db = await get_db()
+    data = await request.json()
+    asin_list = data.get("asin_list", [])
+    delete_all = data.get("all", False)
+
+    if not asin_list and not delete_all:
+        raise HTTPException(400, "需要 asin_list 或 all=true")
+
+    # 先取截图路径，清理磁盘文件
+    target_asins = asin_list if asin_list else []
+    if delete_all:
+        # 获取所有有截图的 ASIN
+        async with db._db.execute(
+            "SELECT screenshot_path FROM results WHERE screenshot_path IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            paths = [row["screenshot_path"] for row in rows]
+    else:
+        paths = await db.get_screenshot_paths(asin_list)
+
+    screenshots_root = os.path.realpath(config.STATIC_DIR)
+    for web_path in paths:
+        if not web_path or not web_path.startswith("/static/screenshots/"):
+            continue
+        rel = web_path[len("/static/"):]  # "screenshots/batch/ASIN.png"
+        real_path = os.path.join(config.STATIC_DIR, rel)
+        real_path = os.path.realpath(real_path)
+        # 越界检测
+        if real_path.startswith(screenshots_root) and os.path.isfile(real_path):
+            os.unlink(real_path)
+
+    count = await db.delete_results(asin_list=asin_list, delete_all=delete_all)
+    return {"status": "ok", "deleted": count}
+
+
 @app.delete("/api/database")
 async def clear_database():
     """清空数据库中所有数据（tasks + results + 截图文件）"""
