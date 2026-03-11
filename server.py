@@ -125,10 +125,8 @@ def _default_settings() -> dict:
         "tunnel_initial_concurrency": getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16),
         "per_channel_qps": getattr(config, "PER_CHANNEL_QPS", 3.0),
         "per_channel_max_concurrency": getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 12),
-        # 定时自动采集
-        "auto_scrape_enabled": False,
-        "auto_scrape_interval": 24,   # 小时
-        "auto_scrape_last_run": 0,    # 时间戳（内部使用）
+        # 定时自动采集（多任务，按时间点触发）
+        "auto_scrape_schedules": [],  # [{"time": "HH:MM", "enabled": true, "last_run_date": ""}]
     }
 
 _SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
@@ -332,36 +330,48 @@ async def _timeout_task_loop():
 
 
 async def _auto_scrape_scheduler():
-    """定时自动采集调度器"""
+    """定时自动采集调度器（按时间点触发，支持多任务）"""
     while True:
         await asyncio.sleep(60)
         try:
-            if not _runtime_settings.get("auto_scrape_enabled", False):
+            schedules = _runtime_settings.get("auto_scrape_schedules", [])
+            if not schedules:
                 continue
 
-            interval = _runtime_settings.get("auto_scrape_interval", 24) * 3600
-            last_run = _runtime_settings.get("auto_scrape_last_run", 0)
-            if time.time() - last_run < interval:
-                continue
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            current_hm = now.strftime("%H:%M")
 
-            db = await get_db()
+            for sched in schedules:
+                if not sched.get("enabled", True):
+                    continue
+                sched_time = sched.get("time", "")
+                if not sched_time:
+                    continue
+                # 今天已执行过则跳过
+                if sched.get("last_run_date", "") == today_str:
+                    continue
+                # 当前时间 >= 设定时间才触发
+                if current_hm < sched_time:
+                    continue
 
-            # 防重叠：检查是否有未完成的 auto_* 批次
-            if await db.has_pending_auto_batch():
-                logger.info("定时采集: 上一轮 auto 批次未完成，跳过")
-                continue
+                db = await get_db()
+                # 防重叠：有未完成的 auto_* 批次则跳过
+                if await db.has_pending_auto_batch():
+                    logger.info(f"定时采集[{sched_time}]: 上一轮 auto 批次未完成，跳过")
+                    continue
 
-            asins = await db.get_all_asins()
-            if not asins:
-                continue
+                asins = await db.get_all_asins()
+                if not asins:
+                    continue
 
-            batch_name = f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            zip_code = _runtime_settings.get("zip_code", "10001")
-            inserted = await db.create_tasks(batch_name, asins, zip_code=zip_code, needs_screenshot=False)
+                batch_name = f"auto_{now.strftime('%Y%m%d_%H%M%S')}"
+                zip_code = _runtime_settings.get("zip_code", "10001")
+                inserted = await db.create_tasks(batch_name, asins, zip_code=zip_code, needs_screenshot=False)
 
-            _runtime_settings["auto_scrape_last_run"] = time.time()
-            _save_settings()
-            logger.info(f"定时采集: 创建批次 {batch_name}，{inserted} 个任务")
+                sched["last_run_date"] = today_str
+                _save_settings()
+                logger.info(f"定时采集[{sched_time}]: 创建批次 {batch_name}，{inserted} 个任务")
         except Exception as e:
             logger.error(f"定时采集调度异常: {e}")
 
@@ -1227,9 +1237,7 @@ async def update_settings(request: Request):
         "tunnel_initial_concurrency": (int,   2,    100),
         "per_channel_qps":            (float, 0.5,  20),
         "per_channel_max_concurrency": (int,   1,    30),
-        # 定时自动采集
-        "auto_scrape_enabled":  (bool,  None, None),
-        "auto_scrape_interval": (int,   1,    168),   # 1h ~ 7d
+        # auto_scrape_schedules 通过专用端点管理，不在此校验
     }
 
     changed = False
@@ -1399,6 +1407,76 @@ async def reset_settings():
     _save_settings()
     logger.info(f"⚙️ 设置已恢复默认并持久化 (version={_settings_version})")
     return {"status": "ok", "settings": _runtime_settings, "_version": _settings_version}
+
+
+# --- 定时采集任务管理 ---
+
+def _validate_time_str(t: str) -> bool:
+    """校验 HH:MM 格式"""
+    if not t or len(t) != 5 or t[2] != ':':
+        return False
+    try:
+        h, m = int(t[:2]), int(t[3:])
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except ValueError:
+        return False
+
+
+@app.get("/api/auto-scrape/schedules")
+async def get_schedules():
+    """获取定时采集任务列表"""
+    return {"schedules": _runtime_settings.get("auto_scrape_schedules", [])}
+
+
+@app.post("/api/auto-scrape/schedules")
+async def add_schedule(request: Request):
+    """新增定时采集任务"""
+    data = await request.json()
+    time_str = str(data.get("time", "")).strip()
+    if not _validate_time_str(time_str):
+        raise HTTPException(422, "时间格式无效，请使用 HH:MM（如 13:35）")
+
+    schedules = _runtime_settings.setdefault("auto_scrape_schedules", [])
+    # 检查重复
+    for s in schedules:
+        if s.get("time") == time_str:
+            raise HTTPException(409, f"已存在 {time_str} 的定时任务")
+
+    schedules.append({"time": time_str, "enabled": True, "last_run_date": ""})
+    # 按时间排序
+    schedules.sort(key=lambda x: x.get("time", ""))
+    _save_settings()
+    return {"schedules": schedules}
+
+
+@app.put("/api/auto-scrape/schedules/{index}")
+async def update_schedule(index: int, request: Request):
+    """更新定时采集任务（启用/禁用）"""
+    schedules = _runtime_settings.get("auto_scrape_schedules", [])
+    if index < 0 or index >= len(schedules):
+        raise HTTPException(404, "任务不存在")
+    data = await request.json()
+    if "enabled" in data:
+        schedules[index]["enabled"] = bool(data["enabled"])
+    if "time" in data:
+        time_str = str(data["time"]).strip()
+        if not _validate_time_str(time_str):
+            raise HTTPException(422, "时间格式无效")
+        schedules[index]["time"] = time_str
+        schedules.sort(key=lambda x: x.get("time", ""))
+    _save_settings()
+    return {"schedules": schedules}
+
+
+@app.delete("/api/auto-scrape/schedules/{index}")
+async def delete_schedule(index: int):
+    """删除定时采集任务"""
+    schedules = _runtime_settings.get("auto_scrape_schedules", [])
+    if index < 0 or index >= len(schedules):
+        raise HTTPException(404, "任务不存在")
+    schedules.pop(index)
+    _save_settings()
+    return {"schedules": schedules}
 
 
 # --- 批次操作 ---

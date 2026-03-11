@@ -274,35 +274,21 @@
         </div>
 
         <div class="card mt-3">
-            <div class="card-header"><i class="bi bi-clock-history"></i> 定时自动采集</div>
-            <div class="card-body">
-                <div class="form-check form-switch mb-3">
-                    <input class="form-check-input" type="checkbox" id="autoScrapeEnabled"
-                           {{ 'checked' if settings.auto_scrape_enabled }}>
-                    <label class="form-check-label" for="autoScrapeEnabled">启用定时采集</label>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label">采集间隔（小时）</label>
-                    <input type="number" class="form-control" id="autoScrapeInterval"
-                           value="{{ settings.auto_scrape_interval }}" min="1" max="168">
-                    <small class="text-secondary">每隔 N 小时自动对主库所有 ASIN 发起重新采集</small>
-                </div>
-                <div class="text-secondary" style="font-size:0.8rem;">
-                    <div>上次采集:
-                        <span id="lastRunTime">
-                            {% if settings.auto_scrape_last_run %}
-                            --
-                            {% else %}
-                            尚未运行
-                            {% endif %}
-                        </span>
-                    </div>
-                    <div>下次预计: <span id="nextRunTime">--</span></div>
-                </div>
-                <button class="btn btn-sm btn-accent mt-2" onclick="saveAutoScrape()">
-                    <i class="bi bi-check-lg"></i> 保存定时设置
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-clock-history"></i> 定时自动采集</span>
+                <button class="btn btn-sm btn-accent" onclick="addSchedule()">
+                    <i class="bi bi-plus-lg"></i> 新增
                 </button>
-                <div id="autoScrapeResult" class="mt-2" style="display:none;"></div>
+            </div>
+            <div class="card-body">
+                <small class="text-secondary d-block mb-3">
+                    设置每天定时对主库所有 ASIN 发起重新采集，支持多个时间点。
+                </small>
+                <div id="scheduleList"></div>
+                <div id="scheduleEmpty" class="text-secondary text-center py-3" style="display:none;">
+                    暂无定时任务，点击"新增"添加
+                </div>
+                <div id="scheduleResult" class="mt-2" style="display:none;"></div>
             </div>
         </div>
 
@@ -440,65 +426,115 @@ async function resetDefaults() {
     }
 }
 
-// 定时采集
-async function saveAutoScrape() {
-    const enabled = document.getElementById('autoScrapeEnabled').checked;
-    const interval = parseInt(document.getElementById('autoScrapeInterval').value) || 24;
-    const resultDiv = document.getElementById('autoScrapeResult');
+// 定时采集 — 多任务管理
+let _schedules = [];
 
+async function loadSchedules() {
     try {
-        const resp = await fetch('/api/settings', {
+        const resp = await fetch('/api/auto-scrape/schedules');
+        const data = await resp.json();
+        _schedules = data.schedules || [];
+        renderSchedules();
+    } catch(e) {
+        console.error('加载定时任务失败:', e);
+    }
+}
+
+function renderSchedules() {
+    const list = document.getElementById('scheduleList');
+    const empty = document.getElementById('scheduleEmpty');
+    if (!_schedules.length) {
+        list.innerHTML = '';
+        empty.style.display = '';
+        return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = _schedules.map((s, i) => {
+        const statusText = s.last_run_date
+            ? `上次运行: ${s.last_run_date}`
+            : '尚未运行';
+        const enabledClass = s.enabled ? 'text-success' : 'text-secondary';
+        const enabledIcon = s.enabled ? 'bi-check-circle-fill' : 'bi-pause-circle';
+        const enabledTitle = s.enabled ? '点击禁用' : '点击启用';
+        return `<div class="d-flex align-items-center gap-2 mb-2 p-2 rounded" style="background:var(--card-bg); border:1px solid var(--border);">
+            <button class="btn btn-sm ${enabledClass}" onclick="toggleSchedule(${i})" title="${enabledTitle}" style="border:none; background:none;">
+                <i class="bi ${enabledIcon}" style="font-size:1.1rem;"></i>
+            </button>
+            <span style="font-size:1.2rem; font-weight:600; font-family:monospace; min-width:60px;">${s.time}</span>
+            <span class="text-secondary" style="font-size:0.75rem; flex:1;">${statusText}</span>
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteSchedule(${i})" title="删除">
+                <i class="bi bi-trash3"></i>
+            </button>
+        </div>`;
+    }).join('');
+}
+
+async function addSchedule() {
+    const timeStr = prompt('输入每天执行时间（HH:MM 格式，如 13:35）');
+    if (!timeStr) return;
+    const resultDiv = document.getElementById('scheduleResult');
+    try {
+        const resp = await fetch('/api/auto-scrape/schedules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ time: timeStr }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+            showScheduleMsg('success', '已添加');
+        } else {
+            showScheduleMsg('danger', data.detail || '添加失败');
+        }
+    } catch(e) {
+        showScheduleMsg('danger', '网络错误: ' + e.message);
+    }
+}
+
+async function toggleSchedule(index) {
+    const current = _schedules[index];
+    try {
+        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                auto_scrape_enabled: enabled,
-                auto_scrape_interval: interval,
-            }),
+            body: JSON.stringify({ enabled: !current.enabled }),
         });
-        const result = await resp.json();
+        const data = await resp.json();
         if (resp.ok) {
-            resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-success py-1">已保存</div>';
-            updateAutoScrapeStatus(result.settings);
-        } else {
-            resultDiv.style.display = 'block';
-            resultDiv.innerHTML = '<div class="alert alert-danger py-1">保存失败</div>';
+            _schedules = data.schedules;
+            renderSchedules();
         }
-    } catch(err) {
-        resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<div class="alert alert-danger py-1">网络错误: ${err.message}</div>`;
-    }
-    setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
-}
-
-function updateAutoScrapeStatus(settings) {
-    const lastRun = settings.auto_scrape_last_run;
-    const interval = (settings.auto_scrape_interval || 24) * 3600;
-    const lastEl = document.getElementById('lastRunTime');
-    const nextEl = document.getElementById('nextRunTime');
-
-    if (lastRun && lastRun > 0) {
-        const d = new Date(lastRun * 1000);
-        lastEl.textContent = d.toLocaleString();
-        if (settings.auto_scrape_enabled) {
-            const nextTime = new Date((lastRun + interval) * 1000);
-            nextEl.textContent = nextTime.toLocaleString();
-        } else {
-            nextEl.textContent = '已禁用';
-        }
-    } else {
-        lastEl.textContent = '尚未运行';
-        nextEl.textContent = settings.auto_scrape_enabled ? '等待首次运行...' : '已禁用';
+    } catch(e) {
+        console.error('切换失败:', e);
     }
 }
 
-// 页面加载时更新状态
+async function deleteSchedule(index) {
+    if (!confirm(`确定删除 ${_schedules[index].time} 的定时任务？`)) return;
+    try {
+        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+            showScheduleMsg('success', '已删除');
+        }
+    } catch(e) {
+        showScheduleMsg('danger', '删除失败: ' + e.message);
+    }
+}
+
+function showScheduleMsg(type, msg) {
+    const div = document.getElementById('scheduleResult');
+    div.style.display = 'block';
+    div.innerHTML = `<div class="alert alert-${type} py-1">${msg}</div>`;
+    setTimeout(() => { div.style.display = 'none'; }, 2000);
+}
+
+// 页面加载时获取定时任务列表
 document.addEventListener('DOMContentLoaded', () => {
-    updateAutoScrapeStatus({
-        auto_scrape_last_run: {{ settings.auto_scrape_last_run or 0 }},
-        auto_scrape_interval: {{ settings.auto_scrape_interval or 24 }},
-        auto_scrape_enabled: {{ 'true' if settings.auto_scrape_enabled else 'false' }},
-    });
+    loadSchedules();
 });
 </script>
 {% endblock %}
