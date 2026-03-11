@@ -803,20 +803,49 @@ class Database:
 
     async def batch_submit_results(self, results_list: List[Dict], result_fields: List[str]) -> int:
         """
-        批量提交采集结果（写锁保护，防止与 pull_tasks 事务冲突）
-
-        Args:
-            results_list: [{"task_id": int, "worker_id": str, "success": bool, "result": dict, ...}]
-            result_fields: 结果表的字段列表
-
-        Returns:
-            成功处理的条目数
+        批量提交采集结果（ASIN 主表模式，含变动对比）
         """
         if not results_list:
             return 0
 
         async with self._write_lock:
             try:
+                # 收集所有成功 ASIN，一次性查旧数据
+                success_items = []
+                for item in results_list:
+                    if item.get("success") and item.get("result"):
+                        success_items.append(item)
+
+                # 批量查旧数据
+                old_map = {}
+                if success_items:
+                    asins = [it["result"].get("asin") for it in success_items if it["result"].get("asin")]
+                    if asins:
+                        placeholders = ",".join(["?"] * len(asins))
+                        async with self._db.execute(
+                            f"SELECT * FROM results WHERE asin IN ({placeholders})", asins
+                        ) as cursor:
+                            rows = await cursor.fetchall()
+                            for row in rows:
+                                old_map[row["asin"]] = dict(row)
+
+                # 批量分配 change_seq：先取基准值
+                change_count = 0
+                items_needing_seq = []
+
+                all_fields = ["batch_name", "asin"] + [f for f in result_fields if f != "asin"]
+                update_fields = [f for f in all_fields if f not in ("id", "asin", "created_at", "screenshot_path")]
+                update_parts = [f"{f}=excluded.{f}" for f in update_fields]
+                update_parts.append(
+                    "screenshot_path=COALESCE(NULLIF(excluded.screenshot_path,''), results.screenshot_path)")
+                update_clause = ", ".join(update_parts)
+                field_names = ",".join(all_fields)
+                pholders = ",".join(["?"] * len(all_fields))
+                sql = (f"INSERT INTO results ({field_names}) VALUES ({pholders}) "
+                       f"ON CONFLICT(asin) DO UPDATE SET {update_clause}")
+
+                now_iso = datetime.now().isoformat()
+
                 for item in results_list:
                     task_id = item.get("task_id")
                     worker_id = item.get("worker_id", "unknown")
@@ -825,22 +854,23 @@ class Database:
                     now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
                     if success and result_data:
-                        # 保存结果
-                        fields = ["batch_name", "asin"] + [f for f in result_fields if f != "asin"]
-                        values = [result_data.get(f, "") for f in fields]
-                        placeholders = ",".join(["?"] * len(fields))
-                        field_names = ",".join(fields)
-                        await self._db.execute(
-                            f"INSERT OR REPLACE INTO results ({field_names}) VALUES ({placeholders})",
-                            values
-                        )
-                        # 标记任务完成
+                        asin = result_data.get("asin")
+                        old = old_map.get(asin)
+                        has_change = self._apply_change_detection(result_data, old)
+
+                        result_data["updated_at"] = now_iso
+                        if has_change:
+                            result_data["last_change_at"] = now_iso
+                            change_count += 1
+                            items_needing_seq.append(result_data)
+
+                        values = [result_data.get(f, "") for f in all_fields]
+                        await self._db.execute(sql, values)
                         await self._db.execute(
                             "UPDATE tasks SET status = 'done', worker_id = ?, updated_at = ? WHERE id = ?",
                             (worker_id, now, task_id)
                         )
                     else:
-                        # 标记任务失败（含错误分类）
                         error_type = item.get("error_type")
                         error_detail = item.get("error_detail")
                         await self._db.execute(
@@ -851,7 +881,23 @@ class Database:
                             (worker_id, error_type, error_detail, now, task_id)
                         )
 
-                # 整批统一 commit（在锁内完成，不会被其他操作打断）
+                # 批量分配 change_seq
+                if items_needing_seq:
+                    async with self._db.execute(
+                        "SELECT value FROM counters WHERE name = 'change_seq'"
+                    ) as c:
+                        base = (await c.fetchone())[0]
+                    for i, rd in enumerate(items_needing_seq):
+                        rd["change_seq"] = base + i + 1
+                        await self._db.execute(
+                            "UPDATE results SET change_seq = ?, last_change_at = ? WHERE asin = ?",
+                            (rd["change_seq"], rd["last_change_at"], rd["asin"])
+                        )
+                    await self._db.execute(
+                        "UPDATE counters SET value = ? WHERE name = 'change_seq'",
+                        (base + len(items_needing_seq),)
+                    )
+
                 await self._db.commit()
             except Exception:
                 try:

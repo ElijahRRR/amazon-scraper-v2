@@ -25,7 +25,7 @@
     "category": "core",
     "description": "batch_submit_results 批量对比 + change_seq 批量分配",
     "steps": ["一次性查询旧数据", "批量 change_seq 分配", "ON CONFLICT 批量写入", "任务状态更新不变"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 5,
