@@ -205,7 +205,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_name);
             CREATE INDEX IF NOT EXISTS idx_tasks_batch_asin ON tasks(batch_name, asin);
             CREATE INDEX IF NOT EXISTS idx_results_batch ON results(batch_name);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_results_asin_unique ON results(asin);
+            -- idx_results_asin_unique 由 _migrate_v2() 在去重后创建
         """)
 
         # 迁移：为已存在的表添加新列（CREATE TABLE IF NOT EXISTS 不会修改已有表）
