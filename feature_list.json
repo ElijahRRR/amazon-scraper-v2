@@ -88,6 +88,6 @@
     "category": "ui",
     "description": "settings.html: 定时采集设置卡片",
     "steps": ["开关 checkbox", "间隔输入框", "状态显示", "JS 提交包含 bool 值"],
-    "passes": false
+    "passes": true
   }
 ]

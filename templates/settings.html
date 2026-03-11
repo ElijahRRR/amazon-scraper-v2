@@ -273,6 +273,39 @@
             </div>
         </div>
 
+        <div class="card mt-3">
+            <div class="card-header"><i class="bi bi-clock-history"></i> 定时自动采集</div>
+            <div class="card-body">
+                <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" id="autoScrapeEnabled"
+                           {{ 'checked' if settings.auto_scrape_enabled }}>
+                    <label class="form-check-label" for="autoScrapeEnabled">启用定时采集</label>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">采集间隔（小时）</label>
+                    <input type="number" class="form-control" id="autoScrapeInterval"
+                           value="{{ settings.auto_scrape_interval }}" min="1" max="168">
+                    <small class="text-secondary">每隔 N 小时自动对主库所有 ASIN 发起重新采集</small>
+                </div>
+                <div class="text-secondary" style="font-size:0.8rem;">
+                    <div>上次采集:
+                        <span id="lastRunTime">
+                            {% if settings.auto_scrape_last_run %}
+                            --
+                            {% else %}
+                            尚未运行
+                            {% endif %}
+                        </span>
+                    </div>
+                    <div>下次预计: <span id="nextRunTime">--</span></div>
+                </div>
+                <button class="btn btn-sm btn-accent mt-2" onclick="saveAutoScrape()">
+                    <i class="bi bi-check-lg"></i> 保存定时设置
+                </button>
+                <div id="autoScrapeResult" class="mt-2" style="display:none;"></div>
+            </div>
+        </div>
+
     </div>
 </div>
 {% endblock %}
@@ -406,5 +439,66 @@ async function resetDefaults() {
         resultDiv.appendChild(alertDiv);
     }
 }
+
+// 定时采集
+async function saveAutoScrape() {
+    const enabled = document.getElementById('autoScrapeEnabled').checked;
+    const interval = parseInt(document.getElementById('autoScrapeInterval').value) || 24;
+    const resultDiv = document.getElementById('autoScrapeResult');
+
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                auto_scrape_enabled: enabled,
+                auto_scrape_interval: interval,
+            }),
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-success py-1">已保存</div>';
+            updateAutoScrapeStatus(result.settings);
+        } else {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-danger py-1">保存失败</div>';
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = `<div class="alert alert-danger py-1">网络错误: ${err.message}</div>`;
+    }
+    setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
+}
+
+function updateAutoScrapeStatus(settings) {
+    const lastRun = settings.auto_scrape_last_run;
+    const interval = (settings.auto_scrape_interval || 24) * 3600;
+    const lastEl = document.getElementById('lastRunTime');
+    const nextEl = document.getElementById('nextRunTime');
+
+    if (lastRun && lastRun > 0) {
+        const d = new Date(lastRun * 1000);
+        lastEl.textContent = d.toLocaleString();
+        if (settings.auto_scrape_enabled) {
+            const nextTime = new Date((lastRun + interval) * 1000);
+            nextEl.textContent = nextTime.toLocaleString();
+        } else {
+            nextEl.textContent = '已禁用';
+        }
+    } else {
+        lastEl.textContent = '尚未运行';
+        nextEl.textContent = settings.auto_scrape_enabled ? '等待首次运行...' : '已禁用';
+    }
+}
+
+// 页面加载时更新状态
+document.addEventListener('DOMContentLoaded', () => {
+    updateAutoScrapeStatus({
+        auto_scrape_last_run: {{ settings.auto_scrape_last_run or 0 }},
+        auto_scrape_interval: {{ settings.auto_scrape_interval or 24 }},
+        auto_scrape_enabled: {{ 'true' if settings.auto_scrape_enabled else 'false' }},
+    });
+});
 </script>
 {% endblock %}
