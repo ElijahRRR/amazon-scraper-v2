@@ -4,7 +4,9 @@ Amazon 产品采集系统 v2 - 数据库操作模块
 包含 tasks 和 results 两张表的完整 CRUD
 """
 import os
+import re
 import time
+import hashlib
 import aiosqlite
 import asyncio
 from typing import List, Optional, Dict, Any
@@ -16,6 +18,86 @@ import config
 from models import Task, Result, RESULT_FIELDS
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== 变动对比辅助函数 ====================
+
+def _parse_price_float(s) -> Optional[float]:
+    """解析价格字符串为 float（移除 $, ¥, 逗号等）"""
+    if not s:
+        return None
+    s = str(s).strip().replace(",", "")
+    # 移除货币符号
+    s = re.sub(r'^[^\d.-]+', '', s)
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _compare_price(old_str, new_str) -> Optional[str]:
+    """价格对比，返回 'up'/'down'/None"""
+    old_val = _parse_price_float(old_str)
+    new_val = _parse_price_float(new_str)
+    if old_val is None or new_val is None:
+        return None
+    if new_val > old_val:
+        return "up"
+    elif new_val < old_val:
+        return "down"
+    return None
+
+
+def _compare_stock_qty(old_str, new_str) -> Optional[str]:
+    """库存数量对比，返回 'up'/'down'/None"""
+    def parse_int(s):
+        if not s:
+            return None
+        s = str(s).strip().replace(",", "")
+        m = re.search(r'(\d+)', s)
+        return int(m.group(1)) if m else None
+    old_val = parse_int(old_str)
+    new_val = parse_int(new_str)
+    if old_val is None or new_val is None:
+        return None
+    if new_val > old_val:
+        return "up"
+    elif new_val < old_val:
+        return "down"
+    return None
+
+
+def _compare_stock_status(old_str, new_str) -> Optional[str]:
+    """库存状态对比，返回 'changed'/None"""
+    def normalize(s):
+        return str(s or "").strip().lower()
+    old_n = normalize(old_str)
+    new_n = normalize(new_str)
+    if not old_n or not new_n:
+        return None
+    if old_n != new_n:
+        return "changed"
+    return None
+
+
+# 稳定白名单字段（排除高波动字段）
+_HASH_FIELDS = [
+    "title", "brand", "product_type", "manufacturer", "model_number",
+    "part_number", "country_of_origin", "is_customized", "best_sellers_rank",
+    "bullet_points", "long_description", "image_urls",
+    "upc_list", "ean_list", "parent_asin", "variation_asins",
+    "root_category_id", "category_ids", "category_tree",
+    "first_available_date", "package_dimensions", "package_weight",
+    "item_dimensions", "item_weight",
+]
+
+
+def _compute_content_hash(data: dict) -> str:
+    """基于白名单字段计算 MD5 hash"""
+    parts = []
+    for f in _HASH_FIELDS:
+        parts.append(str(data.get(f, "") or ""))
+    return hashlib.md5("|".join(parts).encode()).hexdigest()
 
 
 class Database:
@@ -449,20 +531,93 @@ class Database:
 
     # ==================== 结果操作 ====================
 
+    async def _get_result_by_asin(self, asin: str) -> Optional[Dict]:
+        """通过 ASIN 查询当前主表数据（不加锁，调用方持有写锁）"""
+        async with self._db.execute(
+            "SELECT * FROM results WHERE asin = ? LIMIT 1", (asin,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def _next_change_seq(self) -> int:
+        """递增并返回全局变动序列号（调用方持有写锁）"""
+        await self._db.execute(
+            "UPDATE counters SET value = value + 1 WHERE name = 'change_seq'")
+        async with self._db.execute(
+            "SELECT value FROM counters WHERE name = 'change_seq'"
+        ) as c:
+            return (await c.fetchone())[0]
+
+    def _apply_change_detection(self, result_data: Dict, old: Optional[Dict]) -> bool:
+        """对比新旧数据，填充变动字段，返回是否有变动"""
+        has_change = False
+        if old:
+            # 价格变动
+            result_data["prev_current_price"] = old.get("current_price") or ""
+            result_data["prev_buybox_price"] = old.get("buybox_price") or ""
+            result_data["price_change"] = _compare_price(
+                old.get("current_price"), result_data.get("current_price")) or ""
+            # 库存数量变动
+            result_data["prev_stock_count"] = old.get("stock_count") or ""
+            result_data["stock_qty_change"] = _compare_stock_qty(
+                old.get("stock_count"), result_data.get("stock_count")) or ""
+            # 库存状态变动
+            result_data["prev_stock_status"] = old.get("stock_status") or ""
+            result_data["stock_status_change"] = _compare_stock_status(
+                old.get("stock_status"), result_data.get("stock_status")) or ""
+            # 其他字段（content_hash）
+            new_hash = _compute_content_hash(result_data)
+            old_hash = old.get("content_hash") or ""
+            result_data["other_change"] = 1 if (new_hash != old_hash and old_hash) else 0
+            result_data["content_hash"] = new_hash
+            result_data["is_new"] = 0
+
+            has_change = any([
+                result_data["price_change"],
+                result_data["stock_qty_change"],
+                result_data["stock_status_change"],
+                result_data["other_change"],
+            ])
+        else:
+            result_data["content_hash"] = _compute_content_hash(result_data)
+            result_data["is_new"] = 1
+            has_change = True
+
+        return has_change
+
     async def save_result(self, result_data: Dict[str, Any]) -> int:
         """
-        保存采集结果
-        使用 INSERT OR REPLACE 避免重复（基于 batch_name + asin 唯一索引）
+        保存采集结果（ASIN 主表模式）
+        INSERT ... ON CONFLICT(asin) DO UPDATE + 变动对比
         """
-        # 构建字段列表
-        fields = ["batch_name", "asin"] + [f for f in RESULT_FIELDS if f != "asin"]
-        values = [result_data.get(f, "") for f in fields]
-        placeholders = ",".join(["?"] * len(fields))
-        field_names = ",".join(fields)
+        asin = result_data.get("asin")
+        # 构建字段列表：batch_name + RESULT_FIELDS 中除 asin 外的字段 + asin
+        all_fields = ["batch_name", "asin"] + [f for f in RESULT_FIELDS if f != "asin"]
 
         async with self._write_lock:
+            old = await self._get_result_by_asin(asin)
+            has_change = self._apply_change_detection(result_data, old)
+
+            now = datetime.now().isoformat()
+            result_data["updated_at"] = now
+            if has_change:
+                result_data["last_change_at"] = now
+                result_data["change_seq"] = await self._next_change_seq()
+
+            values = [result_data.get(f, "") for f in all_fields]
+            placeholders = ",".join(["?"] * len(all_fields))
+            field_names = ",".join(all_fields)
+
+            # ON CONFLICT(asin) DO UPDATE: 不更新 id, created_at; screenshot_path 仅非空时更新
+            update_fields = [f for f in all_fields if f not in ("id", "asin", "created_at", "screenshot_path")]
+            update_parts = [f"{f}=excluded.{f}" for f in update_fields]
+            update_parts.append(
+                "screenshot_path=COALESCE(NULLIF(excluded.screenshot_path,''), results.screenshot_path)")
+            update_clause = ", ".join(update_parts)
+
             await self._db.execute(
-                f"INSERT OR REPLACE INTO results ({field_names}) VALUES ({placeholders})",
+                f"INSERT INTO results ({field_names}) VALUES ({placeholders}) "
+                f"ON CONFLICT(asin) DO UPDATE SET {update_clause}",
                 values
             )
             await self._db.commit()

@@ -18,7 +18,7 @@
     "category": "core",
     "description": "save_result ON CONFLICT DO UPDATE + 变动对比 + change_seq",
     "steps": ["辅助函数 _compare_price/_compare_stock_qty/_compare_stock_status/_compute_content_hash", "save_result 查旧数据+对比+ON CONFLICT", "_next_change_seq 计数器", "screenshot_path COALESCE 保护"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 4,
