@@ -542,10 +542,11 @@ async def get_results(
     page: int = Query(1),
     per_page: int = Query(50),
     search: str = Query(None),
+    change_filter: str = Query("all"),
 ):
     """分页获取采集结果"""
     db = await get_db()
-    results, total = await db.get_results(batch_name, page, per_page, search)
+    results, total = await db.get_results(batch_name, page, per_page, search, change_filter)
     return {
         "results": results,
         "total": total,

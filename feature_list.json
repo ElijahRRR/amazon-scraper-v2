@@ -32,7 +32,7 @@
     "category": "core",
     "description": "get_results EXISTS 批次筛选 + change_filter + server 路由传递",
     "steps": ["EXISTS 替代 WHERE batch_name", "5种 change_filter 条件", "search 保持", "server get_results 路由传 change_filter"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 6,

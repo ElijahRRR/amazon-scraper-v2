@@ -623,27 +623,51 @@ class Database:
             await self._db.commit()
         return self._db.total_changes
 
-    async def get_results(self, batch_name: str = None, page: int = 1, per_page: int = 50,
-                          search: str = None) -> tuple:
-        """
-        获取采集结果（分页）
-        返回: (results_list, total_count)
-        """
+    def _build_where(self, batch_name=None, search=None, change_filter="all"):
+        """构建 WHERE 子句（复用于 get_results / count_results / iter_results）"""
         conditions = []
         params = []
 
         if batch_name:
-            conditions.append("batch_name = ?")
+            conditions.append(
+                "EXISTS (SELECT 1 FROM tasks t WHERE t.batch_name = ? AND t.asin = r.asin AND t.status = 'done')")
             params.append(batch_name)
+
+        if change_filter == "price_stock_changed":
+            conditions.append(
+                "(r.price_change IS NOT NULL AND r.price_change != '' "
+                "OR r.stock_qty_change IS NOT NULL AND r.stock_qty_change != '' "
+                "OR r.stock_status_change IS NOT NULL AND r.stock_status_change != '')")
+        elif change_filter == "other_changed":
+            conditions.append(
+                "r.other_change = 1 AND (r.price_change IS NULL OR r.price_change = '') "
+                "AND (r.stock_qty_change IS NULL OR r.stock_qty_change = '') "
+                "AND (r.stock_status_change IS NULL OR r.stock_status_change = '')")
+        elif change_filter == "unchanged":
+            conditions.append(
+                "(r.price_change IS NULL OR r.price_change = '') "
+                "AND (r.stock_qty_change IS NULL OR r.stock_qty_change = '') "
+                "AND (r.stock_status_change IS NULL OR r.stock_status_change = '') "
+                "AND (r.other_change IS NULL OR r.other_change = 0) "
+                "AND (r.is_new IS NULL OR r.is_new = 0)")
+        elif change_filter == "new":
+            conditions.append("r.is_new = 1")
+
         if search:
-            conditions.append("(asin LIKE ? OR title LIKE ?)")
+            conditions.append("(r.asin LIKE ? OR r.title LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        return where, params
+
+    async def get_results(self, batch_name: str = None, page: int = 1, per_page: int = 50,
+                          search: str = None, change_filter: str = "all") -> tuple:
+        """获取采集结果（分页，EXISTS 批次筛选 + change_filter）"""
+        where, params = self._build_where(batch_name, search, change_filter)
 
         # 获取总数
         async with self._db.execute(
-            f"SELECT COUNT(*) as cnt FROM results {where}", params
+            f"SELECT COUNT(*) as cnt FROM results r {where}", params
         ) as cursor:
             row = await cursor.fetchone()
             total = row["cnt"]
@@ -651,7 +675,7 @@ class Database:
         # 获取分页数据
         offset = (page - 1) * per_page
         async with self._db.execute(
-            f"SELECT * FROM results {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT r.* FROM results r {where} ORDER BY r.id DESC LIMIT ? OFFSET ?",
             params + [per_page, offset]
         ) as cursor:
             rows = await cursor.fetchall()
