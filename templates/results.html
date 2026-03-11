@@ -129,14 +129,14 @@
                         <td>{{ r.buybox_price or 'N/A' }}</td>
                         <td>{{ r.brand or 'N/A' }}</td>
                         <td>
-                            {{ r.stock_status or 'N/A' }}
+                            {{ r.stock_count or 'N/A' }}
                             {% if r.stock_qty_change == 'up' %}
                             <span class="text-success" title="上次: {{ r.prev_stock_count }}">↑</span>
                             {% elif r.stock_qty_change == 'down' %}
                             <span class="text-danger" title="上次: {{ r.prev_stock_count }}">↓</span>
                             {% endif %}
                             {% if r.stock_status_change == 'changed' %}
-                            <span class="text-warning" title="上次: {{ r.prev_stock_status }}">●</span>
+                            <span class="text-warning" title="状态变动 上次: {{ r.prev_stock_status }}">●</span>
                             {% endif %}
                         </td>
                         <td>
@@ -374,7 +374,7 @@ function renderResults(results) {
             <td>${esc(r.current_price || 'N/A')} ${priceChange}</td>
             <td>${esc(r.buybox_price || 'N/A')}</td>
             <td>${esc(r.brand || 'N/A')}</td>
-            <td>${esc(r.stock_status || 'N/A')} ${stockQtyChange} ${stockStatusChange}</td>
+            <td>${esc(r.stock_count || 'N/A')} ${stockQtyChange} ${stockStatusChange}</td>
             <td>${fbaCell}</td>
             <td>${esc(r.delivery_date || 'N/A')}</td>
             <td><small class="text-secondary">${esc(r.crawl_time || '')}</small></td>

@@ -21,3 +21,10 @@
 - #12: results.html 变动筛选 + 变动标记 + 导出字段选择 Modal
 - #13: settings.html 定时采集设置卡片
 - Issues: None
+
+### Session 2 - 2026-03-11 用户反馈修复
+- Fix: results.html changeFilter 下拉框样式统一（移除 form-select-sm）
+- Redesign: 定时采集从间隔模式改为多任务时间点模式
+  - 支持多个 HH:MM 定时任务，CRUD 端点 /api/auto-scrape/schedules
+  - settings.html 动态列表 UI（新增/删除/启用禁用）
+  - 移除旧的 auto_scrape_enabled/interval/last_run 单任务设置
