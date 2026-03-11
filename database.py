@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 
 # ==================== 变动对比辅助函数 ====================
 
+# 用于判断采集结果是否为解析失败的"空壳"数据
+_NA_VALUES = {"", "N/A", "n/a", "None", "none", None}
+
+
+def _is_parse_failure(data: dict) -> bool:
+    """检测采集结果是否为解析失败（关键字段全为 N/A / 空）。
+    如果价格、库存、品牌全部缺失，视为页面解析失败，不应覆盖已有数据。
+    """
+    key_fields = ["current_price", "buybox_price", "stock_count", "stock_status", "brand"]
+    return all(data.get(f) in _NA_VALUES for f in key_fields)
+
 def _parse_price_float(s) -> Optional[float]:
     """解析价格字符串为 float（移除 $, ¥, 逗号等）"""
     if not s:
@@ -70,10 +81,11 @@ def _compare_stock_qty(old_str, new_str) -> Optional[str]:
 def _compare_stock_status(old_str, new_str) -> Optional[str]:
     """库存状态对比，返回 'changed'/None"""
     def normalize(s):
-        return str(s or "").strip().lower()
+        v = str(s or "").strip().lower()
+        return None if v in ("", "n/a", "none") else v
     old_n = normalize(old_str)
     new_n = normalize(new_str)
-    if not old_n or not new_n:
+    if old_n is None or new_n is None:
         return None
     if old_n != new_n:
         return "changed"
@@ -596,6 +608,12 @@ class Database:
 
         async with self._write_lock:
             old = await self._get_result_by_asin(asin)
+
+            # 解析失败保护：新数据关键字段全为 N/A 且旧数据存在 → 跳过更新
+            if old and _is_parse_failure(result_data):
+                logger.warning(f"跳过 ASIN {asin} 的空壳数据覆盖（解析失败）")
+                return 0
+
             has_change = self._apply_change_detection(result_data, old)
 
             now = datetime.now().isoformat()
@@ -900,6 +918,16 @@ class Database:
                     if success and result_data:
                         asin = result_data.get("asin")
                         old = old_map.get(asin)
+
+                        # 解析失败保护：新数据关键字段全为 N/A 且旧数据存在 → 跳过，仅标记任务完成
+                        if old and _is_parse_failure(result_data):
+                            logger.warning(f"跳过 ASIN {asin} 的空壳数据覆盖（解析失败）")
+                            await self._db.execute(
+                                "UPDATE tasks SET status = 'done', worker_id = ?, updated_at = ? WHERE id = ?",
+                                (worker_id, now, task_id)
+                            )
+                            continue
+
                         has_change = self._apply_change_detection(result_data, old)
 
                         result_data["updated_at"] = now_iso
