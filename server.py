@@ -1498,32 +1498,6 @@ python worker.py --server "$SERVER" "$@"
     )
 
 
-@app.get("/api/tool/export-local")
-async def download_export_local():
-    """下载本地导出工具 export_local.py"""
-    fpath = os.path.join(config.BASE_DIR, "export_local.py")
-    if not os.path.isfile(fpath):
-        raise HTTPException(status_code=404, detail="export_local.py 不存在")
-    return FileResponse(
-        fpath,
-        media_type="application/octet-stream",
-        filename="export_local.py",
-    )
-
-
-@app.get("/api/tool/build-exe")
-async def download_build_exe():
-    """下载 Windows 一键打包脚本 build_exe.bat"""
-    fpath = os.path.join(config.BASE_DIR, "build_exe.bat")
-    if not os.path.isfile(fpath):
-        raise HTTPException(status_code=404, detail="build_exe.bat 不存在")
-    return FileResponse(
-        fpath,
-        media_type="application/octet-stream",
-        filename="build_exe.bat",
-    )
-
-
 # ==================== Web UI 路由 ====================
 
 @app.get("/", response_class=HTMLResponse)
