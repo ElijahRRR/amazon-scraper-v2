@@ -67,7 +67,7 @@
     "category": "core",
     "description": "update_screenshot_path 适配新唯一索引 (asin only)",
     "steps": ["WHERE 条件改为仅 asin"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 11,

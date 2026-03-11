@@ -521,11 +521,11 @@ class Database:
         return result.rowcount
 
     async def update_screenshot_path(self, batch_name: str, asin: str, path: str):
-        """更新结果记录的截图路径"""
+        """更新结果记录的截图路径（ASIN 主表模式，仅按 asin 定位）"""
         async with self._write_lock:
             await self._db.execute(
-                "UPDATE results SET screenshot_path = ? WHERE batch_name = ? AND asin = ?",
-                (path, batch_name, asin)
+                "UPDATE results SET screenshot_path = ? WHERE asin = ?",
+                (path, asin)
             )
             await self._db.commit()
 
@@ -683,11 +683,10 @@ class Database:
 
         return results, total
 
-    async def get_result_by_asin(self, batch_name: str, asin: str) -> Optional[Dict]:
-        """获取单个 ASIN 的采集结果"""
+    async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
+        """获取单个 ASIN 的采集结果（ASIN 主表，唯一索引）"""
         async with self._db.execute(
-            "SELECT * FROM results WHERE batch_name = ? AND asin = ? ORDER BY id DESC LIMIT 1",
-            (batch_name, asin)
+            "SELECT * FROM results WHERE asin = ? LIMIT 1", (asin,)
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
