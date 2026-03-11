@@ -452,19 +452,20 @@ class Database:
             return [dict(row) for row in rows]
 
     async def iter_results(self, batch_name: str, chunk_size: int = 500):
-        """分批迭代某批次的结果（流式导出，避免一次性加载全部数据到内存）"""
-        offset = 0
+        """分批迭代某批次的结果（游标分页，恒定 O(1) 每批，不随数据量退化）"""
+        last_id = 0
         while True:
             async with self._db.execute(
-                "SELECT * FROM results WHERE batch_name = ? ORDER BY id ASC LIMIT ? OFFSET ?",
-                (batch_name, chunk_size, offset)
+                "SELECT * FROM results WHERE batch_name = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (batch_name, last_id, chunk_size)
             ) as cursor:
                 rows = await cursor.fetchall()
                 if not rows:
                     break
                 for row in rows:
-                    yield dict(row)
-                offset += chunk_size
+                    d = dict(row)
+                    yield d
+                last_id = rows[-1]["id"]
 
     # ==================== 统计与进度 ====================
 

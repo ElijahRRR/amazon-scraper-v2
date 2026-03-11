@@ -721,7 +721,8 @@ def _get_export_headers():
 
 
 async def _export_excel_streaming(db, batch_name: str):
-    """流式导出 Excel 文件（write_only 模式，写入后立即释放内存）"""
+    """导出 Excel 文件（write_only 模式，写入临时文件避免内存峰值）"""
+    import tempfile
     headers, field_keys = _get_export_headers()
     wb = openpyxl.Workbook(write_only=True)
     ws = wb.create_sheet(title="采集结果")
@@ -737,13 +738,31 @@ async def _export_excel_streaming(db, batch_name: str):
         wb.close()
         raise HTTPException(status_code=404, detail="该批次无数据")
 
-    output = io.BytesIO()
-    wb.save(output)
+    # 写入临时文件而非 BytesIO，避免整个 xlsx 驻留内存
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        wb.save(tmp_path)
+    except Exception:
+        wb.close()
+        os.unlink(tmp_path)
+        raise
     wb.close()
-    output.seek(0)
+
+    async def _stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            os.unlink(tmp_path)
 
     return StreamingResponse(
-        output,
+        _stream_and_cleanup(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={batch_name}.xlsx"},
     )
