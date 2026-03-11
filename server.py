@@ -561,17 +561,20 @@ async def export_data(
     batch_name: str,
     format: str = Query("excel"),
 ):
-    """导出采集数据（Excel/CSV）"""
+    """导出采集数据（Excel/CSV），使用流式读取避免大批次 OOM
+
+    超过 5000 条的大批次自动使用 CSV 格式（Excel 生成太慢且占 CPU）
+    """
     db = await get_db()
-    results = await db.get_all_results(batch_name)
 
-    if not results:
-        raise HTTPException(status_code=404, detail="该批次无数据")
+    # 查询批次数据量，大批次强制 CSV
+    progress = await db.get_progress(batch_name)
+    total = progress.get("done", 0)
 
-    if format == "csv":
-        return _export_csv(results, batch_name)
+    if format == "csv" or total > 5000:
+        return await _export_csv_streaming(db, batch_name)
     else:
-        return _export_excel(results, batch_name)
+        return await _export_excel_streaming(db, batch_name)
 
 
 @app.get("/api/export/{batch_name}/screenshots")
@@ -623,6 +626,51 @@ async def export_screenshots(batch_name: str):
     )
 
 
+@app.get("/api/export/{batch_name}/db")
+async def export_db(batch_name: str):
+    """导出批次数据为独立 SQLite 文件（轻量，服务器几乎零 CPU 开销）"""
+    import tempfile
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+    db = await get_db()
+
+    progress = await db.get_progress(batch_name)
+    if progress.get("done", 0) == 0:
+        raise HTTPException(status_code=404, detail="该批次无数据")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        await db._db.execute("ATTACH DATABASE ? AS export_db", (tmp_path,))
+        await db._db.execute(
+            "CREATE TABLE export_db.results AS SELECT * FROM results WHERE batch_name = ?",
+            (batch_name,)
+        )
+        await db._db.execute("DETACH DATABASE export_db")
+        await db._db.commit()
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+    async def _stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            os.unlink(tmp_path)
+
+    return StreamingResponse(
+        _stream_and_cleanup(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.db"'},
+    )
+
+
 def _parse_price(s: str) -> float | None:
     """解析 '$12.99' 格式的价格字符串为浮点数，失败返回 None。"""
     if not s or s == "N/A":
@@ -636,47 +684,62 @@ def _parse_price(s: str) -> float | None:
         return None
 
 
-def _prepare_export_rows(results: List[Dict]):
-    """准备导出数据，返回 (headers, field_keys, rows)。"""
-    field_keys = list(RESULT_FIELDS)
-    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
-    rows = [[str(row_data.get(f, "")) for f in field_keys] for row_data in results]
+
+def _prepare_single_row(row_data: Dict, field_keys: list, headers: list):
+    """处理单行数据，返回导出用的列表"""
+    row = [str(row_data.get(f, "")) for f in field_keys]
 
     # 在 "BuyBox 运费" 后插入 "总价" 列
     shipping_header = "BuyBox 运费"
     if shipping_header in headers:
         insert_idx = headers.index(shipping_header) + 1
+        price = _parse_price(str(row_data.get("buybox_price", "")))
+        shipping_str = str(row_data.get("buybox_shipping", ""))
+        if price is None:
+            total = "N/A"
+        elif shipping_str.upper() == "FREE":
+            total = f"${price:.2f}"
+        else:
+            shipping = _parse_price(shipping_str)
+            total = f"${price:.2f}" if shipping is None else f"${price + shipping:.2f}"
+        row.insert(insert_idx, total)
+
+    return row
+
+
+def _get_export_headers():
+    """获取导出表头"""
+    field_keys = list(RESULT_FIELDS)
+    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
+
+    shipping_header = "BuyBox 运费"
+    if shipping_header in headers:
+        insert_idx = headers.index(shipping_header) + 1
         headers.insert(insert_idx, "总价")
-        for i, row_data in enumerate(results):
-            price = _parse_price(str(row_data.get("buybox_price", "")))
-            shipping_str = str(row_data.get("buybox_shipping", ""))
-            if price is None:
-                total = "N/A"
-            elif shipping_str.upper() == "FREE":
-                total = f"${price:.2f}"
-            else:
-                shipping = _parse_price(shipping_str)
-                if shipping is None:
-                    total = f"${price:.2f}"
-                else:
-                    total = f"${price + shipping:.2f}"
-            rows[i].insert(insert_idx, total)
 
-    return headers, field_keys, rows
+    return headers, field_keys
 
 
-def _export_excel(results: List[Dict], batch_name: str):
-    """导出 Excel 文件"""
-    headers, _, rows = _prepare_export_rows(results)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "采集结果"
+async def _export_excel_streaming(db, batch_name: str):
+    """流式导出 Excel 文件（write_only 模式，写入后立即释放内存）"""
+    headers, field_keys = _get_export_headers()
+    wb = openpyxl.Workbook(write_only=True)
+    ws = wb.create_sheet(title="采集结果")
     ws.append(headers)
-    for row in rows:
+
+    count = 0
+    async for row_data in db.iter_results(batch_name):
+        row = _prepare_single_row(row_data, field_keys, headers)
         ws.append(row)
+        count += 1
+
+    if count == 0:
+        wb.close()
+        raise HTTPException(status_code=404, detail="该批次无数据")
 
     output = io.BytesIO()
     wb.save(output)
+    wb.close()
     output.seek(0)
 
     return StreamingResponse(
@@ -686,17 +749,27 @@ def _export_excel(results: List[Dict], batch_name: str):
     )
 
 
-def _export_csv(results: List[Dict], batch_name: str):
-    """导出 CSV 文件"""
-    headers, _, rows = _prepare_export_rows(results)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-    writer.writerows(rows)
+async def _export_csv_streaming(db, batch_name: str):
+    """流式导出 CSV 文件（分批读取数据库，避免大批次 OOM）"""
+    headers, field_keys = _get_export_headers()
 
-    content = output.getvalue().encode('utf-8-sig')
+    async def generate():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        yield output.getvalue().encode('utf-8-sig')
+
+        count = 0
+        async for row_data in db.iter_results(batch_name):
+            output = io.StringIO()
+            writer = csv.writer(output)
+            row = _prepare_single_row(row_data, field_keys, headers)
+            writer.writerow(row)
+            yield output.getvalue().encode('utf-8')
+            count += 1
+
     return StreamingResponse(
-        io.BytesIO(content),
+        generate(),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={batch_name}.csv"},
     )
@@ -1422,6 +1495,32 @@ python worker.py --server "$SERVER" "$@"
         buf,
         media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=worker.zip"},
+    )
+
+
+@app.get("/api/tool/export-local")
+async def download_export_local():
+    """下载本地导出工具 export_local.py"""
+    fpath = os.path.join(config.BASE_DIR, "export_local.py")
+    if not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail="export_local.py 不存在")
+    return FileResponse(
+        fpath,
+        media_type="application/octet-stream",
+        filename="export_local.py",
+    )
+
+
+@app.get("/api/tool/build-exe")
+async def download_build_exe():
+    """下载 Windows 一键打包脚本 build_exe.bat"""
+    fpath = os.path.join(config.BASE_DIR, "build_exe.bat")
+    if not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail="build_exe.bat 不存在")
+    return FileResponse(
+        fpath,
+        media_type="application/octet-stream",
+        filename="build_exe.bat",
     )
 
 

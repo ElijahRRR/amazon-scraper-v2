@@ -23,8 +23,8 @@
     <div class="col-6 col-lg-3">
         <div class="stat-card warning">
             <div class="stat-label">进度 / 成功率</div>
-            <div class="stat-number" id="stat-rate">{{ progress.completion_rate }}%</div>
-            <div class="text-secondary" style="font-size:0.8rem;" id="stat-success-rate">成功率 {{ progress.success_rate }}%</div>
+            <div class="stat-number" style="font-size:1.5rem; line-height:1.2;" id="stat-rate">{{ progress.completion_rate }}%</div>
+            <div class="text-secondary" style="font-size:0.75rem; margin-top:2px;" id="stat-success-rate">成功率 {{ progress.success_rate }}%</div>
         </div>
     </div>
     <div class="col-6 col-lg-3">
@@ -50,23 +50,30 @@
                     {% endfor %}
                 </select>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-2">
                 <label class="form-label">搜索</label>
                 <input type="text" id="searchInput" class="form-control" placeholder="ASIN 或标题..." value="{{ search }}">
             </div>
-            <div class="col-md-2">
-                <button class="btn btn-accent w-100" onclick="loadResults(1)"><i class="bi bi-search"></i> 搜索</button>
+            <div class="col-md-1">
+                <label class="form-label">&nbsp;</label>
+                <button class="btn btn-accent w-100" onclick="loadResults(1)"><i class="bi bi-search"></i></button>
             </div>
-            <div class="col-md-3 text-end">
-                <a id="exportExcelBtn" href="#" class="btn btn-outline-accent" style="display:none;">
-                    <i class="bi bi-file-earmark-excel"></i> 导出 Excel
-                </a>
-                <a id="exportCsvBtn" href="#" class="btn btn-outline-accent" style="display:none;">
-                    <i class="bi bi-filetype-csv"></i> CSV
-                </a>
-                <button class="btn btn-outline-danger" onclick="clearDatabase()">
-                    <i class="bi bi-trash3"></i> 清空数据库
-                </button>
+            <div class="col-md-6 text-end">
+                <label class="form-label">&nbsp;</label>
+                <div class="d-flex justify-content-end gap-1 flex-wrap">
+                    <a id="exportExcelBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
+                        <i class="bi bi-file-earmark-excel"></i> Excel
+                    </a>
+                    <a id="exportCsvBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
+                        <i class="bi bi-filetype-csv"></i> CSV
+                    </a>
+                    <a id="exportDbBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
+                        <i class="bi bi-database-down"></i> 数据库
+                    </a>
+                    <button class="btn btn-outline-danger btn-sm" onclick="clearDatabase()">
+                        <i class="bi bi-trash3"></i> 清空
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -279,11 +286,13 @@ async function loadProgress() {
         const resp = await fetch(url);
         const data = await resp.json();
 
+        state.batchDone = data.done;
         document.getElementById('stat-total').textContent = data.total;
         document.getElementById('stat-done').textContent = data.done;
         document.getElementById('stat-rate').textContent = data.completion_rate + '%';
         document.getElementById('stat-success-rate').textContent = '成功率 ' + data.success_rate + '%';
         document.getElementById('stat-failed').textContent = data.failed;
+        updateExportButtons();
     } catch(e) {
         console.error('加载进度失败:', e);
     }
@@ -293,16 +302,22 @@ async function loadProgress() {
 function updateExportButtons() {
     const excelBtn = document.getElementById('exportExcelBtn');
     const csvBtn = document.getElementById('exportCsvBtn');
+    const dbBtn = document.getElementById('exportDbBtn');
 
     if (state.batch) {
         const batchEncoded = encodeURIComponent(state.batch);
         excelBtn.href = `/api/export/${batchEncoded}?format=excel`;
         csvBtn.href = `/api/export/${batchEncoded}?format=csv`;
-        excelBtn.style.display = 'inline-block';
+        dbBtn.href = `/api/export/${batchEncoded}/db`;
+
+        // ≤5000 条显示 Excel，>5000 隐藏（服务器 CPU 扛不住）
+        excelBtn.style.display = (state.batchDone || 0) <= 5000 ? 'inline-block' : 'none';
         csvBtn.style.display = 'inline-block';
+        dbBtn.style.display = 'inline-block';
     } else {
         excelBtn.style.display = 'none';
         csvBtn.style.display = 'none';
+        dbBtn.style.display = 'none';
     }
 }
 

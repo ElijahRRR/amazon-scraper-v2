@@ -51,7 +51,7 @@
 4. Worker 将采集结果批量推送回 Server（`/api/tasks/result/batch`）
 5. 若任务需要截图且 Worker 开启截图功能：HTML 写入磁盘 → 截图子进程渲染 → **逐张立即上传** Server → 删除 HTML
 6. 截图批次全部上传完成前，Worker 暂停拉取新任务（门控机制）
-7. 用户在 Web UI 查看进度、浏览结果、导出 Excel/CSV
+7. 用户在 Web UI 查看进度、浏览结果、导出 Excel/CSV/数据库文件
 
 ## 技术栈
 
@@ -66,7 +66,7 @@
 | 代理 | 快代理 TPS 隧道代理 | 固定入口，服务端自动换 IP |
 | 压缩 | Brotli (`br`) | 比 gzip 小 15-25%，减少传输量 |
 | 模板 | Jinja2 | Web UI 页面渲染 |
-| 导出 | openpyxl / csv | Excel (.xlsx) 和 CSV 导出 |
+| 导出 | openpyxl / csv / SQLite | Excel (.xlsx)、CSV、数据库文件导出 |
 | 截图存证 | Playwright (Chromium) | 可选功能，渲染商品页截图用于数据抽查 |
 
 ## 反反爬策略
@@ -405,7 +405,8 @@ Worker C ──POST metrics──→ Server ──分配配额──→ Worker C
 | GET | `/api/progress/{batch}` | 获取批次进度 |
 | GET | `/api/batches` | 获取批次列表 |
 | GET | `/api/results` | 分页查询结果 |
-| GET | `/api/export/{batch}` | 导出数据（Excel/CSV） |
+| GET | `/api/export/{batch}` | 导出数据（≤5000条Excel，>5000条自动CSV） |
+| GET | `/api/export/{batch}/db` | 导出批次数据为独立 SQLite 文件（零 CPU 开销） |
 | GET | `/api/export/{batch}/screenshots` | 批量下载截图（ZIP 压缩包） |
 | GET | `/api/workers` | 查看在线 Worker |
 | DELETE | `/api/workers` | 清理所有离线 Worker |
@@ -419,6 +420,7 @@ Worker C ──POST metrics──→ Server ──分配配额──→ Worker C
 | DELETE | `/api/batches/{batch}` | 删除批次（含数据库记录 + 截图文件） |
 | DELETE | `/api/database` | 清空所有数据（任务 + 结果 + 截图文件） |
 | GET | `/api/worker/download` | 下载 Worker 安装包（ZIP，含启动脚本） |
+| GET | `/api/tool/export-local` | 下载本地导出工具 export_local.py |
 
 **Web UI 页面：**
 
@@ -426,8 +428,8 @@ Worker C ──POST metrics──→ Server ──分配配额──→ Worker C
 |------|------|
 | `/` | 仪表盘（总览进度、活跃 Worker） |
 | `/tasks` | 任务管理（上传 ASIN、查看批次、错误分类详情、优先采集、截图下载） |
-| `/results` | 结果浏览（分页、搜索、导出） |
-| `/settings` | 设置（邮编、速率、并发、截图浏览器数/并发数、AIMD 参数，保存后 Worker 自动同步） |
+| `/results` | 结果浏览（分页、搜索、导出 Excel/CSV/数据库） |
+| `/settings` | 设置（邮编、速率、并发、截图浏览器数/并发数、AIMD 参数，保存后 Worker 自动同步）+ 下载工具 |
 | `/workers` | Worker 监控（在线状态、统计、下载 Worker 包、清理离线） |
 
 ## 快速开始
@@ -563,6 +565,26 @@ requirements-screenshot.txt（可选，截图功能需要 playwright）
 
 > 安装包内含 8 个 Python 文件 + 依赖清单 + 启动脚本，Server 地址已自动注入。首次启动会自动创建虚拟环境、安装依赖并下载 Playwright Chromium 用于截图功能。**无需配置任何环境变量**——Worker 启动时会自动从 Server 拉取全部运行参数（代理地址、并发控制、QPS 限速、AIMD 调控参数等），完全由 Server 统一管理。
 
+#### 方式四：本地导出工具
+
+大批量数据（>5000 条）在服务器上生成 Excel 会占满 CPU，推荐使用本地导出工具：
+
+1. 在「采集结果」页面点击「数据库」按钮，下载批次的 `.db` 文件
+2. 在「设置」页面点击「下载 export_local.py」，获取本地导出工具
+3. 运行导出工具：
+
+```bash
+# 方式 1：双击运行（弹出文件选择器，选择 .db 文件，自动生成 Excel）
+python export_local.py
+
+# 方式 2：命令行
+python export_local.py batch_xxx.db              # 生成 Excel（同目录）
+python export_local.py batch_xxx.db -f csv       # 生成 CSV
+python export_local.py batch_xxx.db -o report.xlsx  # 指定输出路径
+```
+
+> 工具完全独立运行，不依赖项目其他文件。首次运行自动安装 `openpyxl` 依赖（使用清华镜像加速）。仅需 Python 3.8+ 环境。
+
 Worker 命令行参数：
 
 | 参数 | 默认值 | 说明 |
@@ -580,7 +602,10 @@ Worker 命令行参数：
 3. 启动 Worker（Docker 或 Python，可在多台机器上部署）
 4. 在「仪表盘」查看实时采集进度和速度
 5. 在「结果浏览」页面查看、搜索采集数据
-6. 点击「导出」下载 Excel 或 CSV 文件
+6. 点击「导出」下载数据：
+   - **≤5000 条**：可选 Excel、CSV、数据库文件三种格式
+   - **>5000 条**：可选 CSV、数据库文件（Excel 按钮自动隐藏，避免服务器 CPU 过载）
+   - **大批量推荐**：下载 `.db` 数据库文件，使用本地导出工具生成 Excel（见下方说明）
 7. 截图批次可在任务管理页面下载 ZIP 压缩包
 
 ### ASIN 文件格式
@@ -652,6 +677,7 @@ amazon-scraper-v2/
 ├── proxy.py               # 代理管理（快代理 TPS 隧道，全异步 httpx）
 ├── database.py            # 数据库操作（aiosqlite，WAL + busy_timeout）
 ├── models.py              # 数据模型（Task, Result dataclass）
+├── export_local.py        # 本地导出工具（独立运行，从 .db 生成 Excel/CSV）
 ├── requirements.txt       # Server 完整依赖（含 httpx）
 ├── requirements-worker.txt # Worker 精简依赖（含 httpx）
 ├── requirements-screenshot.txt # 截图功能依赖（可选，playwright）

@@ -451,6 +451,21 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def iter_results(self, batch_name: str, chunk_size: int = 500):
+        """分批迭代某批次的结果（流式导出，避免一次性加载全部数据到内存）"""
+        offset = 0
+        while True:
+            async with self._db.execute(
+                "SELECT * FROM results WHERE batch_name = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+                (batch_name, chunk_size, offset)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    yield dict(row)
+                offset += chunk_size
+
     # ==================== 统计与进度 ====================
 
     async def get_progress(self, batch_name: str = None) -> Dict:

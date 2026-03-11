@@ -272,6 +272,31 @@
                 </small>
             </div>
         </div>
+
+        <div class="card mt-3">
+            <div class="card-header"><i class="bi bi-file-earmark-code"></i> 本地导出工具</div>
+            <div class="card-body">
+                <p class="text-secondary mb-3" style="font-size:0.85rem;">
+                    大批量数据推荐下载 <code>.db</code> 数据库文件，在本地生成 Excel，避免服务器 CPU 过载。
+                </p>
+                <div class="d-flex gap-2 mb-3">
+                    <a href="/api/tool/build-exe" class="btn btn-accent flex-fill">
+                        <i class="bi bi-windows"></i> 下载一键打包脚本
+                    </a>
+                    <a href="/api/tool/export-local" class="btn btn-outline-accent flex-fill">
+                        <i class="bi bi-filetype-py"></i> 下载 Python 脚本
+                    </a>
+                </div>
+                <small class="text-secondary d-block mb-2">
+                    <strong>一键打包脚本</strong>（推荐）：下载 <code>build_exe.bat</code>，连同 <code>export_local.py</code> 放在同一目录，
+                    双击运行自动检测并安装 Python → 打包生成 <code>导出工具.exe</code>。
+                    生成的 .exe 可拷贝到任意 Windows 电脑使用，无需任何环境。
+                </small>
+                <small class="text-secondary d-block">
+                    <strong>Python 脚本</strong>：已有 Python 环境的电脑可直接双击运行，首次自动安装依赖。
+                </small>
+            </div>
+        </div>
     </div>
 </div>
 {% endblock %}
