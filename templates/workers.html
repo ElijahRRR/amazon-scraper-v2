@@ -109,8 +109,10 @@
 
     function val(v, suffix, decimals) {
         if (v == null) return '-';
-        if (decimals != null) return v.toFixed(decimals) + (suffix || '');
-        return v.toLocaleString() + (suffix || '');
+        var n = Number(v);
+        if (isNaN(n)) return '-';
+        if (decimals != null) return n.toFixed(decimals) + (suffix || '');
+        return n.toLocaleString() + (suffix || '');
     }
 
     // ---- coordinator update ----
@@ -185,7 +187,7 @@
                     '</div>' +
                     '<div class="worker-footer">' +
                         '<span><i class="bi bi-clock"></i> ' + fmtDuration(w.uptime) + '</span>' +
-                        '<span><i class="bi bi-activity"></i> ' + (w.last_seen || '-') + '</span>' +
+                        '<span><i class="bi bi-activity"></i> ' + escapeHtml(w.last_seen || '-') + '</span>' +
                     '</div>' +
                 '</div>' +
             '</div>' +

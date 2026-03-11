@@ -315,11 +315,7 @@ async def _timeout_task_loop():
         stale = [wid for wid, info in _worker_registry.items()
                  if now - info["last_seen"] > 600]
         for wid in stale:
-            del _worker_registry[wid]
-            # 同步清理协调器中的过期数据
-            _global_coordinator["worker_metrics"].pop(wid, None)
-            _global_coordinator["worker_quotas"].pop(wid, None)
-            _global_coordinator["recovery_jitter"].pop(wid, None)
+            _cleanup_worker(wid)
         if stale:
             logger.info(f"清理了 {len(stale)} 个长期离线 Worker")
 
@@ -356,13 +352,17 @@ async def _auto_scrape_scheduler():
                     continue
 
                 db = await get_db()
-                # 防重叠：有未完成的 auto_* 批次则跳过
+                # 防重叠：有未完成的 auto_* 批次则标记已处理并跳过（不补跑）
                 if await db.has_pending_auto_batch():
-                    logger.info(f"定时采集[{sched_time}]: 上一轮 auto 批次未完成，跳过")
+                    sched["last_run_date"] = today_str
+                    _save_settings()
+                    logger.info(f"定时采集[{sched_time}]: 上一轮 auto 批次未完成，跳过（不补跑）")
                     continue
 
                 asins = await db.get_all_asins()
                 if not asins:
+                    sched["last_run_date"] = today_str
+                    _save_settings()
                     continue
 
                 batch_name = f"auto_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -721,9 +721,9 @@ async def export_all_data(
 
 
 @app.get("/api/export/all/db")
-async def export_all_db():
+async def export_all_db(change_filter: str = Query("all")):
     """全局导出为独立 SQLite 文件"""
-    return await _export_db_streaming(batch_name=None)
+    return await _export_db_streaming(batch_name=None, change_filter=change_filter)
 
 
 @app.get("/api/export/{batch_name}")
@@ -796,21 +796,20 @@ async def export_screenshots(batch_name: str):
 
 
 @app.get("/api/export/{batch_name}/db")
-async def export_db(batch_name: str):
-    """导出批次数据为独立 SQLite 文件（EXISTS 筛选）"""
-    return await _export_db_streaming(batch_name=batch_name)
+async def export_db(batch_name: str, change_filter: str = Query("all")):
+    """导出批次数据为独立 SQLite 文件（EXISTS 筛选 + change_filter）"""
+    return await _export_db_streaming(batch_name=batch_name, change_filter=change_filter)
 
 
-async def _export_db_streaming(batch_name: str = None):
-    """导出 .db 文件（全字段，batch_name=None 表示全局导出）"""
+async def _export_db_streaming(batch_name: str = None, change_filter: str = "all"):
+    """导出 .db 文件（全字段，batch_name=None 表示全局导出，支持 change_filter）"""
     import tempfile
     db = await get_db()
 
+    total = await db.count_results(batch_name=batch_name, change_filter=change_filter)
     if batch_name:
-        total = await db.count_results(batch_name=batch_name)
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
     else:
-        total = await db.count_results()
         safe_name = f"all_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     if total == 0:
@@ -822,18 +821,10 @@ async def _export_db_streaming(batch_name: str = None):
 
     try:
         await db._db.execute("ATTACH DATABASE ? AS export_db", (tmp_path,))
-        if batch_name:
-            await db._db.execute("""
-                CREATE TABLE export_db.results AS
-                SELECT r.* FROM results r
-                WHERE EXISTS (
-                    SELECT 1 FROM tasks t
-                    WHERE t.batch_name = ? AND t.asin = r.asin AND t.status = 'done'
-                )
-            """, (batch_name,))
-        else:
-            await db._db.execute(
-                "CREATE TABLE export_db.results AS SELECT * FROM results")
+        where, params = db._build_where(batch_name=batch_name, change_filter=change_filter)
+        await db._db.execute(
+            f"CREATE TABLE export_db.results AS SELECT r.* FROM results r {where}",
+            params)
         await db._db.execute("DETACH DATABASE export_db")
         await db._db.commit()
     except Exception:
@@ -971,11 +962,20 @@ async def get_workers():
     return {"workers": workers}
 
 
+def _cleanup_worker(wid: str):
+    """从注册表和协调器中移除 Worker"""
+    _worker_registry.pop(wid, None)
+    _global_coordinator["worker_metrics"].pop(wid, None)
+    _global_coordinator["worker_quotas"].pop(wid, None)
+    _global_coordinator["recovery_jitter"].pop(wid, None)
+
+
 @app.delete("/api/workers/{worker_id}")
 async def remove_worker(worker_id: str):
     """移除单个离线 worker"""
     if worker_id in _worker_registry:
-        del _worker_registry[worker_id]
+        _cleanup_worker(worker_id)
+        _allocate_quotas()
         return {"status": "ok", "removed": worker_id}
     return {"status": "not_found"}
 
@@ -986,7 +986,9 @@ async def remove_offline_workers():
     now = time.time()
     offline = [wid for wid, info in _worker_registry.items() if now - info["last_seen"] >= 60]
     for wid in offline:
-        del _worker_registry[wid]
+        _cleanup_worker(wid)
+    if offline:
+        _allocate_quotas()
     return {"status": "ok", "removed": len(offline)}
 
 
@@ -1013,8 +1015,8 @@ async def worker_sync(request: Request):
         ip=client_ip,
     )
 
-    # 处理 metrics（可能触发全局封锁）
-    if metrics:
+    # 处理 metrics（可能触发全局封锁）— 仅已注册 Worker 才写入
+    if metrics and worker_id in _worker_registry:
         _handle_worker_metrics(worker_id, metrics)
 
     # 确保配额是最新的

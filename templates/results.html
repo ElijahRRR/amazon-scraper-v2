@@ -491,10 +491,13 @@ function doExport() {
     const params = new URLSearchParams();
 
     if (fmt === 'db') {
-        // .db 导出全字段
+        // .db 导出全字段，但继承 change_filter
         url = state.batch
             ? `/api/export/${encodeURIComponent(state.batch)}/db`
             : '/api/export/all/db';
+        if (state.changeFilter && state.changeFilter !== 'all') {
+            params.set('change_filter', state.changeFilter);
+        }
     } else {
         url = state.batch
             ? `/api/export/${encodeURIComponent(state.batch)}`
