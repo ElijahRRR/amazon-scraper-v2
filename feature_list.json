@@ -46,7 +46,7 @@
     "category": "core",
     "description": "delete_batch 不删 results + 清理悬空 screenshot_path",
     "steps": ["DELETE 仅删 tasks", "UPDATE results SET screenshot_path=NULL", "server 端仍删截图目录"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 8,

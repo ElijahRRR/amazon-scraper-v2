@@ -954,10 +954,16 @@ class Database:
         return len(results_list)
 
     async def delete_batch(self, batch_name: str):
-        """删除整个批次（任务 + 结果）"""
+        """删除批次（仅删任务记录，保留 ASIN 数据，清理悬空截图路径）"""
         async with self._write_lock:
+            # 清空该批次相关 ASIN 的 screenshot_path（截图文件即将被删除）
+            await self._db.execute("""
+                UPDATE results SET screenshot_path = NULL
+                WHERE screenshot_path IS NOT NULL
+                  AND asin IN (SELECT asin FROM tasks WHERE batch_name = ?)
+                  AND screenshot_path LIKE ?
+            """, (batch_name, f"%{batch_name}%"))
             await self._db.execute("DELETE FROM tasks WHERE batch_name = ?", (batch_name,))
-            await self._db.execute("DELETE FROM results WHERE batch_name = ?", (batch_name,))
             await self._db.commit()
 
     async def clear_all(self) -> Dict[str, int]:
