@@ -289,9 +289,22 @@
                     暂无定时任务，点击"新增"添加
                 </div>
                 <div id="scheduleNewRow" class="row g-2 align-items-end mt-2" style="display:none;">
-                    <div class="col">
-                        <label class="form-label">执行时间</label>
-                        <input type="time" class="form-control" id="newScheduleTime" value="08:00">
+                    <div class="col-auto">
+                        <label class="form-label">时</label>
+                        <select id="newScheduleHour" class="form-select" style="width:80px;">
+                            {% for h in range(24) %}
+                            <option value="{{ '%02d'|format(h) }}" {{ 'selected' if h == 8 }}>{{ '%02d'|format(h) }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-auto d-flex align-items-center" style="padding-bottom:6px; font-size:1.2rem; font-weight:700;">:</div>
+                    <div class="col-auto">
+                        <label class="form-label">分</label>
+                        <select id="newScheduleMinute" class="form-select" style="width:80px;">
+                            {% for m in range(60) %}
+                            <option value="{{ '%02d'|format(m) }}">{{ '%02d'|format(m) }}</option>
+                            {% endfor %}
+                        </select>
                     </div>
                     <div class="col-auto d-flex gap-1" style="padding-bottom:1px;">
                         <button class="btn btn-accent" onclick="confirmAddSchedule()">
@@ -484,9 +497,8 @@ function renderSchedules() {
 }
 
 function addSchedule() {
-    const row = document.getElementById('scheduleNewRow');
-    row.style.display = '';
-    document.getElementById('newScheduleTime').focus();
+    document.getElementById('scheduleNewRow').style.display = '';
+    document.getElementById('newScheduleHour').focus();
 }
 
 function cancelAddSchedule() {
@@ -494,9 +506,9 @@ function cancelAddSchedule() {
 }
 
 async function confirmAddSchedule() {
-    const input = document.getElementById('newScheduleTime');
-    const timeStr = input.value.trim();
-    if (!timeStr) return;
+    const h = document.getElementById('newScheduleHour').value;
+    const m = document.getElementById('newScheduleMinute').value;
+    const timeStr = `${h}:${m}`;
     try {
         const resp = await fetch('/api/auto-scrape/schedules', {
             method: 'POST',
@@ -508,7 +520,8 @@ async function confirmAddSchedule() {
             _schedules = data.schedules;
             renderSchedules();
             document.getElementById('scheduleNewRow').style.display = 'none';
-            input.value = '08:00';
+            document.getElementById('newScheduleHour').value = '08';
+            document.getElementById('newScheduleMinute').value = '00';
             showScheduleMsg('success', '已添加');
         } else {
             showScheduleMsg('danger', data.detail || '添加失败');
