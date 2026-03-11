@@ -26,7 +26,7 @@ import openpyxl
 
 import config
 from database import Database, get_db, close_db
-from models import RESULT_FIELDS
+from models import RESULT_FIELDS, EXPORTABLE_FIELDS
 
 # 日志
 logging.basicConfig(
@@ -557,32 +557,151 @@ async def get_results(
 
 
 # --- 数据导出 ---
+
+def _parse_price(s: str) -> float | None:
+    """解析 '$12.99' 格式的价格字符串为浮点数，失败返回 None。"""
+    if not s or s == "N/A":
+        return None
+    s = str(s).strip().replace(",", "")
+    if s.startswith("$"):
+        s = s[1:]
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _calc_total_price(row_data: Dict) -> str:
+    """计算总价（BuyBox 价格 + 运费）"""
+    price = _parse_price(str(row_data.get("buybox_price", "")))
+    shipping_str = str(row_data.get("buybox_shipping", ""))
+    if price is None:
+        return "N/A"
+    elif shipping_str.upper() == "FREE":
+        return f"${price:.2f}"
+    else:
+        shipping = _parse_price(shipping_str)
+        return f"${price:.2f}" if shipping is None else f"${price + shipping:.2f}"
+
+
+def _get_export_headers(selected_fields: List[str] = None):
+    """获取导出表头和字段键
+
+    Args:
+        selected_fields: 用户选择的字段列表（来自 EXPORTABLE_FIELDS），None 表示全选
+    Returns:
+        (headers, field_keys, include_total_price)
+    """
+    if selected_fields is None:
+        selected_fields = list(EXPORTABLE_FIELDS)
+
+    include_total_price = "total_price" in selected_fields
+    # total_price 是虚拟字段，不在数据库中
+    field_keys = [f for f in selected_fields if f != "total_price"]
+    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
+
+    if include_total_price:
+        # 插入到 "BuyBox 运费" 后面，如果 buybox_shipping 在选中字段中
+        shipping_header = config.HEADER_MAP.get("buybox_shipping", "buybox_shipping")
+        if shipping_header in headers:
+            insert_idx = headers.index(shipping_header) + 1
+        else:
+            insert_idx = len(headers)  # 否则追加到末尾
+        headers.insert(insert_idx, config.HEADER_MAP.get("total_price", "总价"))
+
+    return headers, field_keys, include_total_price
+
+
+def _prepare_single_row(row_data: Dict, field_keys: list, headers: list,
+                        include_total_price: bool = True):
+    """处理单行数据，返回导出用的列表"""
+    row = [str(row_data.get(f, "")) for f in field_keys]
+
+    if include_total_price:
+        total = _calc_total_price(row_data)
+        shipping_header = config.HEADER_MAP.get("buybox_shipping", "buybox_shipping")
+        if shipping_header in headers:
+            insert_idx = headers.index(shipping_header) + 1
+        else:
+            insert_idx = len(row)
+        row.insert(insert_idx, total)
+
+    return row
+
+
+def _parse_selected_fields(fields_param: str = None) -> List[str]:
+    """解析并校验字段选择参数"""
+    if not fields_param:
+        return None  # 全选
+    selected = [f for f in fields_param.split(",") if f in EXPORTABLE_FIELDS]
+    return selected if selected else None
+
+
+# 路由顺序：静态路由在参数路由之前
+
+@app.get("/api/export/fields")
+async def export_fields():
+    """返回可导出字段列表"""
+    return {
+        "fields": EXPORTABLE_FIELDS,
+        "headers": {f: config.HEADER_MAP.get(f, f) for f in EXPORTABLE_FIELDS},
+    }
+
+
+@app.get("/api/export/all")
+async def export_all_data(
+    format: str = Query("excel"),
+    change_filter: str = Query("all"),
+    fields: str = Query(None),
+):
+    """全局导出（不限批次）"""
+    db = await get_db()
+    selected = _parse_selected_fields(fields)
+    total = await db.count_results(change_filter=change_filter)
+    if total == 0:
+        raise HTTPException(404, "无匹配数据")
+
+    name = f"all_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if format == "csv" or total > 5000:
+        return await _export_csv_streaming(db, name, batch_name=None,
+                                           change_filter=change_filter, selected_fields=selected)
+    else:
+        return await _export_excel_streaming(db, name, batch_name=None,
+                                             change_filter=change_filter, selected_fields=selected)
+
+
+@app.get("/api/export/all/db")
+async def export_all_db():
+    """全局导出为独立 SQLite 文件"""
+    return await _export_db_streaming(batch_name=None)
+
+
 @app.get("/api/export/{batch_name}")
 async def export_data(
     batch_name: str,
     format: str = Query("excel"),
+    change_filter: str = Query("all"),
+    fields: str = Query(None),
 ):
-    """导出采集数据（Excel/CSV），使用流式读取避免大批次 OOM
-
-    超过 5000 条的大批次自动使用 CSV 格式（Excel 生成太慢且占 CPU）
-    """
+    """导出采集数据（Excel/CSV），支持 change_filter + fields 选择"""
     db = await get_db()
-
-    # 查询批次数据量，大批次强制 CSV
-    progress = await db.get_progress(batch_name)
-    total = progress.get("done", 0)
+    selected = _parse_selected_fields(fields)
+    total = await db.count_results(batch_name=batch_name, change_filter=change_filter)
+    if total == 0:
+        raise HTTPException(404, "无匹配数据")
 
     if format == "csv" or total > 5000:
-        return await _export_csv_streaming(db, batch_name)
+        return await _export_csv_streaming(db, batch_name, batch_name=batch_name,
+                                           change_filter=change_filter, selected_fields=selected)
     else:
-        return await _export_excel_streaming(db, batch_name)
+        return await _export_excel_streaming(db, batch_name, batch_name=batch_name,
+                                             change_filter=change_filter, selected_fields=selected)
 
 
 @app.get("/api/export/{batch_name}/screenshots")
 async def export_screenshots(batch_name: str):
     """批量下载某批次的所有截图（ZIP 打包，使用临时文件避免内存峰值）"""
     import tempfile
-    # 防路径穿越：只允许安全字符
     safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
     screenshot_dir = os.path.realpath(os.path.join(config.STATIC_DIR, "screenshots", safe_name))
     screenshots_root = os.path.realpath(os.path.join(config.STATIC_DIR, "screenshots"))
@@ -595,7 +714,6 @@ async def export_screenshots(batch_name: str):
     if not png_files:
         raise HTTPException(status_code=404, detail="该批次无截图文件")
 
-    # 写入临时文件，避免大批次截图撑爆内存
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -629,14 +747,24 @@ async def export_screenshots(batch_name: str):
 
 @app.get("/api/export/{batch_name}/db")
 async def export_db(batch_name: str):
-    """导出批次数据为独立 SQLite 文件（轻量，服务器几乎零 CPU 开销）"""
+    """导出批次数据为独立 SQLite 文件（EXISTS 筛选）"""
+    return await _export_db_streaming(batch_name=batch_name)
+
+
+async def _export_db_streaming(batch_name: str = None):
+    """导出 .db 文件（全字段，batch_name=None 表示全局导出）"""
     import tempfile
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
     db = await get_db()
 
-    progress = await db.get_progress(batch_name)
-    if progress.get("done", 0) == 0:
-        raise HTTPException(status_code=404, detail="该批次无数据")
+    if batch_name:
+        total = await db.count_results(batch_name=batch_name)
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch_name)
+    else:
+        total = await db.count_results()
+        safe_name = f"all_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    if total == 0:
+        raise HTTPException(status_code=404, detail="无数据")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     tmp_path = tmp.name
@@ -644,13 +772,25 @@ async def export_db(batch_name: str):
 
     try:
         await db._db.execute("ATTACH DATABASE ? AS export_db", (tmp_path,))
-        await db._db.execute(
-            "CREATE TABLE export_db.results AS SELECT * FROM results WHERE batch_name = ?",
-            (batch_name,)
-        )
+        if batch_name:
+            await db._db.execute("""
+                CREATE TABLE export_db.results AS
+                SELECT r.* FROM results r
+                WHERE EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.batch_name = ? AND t.asin = r.asin AND t.status = 'done'
+                )
+            """, (batch_name,))
+        else:
+            await db._db.execute(
+                "CREATE TABLE export_db.results AS SELECT * FROM results")
         await db._db.execute("DETACH DATABASE export_db")
         await db._db.commit()
     except Exception:
+        try:
+            await db._db.execute("DETACH DATABASE export_db")
+        except Exception:
+            pass
         os.unlink(tmp_path)
         raise
 
@@ -672,74 +812,26 @@ async def export_db(batch_name: str):
     )
 
 
-def _parse_price(s: str) -> float | None:
-    """解析 '$12.99' 格式的价格字符串为浮点数，失败返回 None。"""
-    if not s or s == "N/A":
-        return None
-    s = s.strip().replace(",", "")
-    if s.startswith("$"):
-        s = s[1:]
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        return None
-
-
-
-def _prepare_single_row(row_data: Dict, field_keys: list, headers: list):
-    """处理单行数据，返回导出用的列表"""
-    row = [str(row_data.get(f, "")) for f in field_keys]
-
-    # 在 "BuyBox 运费" 后插入 "总价" 列
-    shipping_header = "BuyBox 运费"
-    if shipping_header in headers:
-        insert_idx = headers.index(shipping_header) + 1
-        price = _parse_price(str(row_data.get("buybox_price", "")))
-        shipping_str = str(row_data.get("buybox_shipping", ""))
-        if price is None:
-            total = "N/A"
-        elif shipping_str.upper() == "FREE":
-            total = f"${price:.2f}"
-        else:
-            shipping = _parse_price(shipping_str)
-            total = f"${price:.2f}" if shipping is None else f"${price + shipping:.2f}"
-        row.insert(insert_idx, total)
-
-    return row
-
-
-def _get_export_headers():
-    """获取导出表头"""
-    field_keys = list(RESULT_FIELDS)
-    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
-
-    shipping_header = "BuyBox 运费"
-    if shipping_header in headers:
-        insert_idx = headers.index(shipping_header) + 1
-        headers.insert(insert_idx, "总价")
-
-    return headers, field_keys
-
-
-async def _export_excel_streaming(db, batch_name: str):
-    """导出 Excel 文件（write_only 模式，写入临时文件避免内存峰值）"""
+async def _export_excel_streaming(db, filename: str, batch_name: str = None,
+                                  change_filter: str = "all",
+                                  selected_fields: List[str] = None):
+    """导出 Excel 文件（write_only 模式）"""
     import tempfile
-    headers, field_keys = _get_export_headers()
+    headers, field_keys, include_total = _get_export_headers(selected_fields)
     wb = openpyxl.Workbook(write_only=True)
     ws = wb.create_sheet(title="采集结果")
     ws.append(headers)
 
     count = 0
-    async for row_data in db.iter_results(batch_name):
-        row = _prepare_single_row(row_data, field_keys, headers)
+    async for row_data in db.iter_results(batch_name=batch_name, change_filter=change_filter):
+        row = _prepare_single_row(row_data, field_keys, headers, include_total)
         ws.append(row)
         count += 1
 
     if count == 0:
         wb.close()
-        raise HTTPException(status_code=404, detail="该批次无数据")
+        raise HTTPException(status_code=404, detail="无数据")
 
-    # 写入临时文件而非 BytesIO，避免整个 xlsx 驻留内存
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     tmp_path = tmp.name
     tmp.close()
@@ -762,16 +854,19 @@ async def _export_excel_streaming(db, batch_name: str):
         finally:
             os.unlink(tmp_path)
 
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)
     return StreamingResponse(
         _stream_and_cleanup(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={batch_name}.xlsx"},
+        headers={"Content-Disposition": f"attachment; filename={safe_name}.xlsx"},
     )
 
 
-async def _export_csv_streaming(db, batch_name: str):
-    """流式导出 CSV 文件（分批读取数据库，避免大批次 OOM）"""
-    headers, field_keys = _get_export_headers()
+async def _export_csv_streaming(db, filename: str, batch_name: str = None,
+                                change_filter: str = "all",
+                                selected_fields: List[str] = None):
+    """流式导出 CSV 文件"""
+    headers, field_keys, include_total = _get_export_headers(selected_fields)
 
     async def generate():
         output = io.StringIO()
@@ -779,19 +874,18 @@ async def _export_csv_streaming(db, batch_name: str):
         writer.writerow(headers)
         yield output.getvalue().encode('utf-8-sig')
 
-        count = 0
-        async for row_data in db.iter_results(batch_name):
+        async for row_data in db.iter_results(batch_name=batch_name, change_filter=change_filter):
             output = io.StringIO()
             writer = csv.writer(output)
-            row = _prepare_single_row(row_data, field_keys, headers)
+            row = _prepare_single_row(row_data, field_keys, headers, include_total)
             writer.writerow(row)
             yield output.getvalue().encode('utf-8')
-            count += 1
 
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)
     return StreamingResponse(
         generate(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={batch_name}.csv"},
+        headers={"Content-Disposition": f"attachment; filename={safe_name}.csv"},
     )
 
 

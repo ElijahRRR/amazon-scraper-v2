@@ -60,7 +60,7 @@
     "category": "core",
     "description": "导出改造: 路由顺序 + EXPORTABLE_FIELDS + change_filter + fields + 全局导出",
     "steps": ["/api/export/fields 端点", "/api/export/all 和 /api/export/all/db 端点", "export_data 支持 change_filter+fields", "_get_export_headers 支持 selected_fields", "总价虚拟字段可选", ".db 导出用 EXISTS", "路由顺序正确"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 10,
