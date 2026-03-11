@@ -1,0 +1,93 @@
+[
+  {
+    "id": 1,
+    "category": "infrastructure",
+    "description": "Model + Config 更新: Result dataclass 新增变动字段 + HEADER_MAP + EXPORTABLE_FIELDS",
+    "steps": ["Result 新增13个变动/内部字段", "_INTERNAL_FIELDS 定义", "EXPORTABLE_FIELDS 计算", "HEADER_MAP 新增条目", "total_price 虚拟字段"],
+    "passes": false
+  },
+  {
+    "id": 2,
+    "category": "infrastructure",
+    "description": "数据库迁移框架: PRAGMA user_version + 显式事务 + ASIN 唯一索引 + counters 表",
+    "steps": ["_migrate 方法存在", "新增列 ALTER TABLE", "合并重复ASIN", "计数器表 counters", "唯一索引 idx_results_asin_unique", "PRAGMA user_version=2"],
+    "passes": false
+  },
+  {
+    "id": 3,
+    "category": "core",
+    "description": "save_result ON CONFLICT DO UPDATE + 变动对比 + change_seq",
+    "steps": ["辅助函数 _compare_price/_compare_stock_qty/_compare_stock_status/_compute_content_hash", "save_result 查旧数据+对比+ON CONFLICT", "_next_change_seq 计数器", "screenshot_path COALESCE 保护"],
+    "passes": false
+  },
+  {
+    "id": 4,
+    "category": "core",
+    "description": "batch_submit_results 批量对比 + change_seq 批量分配",
+    "steps": ["一次性查询旧数据", "批量 change_seq 分配", "ON CONFLICT 批量写入", "任务状态更新不变"],
+    "passes": false
+  },
+  {
+    "id": 5,
+    "category": "core",
+    "description": "get_results EXISTS 批次筛选 + change_filter + server 路由传递",
+    "steps": ["EXISTS 替代 WHERE batch_name", "5种 change_filter 条件", "search 保持", "server get_results 路由传 change_filter"],
+    "passes": false
+  },
+  {
+    "id": 6,
+    "category": "core",
+    "description": "iter_results + count_results 支持批次筛选和 change_filter",
+    "steps": ["iter_results 用 EXISTS + change_filter", "count_results 方法", "get_all_asins 方法"],
+    "passes": false
+  },
+  {
+    "id": 7,
+    "category": "core",
+    "description": "delete_batch 不删 results + 清理悬空 screenshot_path",
+    "steps": ["DELETE 仅删 tasks", "UPDATE results SET screenshot_path=NULL", "server 端仍删截图目录"],
+    "passes": false
+  },
+  {
+    "id": 8,
+    "category": "core",
+    "description": "DELETE /api/results 端点 + delete_results 数据库方法",
+    "steps": ["database delete_results + get_screenshot_paths", "server DELETE /api/results 路由", "截图文件清理 + 越界检测"],
+    "passes": false
+  },
+  {
+    "id": 9,
+    "category": "core",
+    "description": "导出改造: 路由顺序 + EXPORTABLE_FIELDS + change_filter + fields + 全局导出",
+    "steps": ["/api/export/fields 端点", "/api/export/all 和 /api/export/all/db 端点", "export_data 支持 change_filter+fields", "_get_export_headers 支持 selected_fields", "总价虚拟字段可选", ".db 导出用 EXISTS", "路由顺序正确"],
+    "passes": false
+  },
+  {
+    "id": 10,
+    "category": "core",
+    "description": "update_screenshot_path 适配新唯一索引 (asin only)",
+    "steps": ["WHERE 条件改为仅 asin"],
+    "passes": false
+  },
+  {
+    "id": 11,
+    "category": "feature",
+    "description": "定时自动采集: 设置 + bool 校验 + 后台调度器 + has_pending_auto_batch",
+    "steps": ["_default_settings 新增 auto_scrape_*", "_validators + bool 类型支持", "_auto_scrape_scheduler 后台协程", "has_pending_auto_batch 数据库方法", "lifespan 启动调度器"],
+    "passes": false
+  },
+  {
+    "id": 12,
+    "category": "ui",
+    "description": "results.html: 变动筛选 + 变动标记 + 导出字段选择 Modal",
+    "steps": ["变动筛选下拉框", "表格变动标记(价格涨跌/库存/新增)", "导出 Modal(格式+范围+字段选择+localStorage)", "全局导出支持(无批次时可导出)"],
+    "passes": false
+  },
+  {
+    "id": 13,
+    "category": "ui",
+    "description": "settings.html: 定时采集设置卡片",
+    "steps": ["开关 checkbox", "间隔输入框", "状态显示", "JS 提交包含 bool 值"],
+    "passes": false
+  }
+]
