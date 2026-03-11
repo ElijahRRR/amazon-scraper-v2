@@ -45,6 +45,7 @@ async def lifespan(app):
     db = await get_db()
     logger.info("✅ 数据库初始化完成")
     asyncio.create_task(_timeout_task_loop())
+    asyncio.create_task(_auto_scrape_scheduler())
     yield
     # shutdown
     await close_db()
@@ -124,6 +125,10 @@ def _default_settings() -> dict:
         "tunnel_initial_concurrency": getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16),
         "per_channel_qps": getattr(config, "PER_CHANNEL_QPS", 3.0),
         "per_channel_max_concurrency": getattr(config, "PER_CHANNEL_MAX_CONCURRENCY", 12),
+        # 定时自动采集
+        "auto_scrape_enabled": False,
+        "auto_scrape_interval": 24,   # 小时
+        "auto_scrape_last_run": 0,    # 时间戳（内部使用）
     }
 
 _SETTINGS_FILE = os.path.join(config.BASE_DIR, "runtime_settings.json")
@@ -324,6 +329,41 @@ async def _timeout_task_loop():
         _allocate_quotas()
 
         await asyncio.sleep(30)
+
+
+async def _auto_scrape_scheduler():
+    """定时自动采集调度器"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not _runtime_settings.get("auto_scrape_enabled", False):
+                continue
+
+            interval = _runtime_settings.get("auto_scrape_interval", 24) * 3600
+            last_run = _runtime_settings.get("auto_scrape_last_run", 0)
+            if time.time() - last_run < interval:
+                continue
+
+            db = await get_db()
+
+            # 防重叠：检查是否有未完成的 auto_* 批次
+            if await db.has_pending_auto_batch():
+                logger.info("定时采集: 上一轮 auto 批次未完成，跳过")
+                continue
+
+            asins = await db.get_all_asins()
+            if not asins:
+                continue
+
+            batch_name = f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            zip_code = _runtime_settings.get("zip_code", "10001")
+            inserted = await db.create_tasks(batch_name, asins, zip_code=zip_code, needs_screenshot=False)
+
+            _runtime_settings["auto_scrape_last_run"] = time.time()
+            _save_settings()
+            logger.info(f"定时采集: 创建批次 {batch_name}，{inserted} 个任务")
+        except Exception as e:
+            logger.error(f"定时采集调度异常: {e}")
 
 
 # ==================== API 端点 ====================
@@ -1187,6 +1227,9 @@ async def update_settings(request: Request):
         "tunnel_initial_concurrency": (int,   2,    100),
         "per_channel_qps":            (float, 0.5,  20),
         "per_channel_max_concurrency": (int,   1,    30),
+        # 定时自动采集
+        "auto_scrape_enabled":  (bool,  None, None),
+        "auto_scrape_interval": (int,   1,    168),   # 1h ~ 7d
     }
 
     changed = False
@@ -1208,7 +1251,16 @@ async def update_settings(request: Request):
         expected_type, lo, hi = validator
         # 类型转换与校验
         try:
-            if expected_type is int:
+            if expected_type is bool:
+                if isinstance(val, bool):
+                    pass
+                elif isinstance(val, (int, float)):
+                    val = bool(val)
+                elif isinstance(val, str):
+                    val = val.lower() in ("true", "1", "yes")
+                else:
+                    val = bool(val)
+            elif expected_type is int:
                 val = int(val)
             elif expected_type is float:
                 val = float(val)

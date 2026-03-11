@@ -74,7 +74,7 @@
     "category": "feature",
     "description": "定时自动采集: 设置 + bool 校验 + 后台调度器 + has_pending_auto_batch",
     "steps": ["_default_settings 新增 auto_scrape_*", "_validators + bool 类型支持", "_auto_scrape_scheduler 后台协程", "has_pending_auto_batch 数据库方法", "lifespan 启动调度器"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 12,

@@ -991,6 +991,13 @@ class Database:
             await self._db.commit()
             return result.rowcount
 
+    async def has_pending_auto_batch(self) -> bool:
+        """检查是否有未完成的 auto_* 批次"""
+        async with self._db.execute(
+            "SELECT 1 FROM tasks WHERE batch_name LIKE 'auto_%' AND status IN ('pending','processing') LIMIT 1"
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def clear_all(self) -> Dict[str, int]:
         """清空所有数据（tasks + results 表）"""
         async with self._write_lock:
