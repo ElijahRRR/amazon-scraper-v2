@@ -1195,6 +1195,18 @@ class Worker:
                             await self._rotate_session(reason="非美国区域数据")
                         continue
 
+                # 核心字段缺失检测：有标题但价格/库存/品牌全为空 → 页面降级，重试
+                _na = {"", "N/A", "N/a", "n/a", "None", None, "0"}
+                _core_fields = ["current_price", "buybox_price", "stock_status", "brand"]
+                if all(result_data.get(f) in _na for f in _core_fields):
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
+                    attempt += 1
+                    last_error_type = "parse_error"
+                    last_error_detail = "核心字段全部缺失（页面降级）"
+                    logger.warning(f"ASIN {asin}{ch_tag} 核心字段缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
+
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
                 await self._submit_result(task_id, result_data, success=True)
