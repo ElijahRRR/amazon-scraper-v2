@@ -532,21 +532,28 @@ class AmazonParser:
     def _slx_parse_long_description(self, tree, html_text: str) -> str:
         try:
             parts = []
-            # A+ 内容
-            nodes = tree.css('div.aplus p, div.aplus img')
-            if not nodes:
-                nodes = tree.css('#productDescription p, #productDescription img')
+            # A+ 内容 — 尝试多种容器选择器
+            _TEXT_TAGS = {'p', 'span', 'div', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'td', 'th'}
+            container = None
+            for sel in ['div.aplus', '#aplus', '#aplusProductDescription', '#productDescription']:
+                container = tree.css_first(sel)
+                if container:
+                    break
 
-            for node in nodes:
-                tag = node.tag
-                if tag == 'img':
-                    src = node.attributes.get('src') or node.attributes.get('data-src', '')
-                    if src and "pixel" not in src and "transparent" not in src:
-                        parts.append(f"\n[Image: {src.strip()}]\n")
-                else:
-                    text = node.text(strip=True)
-                    if text and len(text) > 5:
-                        parts.append(text)
+            if container:
+                for node in container.traverse():
+                    tag = node.tag
+                    if tag == 'img':
+                        src = node.attributes.get('src') or node.attributes.get('data-src', '')
+                        if src and "pixel" not in src and "transparent" not in src:
+                            parts.append(f"\n[Image: {src.strip()}]\n")
+                    elif tag in _TEXT_TAGS:
+                        # 只取叶子级文本节点，避免父子重复
+                        children_with_text = [c for c in node.iter() if c.tag in _TEXT_TAGS and c != node]
+                        if not children_with_text:
+                            text = node.text(deep=True, strip=True)
+                            if text and len(text) > 5:
+                                parts.append(text)
 
             if not parts:
                 seo_keywords = ['ai-optimized', 'search submission', 'noindex', 'sponsored']
@@ -1285,21 +1292,33 @@ class AmazonParser:
 
     def _parse_long_description(self, tree, html_text: str) -> str:
         try:
-            nodes = tree.xpath('//div[contains(@class,"aplus")]//*[self::p or self::img]')
-            if not nodes:
-                nodes = tree.xpath('//*[@id="productDescription"]//*[self::p or self::img]')
+            _TEXT_TAGS = {'p', 'span', 'div', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'td', 'th'}
+            container = None
+            for xpath in [
+                '//div[contains(@class,"aplus")]',
+                '//*[@id="aplus"]',
+                '//*[@id="aplusProductDescription"]',
+                '//*[@id="productDescription"]',
+            ]:
+                results = tree.xpath(xpath)
+                if results:
+                    container = results[0]
+                    break
 
             parts = []
-            for node in nodes:
-                src = node.xpath('./@src | ./@data-src')
-                if src:
-                    s = src[0]
-                    if "pixel" not in s and "transparent" not in s:
-                        parts.append(f"\n[Image: {s.strip()}]\n")
-                else:
-                    text = "".join(node.xpath('.//text()')).strip()
-                    if text and len(text) > 5:
-                        parts.append(text)
+            if container is not None:
+                for node in container.iter():
+                    tag = node.tag if isinstance(node.tag, str) else ''
+                    if tag == 'img':
+                        src = node.get('src') or node.get('data-src', '')
+                        if src and "pixel" not in src and "transparent" not in src:
+                            parts.append(f"\n[Image: {src.strip()}]\n")
+                    elif tag in _TEXT_TAGS:
+                        children_with_text = [c for c in node.iter() if (isinstance(c.tag, str) and c.tag in _TEXT_TAGS and c is not node)]
+                        if not children_with_text:
+                            text = "".join(node.xpath('.//text()')).strip()
+                            if text and len(text) > 5:
+                                parts.append(text)
 
             if not parts:
                 seo_keywords = ['ai-optimized', 'search submission', 'noindex', 'sponsored']
