@@ -241,11 +241,18 @@ class AmazonParser:
 
     def _slx_parse_brand(self, tree) -> str:
         try:
-            node = tree.css_first('a#bylineInfo')
-            if node:
-                brand_text = node.text(strip=True)
-                brand = re.sub(r'Visit the | Store|Brand: ', '', brand_text, flags=re.IGNORECASE).strip()
-                return brand if brand else "N/A"
+            # 多选择器覆盖不同页面布局
+            for sel in ['a#bylineInfo', 'a#brand', 'span#bylineInfo',
+                        '#bylineInfo_feature_div a', '#brand-snapshot-link']:
+                node = tree.css_first(sel)
+                if node:
+                    brand_text = node.text(strip=True)
+                    brand = re.sub(
+                        r'Visit the |Brand:\s*| Store$', '', brand_text,
+                        flags=re.IGNORECASE
+                    ).strip()
+                    if brand and len(brand) <= 80:
+                        return brand
         except Exception:
             pass
         return "N/A"
@@ -875,11 +882,11 @@ class AmazonParser:
             if name and isinstance(name, str) and len(name) > 1:
                 result["title"] = name.strip()
 
-            # 品牌
+            # 品牌（过滤长描述文案：真正品牌名一般不超过 80 字符）
             brand = product.get("brand")
             if isinstance(brand, dict):
                 brand = brand.get("name", "")
-            if brand and isinstance(brand, str) and brand.strip():
+            if brand and isinstance(brand, str) and brand.strip() and len(brand.strip()) <= 80:
                 result["brand"] = brand.strip()
 
             # 图片
@@ -1052,10 +1059,20 @@ class AmazonParser:
 
     def _parse_brand(self, tree) -> str:
         try:
-            brand_text = self._get_text(tree, ['//a[@id="bylineInfo"]/text()'])
+            xpaths = [
+                '//a[@id="bylineInfo"]/text()',
+                '//a[@id="brand"]/text()',
+                '//span[@id="bylineInfo"]/text()',
+                '//*[@id="bylineInfo_feature_div"]//a/text()',
+            ]
+            brand_text = self._get_text(tree, xpaths)
             if brand_text:
-                brand = re.sub(r'Visit the | Store|Brand: ', '', brand_text, flags=re.IGNORECASE).strip()
-                return brand if brand else "N/A"
+                brand = re.sub(
+                    r'Visit the |Brand:\s*| Store$', '', brand_text,
+                    flags=re.IGNORECASE
+                ).strip()
+                if brand and len(brand) <= 80:
+                    return brand
         except Exception:
             pass
         return "N/A"
