@@ -4,7 +4,7 @@
     "category": "infrastructure",
     "description": "Model + Config 更新: Result dataclass 新增变动字段 + HEADER_MAP + EXPORTABLE_FIELDS",
     "steps": ["Result 新增13个变动/内部字段", "_INTERNAL_FIELDS 定义", "EXPORTABLE_FIELDS 计算", "HEADER_MAP 新增条目", "total_price 虚拟字段"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 2,

@@ -248,6 +248,18 @@ HEADER_MAP = {
     "first_available_date": "上架时间",
     "long_description": "长描述",
     "product_type": "商品类型",
+    # 变动追踪字段
+    "price_change": "价格变动",
+    "stock_qty_change": "库存数量变动",
+    "stock_status_change": "库存状态变动",
+    "other_change": "其他变动",
+    "prev_current_price": "上次价格",
+    "prev_buybox_price": "上次BuyBox价格",
+    "prev_stock_count": "上次库存数量",
+    "prev_stock_status": "上次库存状态",
+    "is_new": "是否新增",
+    "updated_at": "最后更新时间",
+    "total_price": "总价",
 }
 
 EXPORT_COLUMN_ORDER = [

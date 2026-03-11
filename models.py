@@ -82,6 +82,22 @@ class Result:
     item_dimensions: str = ""
     item_weight: str = ""
 
+    # 变动追踪字段
+    price_change: str = ""
+    stock_qty_change: str = ""
+    stock_status_change: str = ""
+    other_change: str = ""
+    prev_current_price: str = ""
+    prev_buybox_price: str = ""
+    prev_stock_count: str = ""
+    prev_stock_status: str = ""
+    is_new: str = ""
+    updated_at: str = ""
+    # 内部字段（不导出到 Excel/CSV）
+    content_hash: str = ""
+    last_change_at: str = ""
+    change_seq: str = ""
+
     created_at: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -98,3 +114,9 @@ class Result:
 # 所有采集字段名（不含 id / batch_name / created_at 等管理字段）
 _EXCLUDED = {"id", "batch_name", "created_at"}
 RESULT_FIELDS = [f.name for f in fields(Result) if f.name not in _EXCLUDED]
+
+# 内部字段（不导出到 Excel/CSV，但存储在数据库中）
+_INTERNAL_FIELDS = {"content_hash", "last_change_at", "change_seq"}
+
+# 导出可选字段（= RESULT_FIELDS - _INTERNAL_FIELDS + total_price 虚拟字段）
+EXPORTABLE_FIELDS = [f for f in RESULT_FIELDS if f not in _INTERNAL_FIELDS] + ["total_price"]
