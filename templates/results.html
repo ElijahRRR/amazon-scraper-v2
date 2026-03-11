@@ -51,6 +51,16 @@
                 </select>
             </div>
             <div class="col-md-2">
+                <label class="form-label">变动筛选</label>
+                <select id="changeFilter" class="form-select form-select-sm">
+                    <option value="all">全部 ASIN</option>
+                    <option value="price_stock_changed">价格/库存变动</option>
+                    <option value="other_changed">非价格/库存变动</option>
+                    <option value="unchanged">未变动</option>
+                    <option value="new">新增 ASIN</option>
+                </select>
+            </div>
+            <div class="col-md-2">
                 <label class="form-label">搜索</label>
                 <input type="text" id="searchInput" class="form-control" placeholder="ASIN 或标题..." value="{{ search }}">
             </div>
@@ -58,18 +68,12 @@
                 <label class="form-label">&nbsp;</label>
                 <button class="btn btn-accent w-100" onclick="loadResults(1)"><i class="bi bi-search"></i></button>
             </div>
-            <div class="col-md-6 text-end">
+            <div class="col-md-4 text-end">
                 <label class="form-label">&nbsp;</label>
                 <div class="d-flex justify-content-end gap-1 flex-wrap">
-                    <a id="exportExcelBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
-                        <i class="bi bi-file-earmark-excel"></i> Excel
-                    </a>
-                    <a id="exportCsvBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
-                        <i class="bi bi-filetype-csv"></i> CSV
-                    </a>
-                    <a id="exportDbBtn" href="#" class="btn btn-outline-accent btn-sm" style="display:none;">
-                        <i class="bi bi-database-down"></i> 数据库
-                    </a>
+                    <button id="exportBtn" class="btn btn-outline-accent btn-sm" onclick="openExportModal()">
+                        <i class="bi bi-download"></i> 导出
+                    </button>
                     <button class="btn btn-outline-danger btn-sm" onclick="clearDatabase()">
                         <i class="bi bi-trash3"></i> 清空
                     </button>
@@ -108,13 +112,33 @@
                         <td>
                             <a href="https://www.amazon.com/dp/{{ r.asin }}" target="_blank"
                                class="text-decoration-none" style="color:var(--info)">{{ r.asin }}</a>
+                            {% if r.is_new == 1 or r.is_new == '1' %}
+                            <span class="badge bg-info ms-1" style="font-size:0.6rem;">NEW</span>
+                            {% endif %}
                         </td>
                         <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
                             title="{{ r.title }}">{{ r.title }}</td>
-                        <td>{{ r.current_price or 'N/A' }}</td>
+                        <td>
+                            {{ r.current_price or 'N/A' }}
+                            {% if r.price_change == 'up' %}
+                            <span class="text-danger" title="上次: {{ r.prev_current_price }}">↑</span>
+                            {% elif r.price_change == 'down' %}
+                            <span class="text-success" title="上次: {{ r.prev_current_price }}">↓</span>
+                            {% endif %}
+                        </td>
                         <td>{{ r.buybox_price or 'N/A' }}</td>
                         <td>{{ r.brand or 'N/A' }}</td>
-                        <td>{{ r.stock_status or 'N/A' }}</td>
+                        <td>
+                            {{ r.stock_status or 'N/A' }}
+                            {% if r.stock_qty_change == 'up' %}
+                            <span class="text-success" title="上次: {{ r.prev_stock_count }}">↑</span>
+                            {% elif r.stock_qty_change == 'down' %}
+                            <span class="text-danger" title="上次: {{ r.prev_stock_count }}">↓</span>
+                            {% endif %}
+                            {% if r.stock_status_change == 'changed' %}
+                            <span class="text-warning" title="上次: {{ r.prev_stock_status }}">●</span>
+                            {% endif %}
+                        </td>
                         <td>
                             {% if r.is_fba == 'FBA' %}
                             <span class="badge-status badge-done">FBA</span>
@@ -168,6 +192,55 @@
         </div>
     </div>
 </div>
+
+<!-- 导出字段选择 Modal -->
+<div class="modal fade" id="exportModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-download"></i> 导出设置</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label">导出格式</label>
+                        <select id="exportFormat" class="form-select" onchange="onExportFormatChange()">
+                            <option value="excel">Excel (.xlsx)</option>
+                            <option value="csv">CSV (.csv)</option>
+                            <option value="db">数据库 (.db) — 全字段</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">数据范围</label>
+                        <div class="form-control-plaintext">
+                            <span id="exportScope">--</span>
+                        </div>
+                    </div>
+                </div>
+                <hr>
+                <div id="fieldSelectionArea">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label mb-0">选择导出字段</label>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-secondary" onclick="selectAllFields()">全选</button>
+                            <button class="btn btn-outline-secondary" onclick="selectNoFields()">全不选</button>
+                            <button class="btn btn-outline-secondary" onclick="selectPriceStockFields()">仅价格库存</button>
+                        </div>
+                    </div>
+                    <div id="fieldCheckboxes" class="row g-1" style="max-height:300px; overflow-y:auto;">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-accent" onclick="doExport()">
+                    <i class="bi bi-download"></i> 导出
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -184,22 +257,32 @@ let state = {
     search: '{{ search or "" }}',
     page: {{ current_page }},
     totalPages: {{ total_pages }},
-    total: {{ total }}
+    total: {{ total }},
+    changeFilter: 'all'
 };
+
+// 导出字段缓存
+let _exportFields = null;
+let _exportFieldHeaders = {};
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
-    updateExportButtons();
     renderPagination();
     loadProgress();
 
-    // 批次切换 → AJAX 刷新
+    // 批次切换
     document.getElementById('batchFilter').addEventListener('change', (e) => {
         state.batch = e.target.value;
         state.page = 1;
         loadResults(1);
         loadProgress();
-        updateExportButtons();
+    });
+
+    // 变动筛选切换
+    document.getElementById('changeFilter').addEventListener('change', (e) => {
+        state.changeFilter = e.target.value;
+        state.page = 1;
+        loadResults(1);
     });
 
     // 搜索框回车
@@ -219,6 +302,7 @@ async function loadResults(page) {
     const params = new URLSearchParams({ page: state.page, per_page: 50 });
     if (state.batch) params.set('batch_name', state.batch);
     if (state.search) params.set('search', state.search);
+    if (state.changeFilter && state.changeFilter !== 'all') params.set('change_filter', state.changeFilter);
 
     try {
         const resp = await fetch(`/api/results?${params}`);
@@ -238,6 +322,22 @@ async function loadResults(page) {
     }
 }
 
+// 变动标记辅助
+function changeIndicator(type, direction, prevValue) {
+    if (!direction) return '';
+    const prevEsc = esc(prevValue || '');
+    if (type === 'price') {
+        if (direction === 'up') return `<span class="text-danger" title="上次: ${prevEsc}">↑</span>`;
+        if (direction === 'down') return `<span class="text-success" title="上次: ${prevEsc}">↓</span>`;
+    } else if (type === 'stock_qty') {
+        if (direction === 'up') return `<span class="text-success" title="上次: ${prevEsc}">↑</span>`;
+        if (direction === 'down') return `<span class="text-danger" title="上次: ${prevEsc}">↓</span>`;
+    } else if (type === 'stock_status') {
+        if (direction === 'changed') return `<span class="text-warning" title="上次: ${prevEsc}">●</span>`;
+    }
+    return '';
+}
+
 // 渲染结果表格
 function renderResults(results) {
     const tbody = document.getElementById('resultsBody');
@@ -255,6 +355,12 @@ function renderResults(results) {
 
         const titleEscaped = esc(r.title || '');
         const asinEscaped = esc(r.asin || '');
+        const isNew = (r.is_new == 1 || r.is_new == '1');
+        const newBadge = isNew ? '<span class="badge bg-info ms-1" style="font-size:0.6rem;">NEW</span>' : '';
+
+        const priceChange = changeIndicator('price', r.price_change, r.prev_current_price);
+        const stockQtyChange = changeIndicator('stock_qty', r.stock_qty_change, r.prev_stock_count);
+        const stockStatusChange = changeIndicator('stock_status', r.stock_status_change, r.prev_stock_status);
 
         const screenshotCell = r.screenshot_path
             ? `<button class="btn btn-sm btn-outline-accent" onclick="showScreenshot(this)" data-path="${esc(r.screenshot_path)}" data-asin="${asinEscaped}" title="查看截图"><i class="bi bi-camera"></i></button>`
@@ -262,13 +368,13 @@ function renderResults(results) {
 
         return `<tr>
             <td><a href="https://www.amazon.com/dp/${encodeURIComponent(r.asin)}" target="_blank"
-                   class="text-decoration-none" style="color:var(--info)">${asinEscaped}</a></td>
+                   class="text-decoration-none" style="color:var(--info)">${asinEscaped}</a>${newBadge}</td>
             <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
                 title="${titleEscaped}">${titleEscaped}</td>
-            <td>${esc(r.current_price || 'N/A')}</td>
+            <td>${esc(r.current_price || 'N/A')} ${priceChange}</td>
             <td>${esc(r.buybox_price || 'N/A')}</td>
             <td>${esc(r.brand || 'N/A')}</td>
-            <td>${esc(r.stock_status || 'N/A')}</td>
+            <td>${esc(r.stock_status || 'N/A')} ${stockQtyChange} ${stockStatusChange}</td>
             <td>${fbaCell}</td>
             <td>${esc(r.delivery_date || 'N/A')}</td>
             <td><small class="text-secondary">${esc(r.crawl_time || '')}</small></td>
@@ -292,33 +398,120 @@ async function loadProgress() {
         document.getElementById('stat-rate').textContent = data.completion_rate + '%';
         document.getElementById('stat-success-rate').textContent = '成功率 ' + data.success_rate + '%';
         document.getElementById('stat-failed').textContent = data.failed;
-        updateExportButtons();
     } catch(e) {
         console.error('加载进度失败:', e);
     }
 }
 
-// 更新导出按钮
-function updateExportButtons() {
-    const excelBtn = document.getElementById('exportExcelBtn');
-    const csvBtn = document.getElementById('exportCsvBtn');
-    const dbBtn = document.getElementById('exportDbBtn');
+// === 导出 Modal ===
 
-    if (state.batch) {
-        const batchEncoded = encodeURIComponent(state.batch);
-        excelBtn.href = `/api/export/${batchEncoded}?format=excel`;
-        csvBtn.href = `/api/export/${batchEncoded}?format=csv`;
-        dbBtn.href = `/api/export/${batchEncoded}/db`;
-
-        // ≤5000 条显示 Excel，>5000 隐藏（服务器 CPU 扛不住）
-        excelBtn.style.display = (state.batchDone || 0) <= 5000 ? 'inline-block' : 'none';
-        csvBtn.style.display = 'inline-block';
-        dbBtn.style.display = 'inline-block';
-    } else {
-        excelBtn.style.display = 'none';
-        csvBtn.style.display = 'none';
-        dbBtn.style.display = 'none';
+async function openExportModal() {
+    // 加载字段列表
+    if (!_exportFields) {
+        try {
+            const resp = await fetch('/api/export/fields');
+            const data = await resp.json();
+            _exportFields = data.fields;
+            _exportFieldHeaders = data.headers;
+        } catch(e) {
+            alert('加载字段列表失败');
+            return;
+        }
     }
+
+    // 更新范围显示
+    const scope = state.batch
+        ? `批次: ${state.batch}`
+        : '全部数据';
+    const filter = state.changeFilter !== 'all'
+        ? ` (${document.getElementById('changeFilter').selectedOptions[0].text})`
+        : '';
+    document.getElementById('exportScope').textContent = scope + filter;
+
+    // 渲染字段复选框
+    renderFieldCheckboxes();
+
+    new bootstrap.Modal(document.getElementById('exportModal')).show();
+}
+
+function renderFieldCheckboxes() {
+    const container = document.getElementById('fieldCheckboxes');
+    // 从 localStorage 读取上次选择
+    let saved = null;
+    try {
+        saved = JSON.parse(localStorage.getItem('export_selected_fields'));
+    } catch(e) {}
+
+    container.innerHTML = _exportFields.map(f => {
+        const label = _exportFieldHeaders[f] || f;
+        const checked = saved ? saved.includes(f) : true;
+        return `<div class="col-md-4">
+            <div class="form-check form-check-sm">
+                <input class="form-check-input field-cb" type="checkbox" value="${esc(f)}"
+                       id="field_${esc(f)}" ${checked ? 'checked' : ''}>
+                <label class="form-check-label" for="field_${esc(f)}" style="font-size:0.8rem;">
+                    ${esc(label)}
+                </label>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function selectAllFields() {
+    document.querySelectorAll('.field-cb').forEach(cb => cb.checked = true);
+}
+function selectNoFields() {
+    document.querySelectorAll('.field-cb').forEach(cb => cb.checked = false);
+}
+function selectPriceStockFields() {
+    const priceStock = ['asin','title','current_price','buybox_price','buybox_shipping',
+                        'stock_count','stock_status','price_change','stock_qty_change',
+                        'stock_status_change','prev_current_price','prev_stock_count',
+                        'total_price','crawl_time','updated_at'];
+    document.querySelectorAll('.field-cb').forEach(cb => {
+        cb.checked = priceStock.includes(cb.value);
+    });
+}
+
+function onExportFormatChange() {
+    const fmt = document.getElementById('exportFormat').value;
+    const area = document.getElementById('fieldSelectionArea');
+    area.style.display = fmt === 'db' ? 'none' : '';
+}
+
+function doExport() {
+    const fmt = document.getElementById('exportFormat').value;
+
+    // 保存字段选择到 localStorage
+    const selected = [];
+    document.querySelectorAll('.field-cb:checked').forEach(cb => selected.push(cb.value));
+    localStorage.setItem('export_selected_fields', JSON.stringify(selected));
+
+    let url;
+    const params = new URLSearchParams();
+
+    if (fmt === 'db') {
+        // .db 导出全字段
+        url = state.batch
+            ? `/api/export/${encodeURIComponent(state.batch)}/db`
+            : '/api/export/all/db';
+    } else {
+        url = state.batch
+            ? `/api/export/${encodeURIComponent(state.batch)}`
+            : '/api/export/all';
+        params.set('format', fmt);
+        if (state.changeFilter && state.changeFilter !== 'all') {
+            params.set('change_filter', state.changeFilter);
+        }
+        if (selected.length > 0 && selected.length < _exportFields.length) {
+            params.set('fields', selected.join(','));
+        }
+    }
+
+    const paramStr = params.toString();
+    window.location.href = paramStr ? `${url}?${paramStr}` : url;
+
+    bootstrap.Modal.getInstance(document.getElementById('exportModal')).hide();
 }
 
 // 渲染分页

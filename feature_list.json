@@ -81,7 +81,7 @@
     "category": "ui",
     "description": "results.html: 变动筛选 + 变动标记 + 导出字段选择 Modal",
     "steps": ["变动筛选下拉框", "表格变动标记(价格涨跌/库存/新增)", "导出 Modal(格式+范围+字段选择+localStorage)", "全局导出支持(无批次时可导出)"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 13,
